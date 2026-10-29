@@ -29,6 +29,7 @@ import {
   COMMANDS,
   DEFAULT_KEY_BINDINGS,
   getKeyBindings,
+  IS_MAC,
   keyLabel,
   setKeyBindings,
   type Command,
@@ -48,8 +49,13 @@ type Section = "keys" | "colors" | "view" | "problem" | "submit" | "python" | "s
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 32;
 
-// macOS とメニューの決まったキー（割り当てると、そちらが先に動く・使えなくなる）。押しても届かないものもある
-const RESERVED = new Set(["⌘Q", "⌘H", "⌥⌘H", "⌘M", "⌘C", "⌘V", "⌘X", "⌘Z", "⇧⌘Z", "⌘A", "⌃⌘F"]);
+// macOS とメニューの決まったキー（割り当てると、そちらが先に動く・使えなくなる）。押しても届かないものもある。
+// Windows（macOS 以外）は、Windows と編集・終了のメニューの決まったキー（Windows 移植の段階 1 C9）
+const RESERVED = IS_MAC
+  ? new Set(["⌘Q", "⌘H", "⌥⌘H", "⌘M", "⌘C", "⌘V", "⌘X", "⌘Z", "⇧⌘Z", "⌘A", "⌃⌘F"])
+  : new Set(["Ctrl+Q", "Ctrl+C", "Ctrl+V", "Ctrl+X", "Ctrl+Z", "Ctrl+Y", "Ctrl+Shift+Z", "Ctrl+A", "Alt+F4"]);
+const OS_NAME = IS_MAC ? "macOS" : "Windows";
+const MODIFIER_NAMES = IS_MAC ? "⌘・⌃・⌥" : "Ctrl・Alt";
 
 // 今の割り当てを、コマンドごとの最初の 1 つにする（settings.json に同じコマンドが 2 つ以上あれば、先のもの）
 function currentAssigned(): Assigned {
@@ -78,11 +84,11 @@ function sameKeys(a: Keys | null, b: Keys | null): boolean {
 function refusal(keys: Keys, command: Command, assigned: Assigned): string | null {
   const label = keyLabel(keys);
   if (RESERVED.has(label)) {
-    return `${label} は macOS やメニューで使うキーなので、割り当てられません`;
+    return `${label} は ${OS_NAME} やメニューで使うキーなので、割り当てられません`;
   }
   const functionKey = /^f([1-9]|1[0-9]|20)$/.test(keys.key);
   if (!keys.meta && !keys.ctrl && !keys.alt && !functionKey) {
-    return "⌘・⌃・⌥ のどれかと一緒に押してください（F1〜F20 は、そのままでも使えます）";
+    return `${MODIFIER_NAMES} のどれかと一緒に押してください（F1〜F20 は、そのままでも使えます）`;
   }
   for (const other of COMMANDS) {
     if (other !== command && sameKeys(assigned[other], keys)) {

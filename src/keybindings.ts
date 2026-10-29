@@ -81,9 +81,18 @@ export type KeyBinding = {
   shift: boolean;
 };
 
+// macOS で動いているか（WebView の userAgent。macOS の WKWebView は Macintosh、Windows の WebView2 は Windows NT を含む）。
+// Windows 移植の段階 1 C9（docs/windows-port-plan.md 9.1 の 5）
+export const IS_MAC = /Macintosh|Mac OS X/.test(navigator.userAgent);
+
+// macOS 以外では、⌘ を使う割り当てを Ctrl に置き換える（src-tauri/src/storage.rs の default_key_bindings と同じ規則）
+function forPlatform(bindings: KeyBinding[]): KeyBinding[] {
+  return IS_MAC ? bindings : bindings.map((b) => (b.meta ? { ...b, meta: false, ctrl: true } : b));
+}
+
 // 初期の割り当て（D-022・D-051）。src-tauri/src/storage.rs の default_key_bindings と同じ内容。
 // 提出（submit）は、初期の割り当てを置かない（D-148 §2.2）
-export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
+export const DEFAULT_KEY_BINDINGS: KeyBinding[] = forPlatform([
   // ⌘B：ファイル一覧の表示を切り替える
   { command: "toggleSidebar", key: "b", meta: true, ctrl: false, alt: false, shift: false },
   // ⌘S：開いているファイルをすぐ保存する
@@ -114,7 +123,7 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { command: "showExplorer", key: "e", meta: true, ctrl: false, alt: false, shift: true },
   { command: "showSearch", key: "f", meta: true, ctrl: false, alt: false, shift: true },
   { command: "showDebug", key: "d", meta: true, ctrl: false, alt: false, shift: true },
-];
+]);
 
 let keyBindings: KeyBinding[] = DEFAULT_KEY_BINDINGS;
 
@@ -138,8 +147,28 @@ const KEY_NAMES: Record<string, string> = {
   pagedown: "PageDown",
 };
 
-// キーの見せ方（例：⇧⌘R、F12）。修飾キーは macOS の順（⌃⌥⇧⌘）
+// Windows の、名前で見せるキーのうち macOS と違うもの
+const WINDOWS_KEY_NAMES: Record<string, string> = {
+  backspace: "Backspace",
+  delete: "Delete",
+};
+
+// キーの見せ方（例：⇧⌘R、F12）。修飾キーは macOS の順（⌃⌥⇧⌘）。
+// macOS 以外では Ctrl+Alt+Shift+R の形（⌘ にあたる Windows キーは Win）
 export function keyLabel(binding: Omit<KeyBinding, "command">): string {
+  if (!IS_MAC) {
+    const parts = [
+      ...(binding.ctrl ? ["Ctrl"] : []),
+      ...(binding.alt ? ["Alt"] : []),
+      ...(binding.shift ? ["Shift"] : []),
+      ...(binding.meta ? ["Win"] : []),
+    ];
+    const name =
+      WINDOWS_KEY_NAMES[binding.key] ??
+      KEY_NAMES[binding.key] ??
+      (binding.key.length === 1 ? binding.key.toUpperCase() : binding.key.replace(/^f(\d+)$/, "F$1"));
+    return [...parts, name].join("+");
+  }
   const modifiers =
     (binding.ctrl ? "⌃" : "") + (binding.alt ? "⌥" : "") + (binding.shift ? "⇧" : "") + (binding.meta ? "⌘" : "");
   const key =

@@ -84,8 +84,15 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     let binding = |command: &str, key: &str, (meta, alt, shift): (bool, bool, bool)| KeyBinding {
         command: command.to_string(),
         key: key.to_string(),
+        #[cfg(target_os = "macos")]
         meta,
+        #[cfg(target_os = "macos")]
         ctrl: false,
+        // macOS 以外では ⌘ の代わりに Ctrl を使う（Windows 移植の段階 1 C9。docs/windows-port-plan.md 9.1 の 5）
+        #[cfg(not(target_os = "macos"))]
+        meta: false,
+        #[cfg(not(target_os = "macos"))]
+        ctrl: meta,
         alt,
         shift,
     };
@@ -1565,6 +1572,21 @@ mod tests {
             (format.key.as_str(), format.meta, format.alt, format.shift),
             ("f", false, true, true)
         );
+    }
+
+    // macOS 以外：⌘ を使う割り当てはなく、⌘ だったものは Ctrl になる（9.1 の 5）
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_key_bindings_use_ctrl_outside_macos() {
+        let bindings = default_key_bindings();
+        assert!(bindings.iter().all(|b| !b.meta));
+        let save = bindings.iter().find(|b| b.command == "save").unwrap();
+        assert_eq!((save.key.as_str(), save.ctrl, save.shift), ("s", true, false));
+        let test = bindings.iter().find(|b| b.command == "test").unwrap();
+        assert_eq!((test.key.as_str(), test.ctrl, test.shift), ("r", true, true));
+        // ⌘ を使わなかったもの（F12・⇧⌥F）は Ctrl も使わない
+        let format = bindings.iter().find(|b| b.command == "formatDocument").unwrap();
+        assert!(!format.ctrl);
     }
 
     #[test]

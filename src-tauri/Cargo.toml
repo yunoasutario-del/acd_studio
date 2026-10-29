@@ -41,6 +41,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
     "Win32_System_Time",
 ] }
+# WebView2 のブラウザの既定のキー（Ctrl+R の再読み込みなど）を切るため（9.1 の 5。windows-sys だけの方針の例外。8 章）。
+# Tauri 2.12.4 には設定がなく、with_webview の controller() がこの型を返す。どちらも Tauri の依存として Cargo.lock にあった版と同じ
+webview2-com = "0.39.1"
+windows-core = "0.62.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
