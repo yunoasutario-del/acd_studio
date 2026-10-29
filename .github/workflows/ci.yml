@@ -1,0 +1,58 @@
+# macOS と Windows の両方で、ビルド・clippy・テストを動かす（Windows 移植の段階 1。docs/windows-port-plan.md 7 章 C4b）。
+# macOS の動きを壊していないことを確かめるためのもの。外部のツール（g++-15・python3.13・clangd・basedpyright・lldb-dap など）が
+# ない runner では、それを使うテストは自分で飛ぶ
+name: CI
+
+on:
+  push:
+    branches: [windows-port]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run build
+        run: npm run build
+
+      # src-tauri/rust-toolchain.toml の版（rustfmt・clippy を含む）を入れる。引数なしの toolchain install が
+      # rust-toolchain.toml を読むのは rustup 1.28 以降（runner の rustup の版は未確認）
+      - name: Rust toolchain
+        working-directory: src-tauri
+        run: |
+          rustup --version
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo build
+        working-directory: src-tauri
+        run: cargo build
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
