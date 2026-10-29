@@ -453,10 +453,17 @@ pub fn rename_file(root: &Path, relative: &str, new_name: &str) -> Result<String
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let case_only = old_name != new_name && old_name.to_lowercase() == new_name.to_lowercase();
+        #[cfg(unix)]
         let same = fs::symlink_metadata(&from).is_ok_and(|current| {
             use std::os::unix::fs::MetadataExt;
             current.dev() == existing.dev() && current.ino() == existing.ino()
         });
+        // Windows：リンク自体のボリュームのシリアル番号とファイルの番号で比べる（Unix の dev・ino にあたる）
+        #[cfg(windows)]
+        let same = {
+            let _ = &existing;
+            crate::win::same_entry(&from, &to)
+        };
         if !(case_only && same) {
             return Err("同じ名前のファイルまたはフォルダがあります".to_string());
         }

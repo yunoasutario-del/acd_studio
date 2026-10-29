@@ -25,6 +25,8 @@ mod storage;
 mod submit;
 mod toolchain;
 mod trust;
+#[cfg(windows)]
+mod win;
 mod workspace;
 
 use std::sync::atomic::{AtomicBool, Ordering};

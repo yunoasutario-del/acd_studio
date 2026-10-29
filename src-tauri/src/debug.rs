@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -43,7 +44,9 @@ use tauri::ipc::Channel;
 use crate::language::LangSettings;
 use crate::language::Language;
 use crate::lsp::{Decoder, encode, file_uri};
-use crate::process::{exited_without_reaping, kill_group};
+#[cfg(windows)]
+use crate::process::ProcessGroupShim;
+use crate::process::{Pid, exited_without_reaping, kill_group};
 use crate::python::{self, Interpreter};
 use crate::run::{self, Finish, LogKind, Prepared, RunEvent, info, prepare, relative, send};
 use crate::toolchain::{self, RustcPaths, Target};
@@ -932,7 +935,7 @@ impl Client {
         // 出力は、つないでから読む（それまでは debugpy がつなぎを待つので、デバッグ対象は出力しない）
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id() as Pid;
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let until = Instant::now() + CONNECT_WAIT;
         let stream = loop {
@@ -1201,7 +1204,7 @@ impl Client {
     // terminate は送らない。強制的に止めたなら true。debugpy では child がデバッグ対象そのもので、exited の知らせが
     // 来ないので、終了コードを child から受け取る（D-226）
     fn shutdown(&self, child: &mut Child) -> bool {
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id() as Pid;
         // 止める前に、自分で終わっていたか（debugpy の終了コードは、このときだけ使う）
         let ended = exited_without_reaping(pid);
         if !ended {
@@ -1234,12 +1237,32 @@ impl Client {
 }
 
 // pid のプロセスがあるか（回収されていないものを含む）
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
     // SAFETY: シグナル 0 は送らずに、あるかだけを確かめる
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+// Windows：まだ動いているか。デバッグは今回の移植に含めないので、段階 1 ではコンパイルが通るようにするだけ（docs/windows-port-plan.md 9.1 の 12）
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    crate::win::is_alive(pid as u32)
+}
+
+// Windows：デバッグ対象が残っていれば止める（Unix の stop_debuggee と同じ流れ）
+#[cfg(windows)]
+fn stop_debuggee(pid: i32) {
+    let until = Instant::now() + DEBUGGEE_WAIT;
+    while alive(pid) && Instant::now() < until {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if alive(pid) {
+        crate::win::terminate(pid as u32);
+    }
+}
+
 // デバッグ対象が残っていれば SIGKILL を送り、少しの間、なくなるのを待つ
+#[cfg(unix)]
 fn stop_debuggee(pid: i32) {
     let until = Instant::now() + DEBUGGEE_WAIT;
     while alive(pid) && Instant::now() < until {
@@ -1455,7 +1478,7 @@ pub fn debug_target(
             stopped = wait_until_end(&child, &notices, cancel);
             // debugpy は、デバッグ対象が終わる少し前に terminated を送る。自分で終わるのを少し待ち、終了コードを受け取る
             if !stopped && matches!(adapter, Adapter::Debugpy(_)) {
-                let pid = child.id() as libc::pid_t;
+                let pid = child.id() as Pid;
                 let until = Instant::now() + DISCONNECT_WAIT;
                 while !exited_without_reaping(pid) && Instant::now() < until {
                     thread::sleep(POLL_INTERVAL);
@@ -1643,7 +1666,7 @@ fn start_session(
 
 // 終わる（terminated）・止める印・アダプターの終了を待つ。止める印で終えたなら true
 fn wait_until_end(child: &Child, notices: &Receiver<Notice>, cancel: &Arc<AtomicBool>) -> bool {
-    let pid = child.id() as libc::pid_t;
+    let pid = child.id() as Pid;
     loop {
         if cancel.load(Ordering::SeqCst) {
             return true;

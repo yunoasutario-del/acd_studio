@@ -7,7 +7,11 @@
 
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+// Windows では、パイプの読み口はハンドル。Unix と同じ書き方のまま File にする
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;

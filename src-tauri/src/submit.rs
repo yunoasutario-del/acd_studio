@@ -1474,7 +1474,17 @@ pub fn last_test_summary(
     text
 }
 
+// Windows：例：10/26 20:12（手元の時刻）。Unix の localtime_r の代わりに Windows の API で変える
+#[cfg(windows)]
+fn local_time(ms: u64) -> String {
+    match crate::win::local_month_day_time(ms) {
+        Some((month, day, hour, minute)) => format!("{month:02}/{day:02} {hour:02}:{minute:02}"),
+        None => String::new(),
+    }
+}
+
 // 例：10/26 20:12（手元の時刻）
+#[cfg(unix)]
 fn local_time(ms: u64) -> String {
     let secs = (ms / 1000) as libc::time_t;
     // SAFETY: localtime_r は、渡した tm に書くだけ（スレッドごとの領域を使わない）

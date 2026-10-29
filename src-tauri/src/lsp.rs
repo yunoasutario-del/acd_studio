@@ -27,6 +27,7 @@
 // setsid などでグループから抜けた子孫は止められない（D-095）。macOS（Unix）だけを対象にする
 
 use std::io::{BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -40,7 +41,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::language::Language;
-use crate::process::{exited_without_reaping, kill_group, wait_without_reaping};
+#[cfg(windows)]
+use crate::process::ProcessGroupShim;
+use crate::process::{Pid, exited_without_reaping, kill_group, wait_without_reaping};
 use crate::toolchain::{self, find_cargo};
 use crate::workspace::MAX_FILE_SIZE;
 
@@ -536,7 +539,7 @@ impl Server {
         spawn_stderr_reader(child.stderr.take().expect("piped"), sink.clone());
         // 自分で終わったときに知らせる。stop が先に役を取っていれば何もしない
         let reported = Arc::new(AtomicBool::new(false));
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id() as Pid;
         let (flag, notify) = (reported.clone(), sink.clone());
         thread::spawn(move || {
             let code = wait_without_reaping(pid);
@@ -581,7 +584,7 @@ impl Server {
     }
 
     fn exited(&self) -> bool {
-        exited_without_reaping(self.child.id() as libc::pid_t)
+        exited_without_reaping(self.child.id() as Pid)
     }
 
     // 正式な終了を送って wait まで待ち、残っていればグループごと止めて回収する
@@ -604,7 +607,7 @@ impl Server {
             }
         }
         // 回収する前に、グループの残り（rust-analyzer の子など）を止める
-        kill_group(self.child.id() as libc::pid_t);
+        kill_group(self.child.id() as Pid);
         let code = self.child.wait().ok().and_then(|status| status.code());
         if report {
             (self.sink)(LspEvent::Exited { code });

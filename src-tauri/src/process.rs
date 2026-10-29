@@ -12,9 +12,14 @@
 // 出力が READ_GRACE の間届かなくなるか、回収から DRAIN_LIMIT が過ぎたら、読み取りを打ち切る
 // （結果の output_left_open が true になる）。
 // macOS（Unix）だけを対象にする。Windows は将来、Job Object で別に作る（05 P-05-3）
+//
+// Windows（移植の段階 1。docs/windows-port-plan.md 7 章 C3）は仮の実装：Unix の関数と同じ名前・同じ形の関数を
+// `#[cfg(windows)]` で置き、中身は win.rs に任せる。限界：止めるのは直接の子だけで子孫は残り、使用メモリは測らない
+// （段階 2 で Job Object にする）。Unix の経路のコードは変えない
 
 use std::fs::File;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,13 +72,52 @@ pub struct Limits {
     pub memory: Option<u64>,
 }
 
+// プロセスの番号の型（Unix は pid_t。Windows の番号は u32 だが、Unix と同じ i32 で持ち、使うときに u32 に戻す）
+#[cfg(unix)]
+pub type Pid = libc::pid_t;
+#[cfg(windows)]
+pub type Pid = i32;
+
+// Windows には、プロセスグループもシグナルもない。Unix の CommandExt::process_group と ExitStatusExt::signal と
+// 同じ名前のものを置き、Unix と同じ書き方のまま動くようにする（何もしない・いつも None）。段階 2 で Job Object に置き換える
+#[cfg(windows)]
+pub(crate) trait ProcessGroupShim {
+    fn process_group(&mut self, pgroup: i32) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl ProcessGroupShim for Command {
+    fn process_group(&mut self, _pgroup: i32) -> &mut Self {
+        self
+    }
+}
+
+#[cfg(windows)]
+trait SignalShim {
+    fn signal(&self) -> Option<i32>;
+}
+
+#[cfg(windows)]
+impl SignalShim for std::process::ExitStatus {
+    fn signal(&self) -> Option<i32> {
+        None
+    }
+}
+
 // 動いているプロセスの今の使用メモリ（RSS。バイト）。読めなければ None（終わったあとなど）
+#[cfg(unix)]
 fn current_rss(pid: libc::pid_t) -> Option<u64> {
     // SAFETY: rusage_info_v0 はゼロで初期化してよい C の構造体で、proc_pid_rusage に書き込み先として渡すだけ
     let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
     let buffer = (&mut info as *mut libc::rusage_info_v0).cast::<libc::rusage_info_t>();
     let result = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, buffer) };
     (result == 0).then_some(info.ri_resident_size)
+}
+
+// Windows：段階 1 では測らない（メモリの上限で止めない。段階 2）
+#[cfg(windows)]
+fn current_rss(_pid: Pid) -> Option<u64> {
+    None
 }
 
 pub struct RunResult {
@@ -118,6 +162,7 @@ fn spawn_reader(mut source: impl Read + Send + 'static, stream: Stream, events: 
 // 直接の子が終わるのを、回収せずに待つ（waitid の WNOWAIT）。終わった時刻を exited に記録する
 // （出力がたまっていても、実行時間が遅れて記録されないように）。
 // 限界：waitid が EINTR 以外で失敗したときも、終わったものとして扱う
+#[cfg(unix)]
 fn spawn_exit_watcher(pid: libc::pid_t, exited: Arc<OnceLock<Instant>>, events: SyncSender<Event>) {
     thread::spawn(move || {
         loop {
@@ -143,8 +188,19 @@ fn spawn_exit_watcher(pid: libc::pid_t, exited: Arc<OnceLock<Instant>>, events: 
     });
 }
 
+// Windows：終わるのを WaitForSingleObject で待つ（ハンドルを待っても、Unix の回収にあたることは起きない）
+#[cfg(windows)]
+fn spawn_exit_watcher(pid: Pid, exited: Arc<OnceLock<Instant>>, events: SyncSender<Event>) {
+    thread::spawn(move || {
+        let _ = crate::win::wait_for_exit(pid as u32);
+        let _ = exited.set(Instant::now());
+        let _ = events.send(Event::Exited);
+    });
+}
+
 // 直接の子を回収し、終わり方と最大使用メモリ（最大 RSS。バイト）を受け取る（wait4。D-141）。
 // 標準ライブラリの Child::wait は使用メモリを返さないため、自分で回収する
+#[cfg(unix)]
 fn reap(pid: libc::pid_t) -> Result<(std::process::ExitStatus, Option<u64>), String> {
     loop {
         let mut status: libc::c_int = 0;
@@ -166,7 +222,17 @@ fn reap(pid: libc::pid_t) -> Result<(std::process::ExitStatus, Option<u64>), Str
     }
 }
 
+// Windows：終わるのを待って終了コードを受け取る。最大使用メモリは段階 1 では測らない（None）
+#[cfg(windows)]
+fn reap(pid: Pid) -> Result<(std::process::ExitStatus, Option<u64>), String> {
+    use std::os::windows::process::ExitStatusExt;
+    let code = crate::win::wait_for_exit(pid as u32)
+        .ok_or_else(|| "終了を確かめられません".to_string())?;
+    Ok((std::process::ExitStatus::from_raw(code), None))
+}
+
 // グループ全体に SIGKILL を送る。直接の子を回収する前にだけ呼ぶ
+#[cfg(unix)]
 pub(crate) fn kill_group(pgid: libc::pid_t) {
     // SAFETY: 自分が起動し、まだ回収していない子の pid（＝グループの番号）を渡す
     unsafe {
@@ -174,8 +240,15 @@ pub(crate) fn kill_group(pgid: libc::pid_t) {
     }
 }
 
+// Windows：直接の子だけを止める（子孫は残る。段階 2 で Job Object の TerminateJobObject にする）
+#[cfg(windows)]
+pub(crate) fn kill_group(pid: Pid) {
+    crate::win::terminate(pid as u32);
+}
+
 // 直接の子が終わったかを、回収せずに確かめる（waitid の WNOHANG・WNOWAIT）。rust-analyzer の停止で使う（Phase 3b-1）。
 // 限界：waitid が失敗したときも、終わったものとして扱う
+#[cfg(unix)]
 pub(crate) fn exited_without_reaping(pid: libc::pid_t) -> bool {
     // SAFETY: siginfo_t はゼロで初期化してよい C の構造体で、waitid に書き込み先として渡すだけ
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -192,8 +265,15 @@ pub(crate) fn exited_without_reaping(pid: libc::pid_t) -> bool {
     result != 0 || info.si_pid != 0
 }
 
+// Windows：待たずに確かめる。開けないときも、終わったものとして扱う
+#[cfg(windows)]
+pub(crate) fn exited_without_reaping(pid: Pid) -> bool {
+    crate::win::has_exited(pid as u32)
+}
+
 // 直接の子が終わるまで、回収せずに待つ（waitid の WNOWAIT）。終了コードで終わったならその値を返す
 // （シグナルで終わった・waitid が失敗したときは None）。rust-analyzer が自分で終わったことを知るのに使う（Phase 3b-1）
+#[cfg(unix)]
 pub(crate) fn wait_without_reaping(pid: libc::pid_t) -> Option<i32> {
     loop {
         // SAFETY: siginfo_t はゼロで初期化してよい C の構造体で、waitid に書き込み先として渡すだけ
@@ -216,6 +296,12 @@ pub(crate) fn wait_without_reaping(pid: libc::pid_t) -> Option<i32> {
     }
 }
 
+// Windows：終わるまで待ち、終了コードを返す（Windows の終了コードは u32 なので、i32 として読む。例外の 0xC0000005 は負になる）
+#[cfg(windows)]
+pub(crate) fn wait_without_reaping(pid: Pid) -> Option<i32> {
+    crate::win::wait_for_exit(pid as u32).map(|code| code as i32)
+}
+
 // command を新しいプロセスグループで起動し、終わるまで待つ。
 // stdin が None なら、標準入力は空にする。cancel が true になったら止める。
 // on_output には、読んだ出力を順に渡す（実行ログの表示に使う。作業 4）
@@ -235,7 +321,7 @@ pub fn run(
     let mut child: Child = command
         .spawn()
         .map_err(|error| format!("起動できません：{error}"))?;
-    let pid = child.id() as libc::pid_t;
+    let pid = child.id() as Pid;
 
     let (sender, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let exited = Arc::new(OnceLock::new());
@@ -393,6 +479,8 @@ enum PairEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitKind {
     Code(i32),
+    // Windows にはシグナルがないので作られない
+    #[cfg_attr(windows, allow(dead_code))]
     Signal(i32),
     Unknown,
 }
@@ -490,6 +578,7 @@ fn spawn_stderr_reader(mut source: ChildStderr, side: Side, events: SyncSender<P
 }
 
 // 直接の子が終わるのを、回収せずに待ち、終わり方と時刻を知らせる（spawn_exit_watcher と同じく waitid の WNOWAIT）
+#[cfg(unix)]
 fn spawn_pair_exit_watcher(pid: libc::pid_t, side: Side, events: SyncSender<PairEvent>) {
     thread::spawn(move || {
         let kind = loop {
@@ -516,6 +605,18 @@ fn spawn_pair_exit_watcher(pid: libc::pid_t, side: Side, events: SyncSender<Pair
             if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 break ExitKind::Unknown;
             }
+        };
+        let _ = events.send(PairEvent::Exited(side, kind, Instant::now()));
+    });
+}
+
+// Windows：終わるのを待ち、終了コードを知らせる（シグナルはないので ExitKind::Signal にはならない）
+#[cfg(windows)]
+fn spawn_pair_exit_watcher(pid: Pid, side: Side, events: SyncSender<PairEvent>) {
+    thread::spawn(move || {
+        let kind = match crate::win::wait_for_exit(pid as u32) {
+            Some(code) => ExitKind::Code(code as i32),
+            None => ExitKind::Unknown,
         };
         let _ = events.send(PairEvent::Exited(side, kind, Instant::now()));
     });
@@ -549,7 +650,7 @@ pub fn run_pair(
     let mut solution_child: Child = solution
         .spawn()
         .map_err(|error| format!("解答を起動できません：{error}"))?;
-    let solution_pid = solution_child.id() as libc::pid_t;
+    let solution_pid = solution_child.id() as Pid;
     let mut judge_child: Child = match judge.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -558,7 +659,7 @@ pub fn run_pair(
             return Err(format!("ジャッジを起動できません：{error}"));
         }
     };
-    let judge_pid = judge_child.id() as libc::pid_t;
+    let judge_pid = judge_child.id() as Pid;
     let pids = [solution_pid, judge_pid];
 
     let (sender, events) = mpsc::sync_channel(CHANNEL_CAPACITY);

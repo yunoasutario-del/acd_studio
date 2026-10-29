@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -434,6 +435,28 @@ pub enum Loaded<T> {
     Broken(PathBuf),
 }
 
+// Windows には Unix のパーミッション（0700・0600）がない。Unix の DirBuilderExt・OpenOptionsExt の mode と
+// 同じ名前で何もしないものを置き、Unix と同じ書き方のまま動くようにする。アプリのフォルダ（%APPDATA% の下）は
+// 利用者だけが読み書きできる ACL になっていると思われる（推測。未確認。docs/windows-port-plan.md 3.3）
+#[cfg(windows)]
+trait ModeShim {
+    fn mode(&mut self, mode: u32) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl ModeShim for fs::DirBuilder {
+    fn mode(&mut self, _mode: u32) -> &mut Self {
+        self
+    }
+}
+
+#[cfg(windows)]
+impl ModeShim for fs::OpenOptions {
+    fn mode(&mut self, _mode: u32) -> &mut Self {
+        self
+    }
+}
+
 // アプリのフォルダを作る（所有者だけが読み書きできる 0700）
 pub fn ensure_dir(dir: &Path) -> Result<(), String> {
     fs::DirBuilder::new()
@@ -466,6 +489,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .mode(0o600)
             .open(&tmp)?;
         // すでにあった一時ファイルの権限も 0600 にそろえる
+        #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
