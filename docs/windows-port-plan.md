@@ -162,11 +162,11 @@ session.rs の Keychain を使うテスト、storage.rs の 0o600・0o700 の検
 | src/keybindings.ts:141–149 | 表示が `⌃⌥⇧⌘` の記号 | Windows は `Ctrl+Shift+R` の形 | 箇所：確認済み／代替案：未確認 |
 | src/keybindings.ts:157–170・216–230 | `metaKey` を照合に使う。⌥ で文字が変わる macOS の対策 | Windows キー（metaKey）は OS に取られることが多い（推測）。AltGr（Ctrl＋Alt と同じに見える）の扱い | 箇所：確認済み／代替案：未確認 |
 | src/settings/SettingsDialog.tsx:51–85 | 予約のキー（⌘Q・⌘H など）と、文言「macOS やメニューで使うキー」「⌘・⌃・⌥ のどれか」 | Windows の予約（Alt+F4・Ctrl+C/V/X/Z/A、Alt 単独でメニュー）に分ける | 箇所：確認済み／代替案：未確認 |
-| 既定の割り当て全体 | Ctrl+R（実行）・Ctrl+W・Ctrl+F・Ctrl+P などが WebView2 のブラウザの既定動作（再読み込みなど）と重なる | keydown の preventDefault で止まるか、WebView2 の AreBrowserAcceleratorKeysEnabled を切るかを確かめる（未確認） | 箇所：確認済み／代替案：未確認 |
+| 既定の割り当て全体 | Ctrl+R（実行）・Ctrl+W・Ctrl+F・Ctrl+P などが WebView2 のブラウザの既定動作（再読み込みなど）と重なる | WebView2 の AreBrowserAcceleratorKeysEnabled を false にする（9.1 の 5）。wry 0.57.0 に `with_browser_accelerator_keys` があるが、tauri 2.12.4・tauri-utils・tauri-runtime-wry からは設定できない（ソースで確認済み）ので、`with_webview` の `controller()`（webview2-com の型）から設定する。編集のキー（Ctrl+C/V など）が使えるままかは未確認 | 箇所・API：確認済み／動き：未確認 |
 | App.tsx・RunButtons.tsx:102・inputMacro.ts・lsp.ts などのコメントと表示 | 「⌘.」「⌘Z」「Finder」「Keychain」の文字（SubmissionPanel.tsx:235、ipc/scaffold.ts:104 など） | 表示する文字は OS ごとに出し分ける。コメントはそのままでよい | 箇所：確認済み／代替案：未確認 |
-| menu.rs:20–113 | アプリ名のメニュー（about・services・hide・hide_others）、fullscreen、CmdOrCtrl+Q | services・hide・hide_others は macOS 向け（Windows でどう扱われるかは未確認）。Windows はメニューが窓の中に出るので、設定・終了を「ファイル」に移すなど並べ替える。Ctrl+Q は Windows の習慣ではない（Alt+F4） | 箇所：確認済み／代替案：未確認 |
+| menu.rs:20–113 | アプリ名のメニュー（about・services・hide・hide_others）、fullscreen、CmdOrCtrl+Q | muda 0.20.0 の文書では services・hide_others・fullscreen などが「Windows: Unsupported」（ソースで確認済み）。Windows はメニューが窓の中に出るので、設定・終了を「ファイル」に移すなど並べ替える。Ctrl+Q は Windows の習慣ではない（Alt+F4） | 箇所：確認済み／代替案：未確認 |
 | main.rs:1–2 | release だけ `windows_subsystem = "windows"` | そのままでよい。dev ではコンソールが出る | 確認済み |
-| tauri.conf.json:47–61 | bundle.targets "all"、icon に icon.ico あり、macOS の署名の設定 | Windows では msi（WiX）と nsis が作られる（推測）。macOS の節は無視される（推測）。targets を Windows 用に絞るかは決める項目 | 箇所：確認済み／代替案：未確認 |
+| tauri.conf.json:47–61 | bundle.targets "all"、icon に icon.ico あり、macOS の署名の設定 | Windows では msi（WiX）と nsis が作られる（推測）。macOS の節は無視される（推測）。tauri-utils は `tauri.windows.conf.json` を主の設定にマージする（ソースで確認済み）ので、Windows だけ `targets: ["nsis"]` にする（9.1 の 15） | 箇所・マージ：確認済み／代替案：未確認 |
 | tauri.conf.json:24–45 | CSP の `connect-src ipc: http://ipc.localhost` | Windows の Tauri の IPC も `http://ipc.localhost` を使う（推測）ので、そのまま動く見込み | 箇所：確認済み／代替案：未確認 |
 | src-tauri/Cargo.toml:21 | libc を全 OS で依存にしている | `[target.'cfg(unix)'.dependencies]` に移し、Windows は windows-sys（8 章） | 確認済み |
 
@@ -187,7 +187,7 @@ IDE は窓の Cookie から REVEL_SESSION だけを読む（session.rs:522–537
 | 案 B：keyring クレート | Windows・macOS・Linux を 1 つの API で扱える。新しい依存（Cargo.lock にない。確認済み）。Windows の機能を features で有効にする必要がある（推測）。macOS 側を置き換えるかは別の判断 | 未確認 | 選んだ場合に、案 A と同じ単体テストを行う |
 | 値の大きさ | CredentialBlob の上限は CRED_MAX_CREDENTIAL_BLOB_SIZE（5×512 = 2560 バイト）と思われるが、valid_cookie_value（session.rs:38–44）は 4096 バイトまで許す | 上限：未確認、実際の REVEL_SESSION の長さ：不明 | ログインして値の長さを記録する（値そのものは記録しない）。上限を超える値は保存の前に断る |
 | 他のプログラムからの読み出し | 同じ利用者の権限で動くプログラムは確認なしに読める（macOS の限界〔session.rs:9〕と同じ） | 推測（未確認） | 別のプロセス（PowerShell から CredRead を呼ぶ小さなスクリプト）で、確認なしに読めるかを試す |
-| ログインの窓の incognito | WebView2 で InPrivate になり、閉じたあと Cookie・履歴・キャッシュ・パスワードの自動保存がディスクに残らないか。wry が WebView2 の InPrivate を使うというのは推測。パスワードの自動保存は WebView2 の IsPasswordAutosaveEnabled（既定は無効と推測）、フォームの自動入力は IsGeneralAutofillEnabled（既定は有効と推測）で、Tauri からどう設定されるかは不明 | 未確認（自動入力の設定は不明） | 下の「手順 A」 |
+| ログインの窓の incognito | WebView2 で InPrivate になり、閉じたあと Cookie・履歴・キャッシュ・パスワードの自動保存がディスクに残らないか。wry 0.57.0 は incognito を WebView2 の `SetIsInPrivateModeEnabled` に渡す（webview2/mod.rs:414。ソースで確認済み）。InPrivate のときにディスクに何が残るかは未確認。パスワードの自動保存は WebView2 の IsPasswordAutosaveEnabled（既定は無効と推測）、フォームの自動入力は IsGeneralAutofillEnabled（既定は有効と推測）で、Tauri からどう設定されるかは不明 | 未確認（自動入力の設定は不明） | 下の「手順 A」 |
 | パスワードが IDE に渡らない | src-tauri/src で password を含むのは security の副コマンド名だけ（session.rs:78・101・121・133。grep で確認済み）。IDE は cookies() から REVEL_SESSION だけを読む（session.rs:523–536） | コード：確認済み／Windows 版：未確認 | 下の「手順 B」 |
 | ログアウト・期限切れで消える | logout（session.rs:431–435）で delete。ログインのページへ移されたら delete（session.rs:287–290）。Cookie が入れ替われば保存し直す（session.rs:281–285） | コード：確認済み／Windows 版：未確認 | 下の「手順 C」 |
 
@@ -439,20 +439,30 @@ Client の中の lldb-dap 向けの部分を、アダプターごとに分ける
 
 ### 段階 1：ビルドが通り、`npm run tauri dev` で起動する
 
-何を変えるか
-- **最初に 4.10 のパスの検証を直す**（check_name で `\`・`:`・使えない文字・予約名・末尾の `.` と空白を断る）。Windows のテストを足す
-- 2.2 の 79 件を cfg で分ける。process.rs は Windows の実装を別のモジュール（例：`process/windows.rs`）に置き、関数の形（run・run_pair・kill_group・exited_without_reaping・wait_without_reaping）は同じにする。この段階では Job Object の中身まで作らず、まず Child::kill・try_wait の仮の実装でもよい（段階 2 で作り直す）
-- storage.rs のパーミッション、workspace.rs の dev・ino（canonicalize の比較）、random.rs の OwnedFd、submit.rs の localtime_r
-- Cargo.toml：libc を `cfg(unix)` に、windows-sys を `cfg(windows)` に（8 章）
-- HOME の読み方、`.exe` の付け方、app_config_dir の場所の確認
-- 外部コマンドを作る共通の関数を作り、CREATE_NO_WINDOW を付ける（4.6）
-- menu.rs の macOS 向けの項目を分ける
+段階 1 は、次のまとまりごとに 1 つずつコミットする（2026-10-29 に決めた順。各コミットのあとに、番号・入れたファイル・テストの結果を報告してから次へ進む）。
+Unix / macOS の経路のコードは、cfg を付ける・場所を移す以外はできるだけ変えない。共通の関数の引数の形は変えず、Windows 側に別の関数を用意する。
+Unix 側の文字を変えたときは、そのコミットの報告に明記する。push は、段階 1 の最後に利用者が許可するまでしない。
 
-どう確認するか
-- `cargo build`・`cargo clippy` がエラー・警告なし。`cargo test --no-run` が通る（Unix 専用のテストは `#[cfg(unix)]`）
-- `npm run tauri dev` で窓が出て、フォルダを開き、ファイルの一覧・編集・保存ができる。2 つ目の起動が断られる（単一起動のロック）
-- `%APPDATA%\io.github.ishigaki892.acdstudio` に state.json・settings.json ができる
-- `npm run tauri build` の release で、操作のたびにコンソールの窓が出ない
+| 順 | まとまり | 何を変えるか | どう確認するか |
+| --- | --- | --- | --- |
+| C1 | 文書 | この表と、9 章の「決めたこと」 | — |
+| C2 | .gitattributes（9 章 6c） | `* text=auto eol=lf`。`*.bat`・`*.cmd`・`*.ps1` は `eol=crlf`（今は該当するファイルが 0 個。確認済み）。画像は `binary` | `git add --renormalize .` で索引が変わらない。`git checkout-index --all --force` の前に `git status --short` を見て、autogenerated の改行だけの差と .gitattributes 以外に変更があれば止める。書き直したあと `git status` が .gitattributes だけ |
+| C3 | `cargo build` を通す（2.2 の 79 件） | libc を `cfg(unix)`、windows-sys 0.61 を `cfg(windows)` の依存に。process.rs は Unix の関数に `#[cfg(unix)]` を付けて中身を変えず、Windows の仮の実装を `src/process_windows.rs` に置く（直接の子だけを止める・終わりは WaitForSingleObject・メモリは測らない。Job Object は段階 2）。lsp.rs・debug.rs は `process::Pid`。storage.rs のパーミッション、workspace.rs の同じものの判定（Windows は GetFileInformationByHandle のボリュームとファイルの番号）、random.rs の OwnedHandle、submit.rs の時刻（SystemTimeToTzSpecificLocalTime） | `cargo build`・`cargo clippy` がエラー・警告なし |
+| C4 | `cargo test --no-run` を通す（テストの 33 件） | Unix にしかないものを使うテストに `#[cfg(unix)]`（中身は変えない）。process.rs の仮の実装のテストを `cmd /c` で足す | `cargo test --no-run`・`cargo clippy --all-targets` |
+| C4b | CI | `.github/workflows/ci.yml`：macos-latest・windows-latest で `npm ci`・`npm run build`・`cargo build`・`cargo clippy --all-targets`・`cargo test`。windows-port への push と workflow_dispatch で動く | push を許可してもらったあとで結果を見る（それまでは未確認） |
+| C5 | 4.10 パスの検証 | Windows のテストを先に書いて失敗を確かめてから、check_name と check_relative の各要素で `\`・`:`・`*?"<>|`・制御文字・末尾の `.` と空白・予約名を断る（Windows だけ。9 章 13）。テストと修正は 1 つのコミットにし、直す前の失敗をメッセージに書く | 直す前に失敗し、直したあとに通る。外のファイル・フォルダができていない |
+| C6 | 外部コマンドの作り方・HOME・`.exe` | `process::command` で CREATE_NO_WINDOW を付ける（本番のコードの 26 か所）。`toolchain::home_dir()`（Windows は `std::env::home_dir()`）。cargo・rustc・rust-analyzer の名前に `EXE_SUFFIX` | 該当のテスト。窓が出ないことは release で利用者に見てもらう |
+| C7 | `cargo test` を通す | 失敗を分類し、Unix 専用は `#[cfg(unix)]`、後の段階で直すものは `#[cfg_attr(windows, ignore = "…段階 N…")]`、段階 1 の不具合は直す | `cargo test` が Windows で通る |
+| C8 | メニュー（9 章 16） | macOS の今のメニューは `#[cfg(target_os = "macos")]` のまま。Windows は「ファイル」（フォルダを開く・タブを閉じる・言語サーバーを再起動・設定・終了）と「編集」だけ | dev でメニューが出て動く |
+| C9 | キー割り当て・ブラウザの既定のキー（9 章 5） | macOS 以外は既定の割り当ての ⌘ を Ctrl に（storage.rs と keybindings.ts）。表示は `Ctrl+Shift+R` の形。設定の画面の予約のキー。WebView2 のブラウザの既定のキーは、webview2-com で SetAreBrowserAcceleratorKeysEnabled(false) | `npm run build`。dev で Ctrl+S が保存、Ctrl+R が再読み込みにならない、Ctrl+C/V が使える |
+| C10 | バンドル（9 章 15）・まとめ | `src-tauri/tauri.windows.conf.json` で Windows だけ `targets: ["nsis"]`（macOS は "all" のまま）。署名はしない。この文書に段階 1 の結果を書く | `npm run tauri build` で nsis のインストーラーだけができる |
+
+段階 1 の全体の確認
+- Windows で `cargo build`・`cargo test`・`cargo clippy --all-targets` がエラー・警告なし、`npm run build` が通る
+- `npm run tauri dev` で起動し、`%APPDATA%\io.github.ishigaki892.acdstudio` に instance.lock ができる（app_config_dir の場所の確認）
+- 画面の操作は利用者が確かめる：フォルダを開く・ファイル一覧・編集・Ctrl+S で保存・メニュー・Ctrl+R で再読み込みしない・Ctrl+C/V・設定の画面のキーの表示・
+  2 つ目の起動が断られる・release の exe でコンソールの窓が出ない
+- macOS：`cargo check --target aarch64-apple-darwin --all-targets` を試す（依存の C のビルドで失敗すれば未確認）。本当の確認は CI の macos-latest
 
 ### 段階 2：問題の取得とサンプルテスト（AC・WA・RE・TLE・MLE）
 
@@ -507,6 +517,8 @@ Client の中の lldb-dap 向けの部分を、アダプターごとに分ける
 
 ### 段階 6：デバッグ
 
+**今回の移植には含めない（9 章 12。2026-10-29 に決めた）。** 段階 1 では、デバッグのコードは Windows でコンパイルが通るようにするだけで、動かさない。以下は後で行うときのための記録。
+
 何を変えるか
 - 6 章で選んだ方式のアダプターの探索と起動、DAP の違いの吸収
 - 標準入力の渡し方（入力のファイルがないときは `NUL`）
@@ -527,6 +539,10 @@ Client の中の lldb-dap 向けの部分を、アダプターごとに分ける
 | keyring（選んだ場合だけ） | 資格情報の保存を OS ごとに書かずに済む | windows-sys の CredWriteW など（4.1 の案 A） | 未確認 |
 | tauri-plugin-opener（選んだ場合だけ） | URL・ファイル・フォルダを開く処理を OS ごとに書かずに済む。Tauri の公式 | ShellExecuteW（windows-sys）、`explorer.exe` | 未確認 |
 | chrono（選んだ場合だけ） | 提出の時刻の表示。Cargo.lock に 0.4.45 がある | JS 側で整形する、windows-sys の時刻の API | Cargo.lock にあること：確認済み |
+| webview2-com 0.39・windows-core 0.62（Windows だけ。**使うと決めた**） | WebView2 のブラウザの既定のキーを切る（SetAreBrowserAcceleratorKeysEnabled）。Tauri 2.12.4 には設定がなく、`with_webview` の `controller()` が webview2-com の型を返す（ソースで確認済み）。どちらも Tauri の間接依存として同じ版が Cargo.lock にある | JS の preventDefault だけで防ぐ（効くキーは未確認） | Cargo.lock にあること・Tauri の API：確認済み／動き：未確認 |
+
+決めたこと（2026-10-29）：Windows の API は windows-sys を直接使い、keyring・tauri-plugin-opener・chrono などの用途別のクレートは足さない。
+例外として、WebView2 の設定のために webview2-com と windows-core を足す。dunce を使うかは段階 4 で決める（その時点でも windows-sys の方針に合わせて自前の関数にする案がある）。
 
 ---
 
@@ -548,6 +564,32 @@ Client の中の lldb-dap 向けの部分を、アダプターごとに分ける
 14. ログインの窓の incognito が効いていなかったときの対策（4.1）
 15. tauri.conf.json の bundle.targets を Windows でどうするか（msi・nsis の両方か片方か）。署名をするか
 16. メニューの並び（Windows ではアプリ名のメニューがない）
+
+### 9.1 決めたこと（2026-10-29）
+
+| 番号 | 決めたこと | どの段階で |
+| --- | --- | --- |
+| 1 | Job Object には (a) CREATE_SUSPENDED で起動し、主スレッドを探して再開する方法で入れる | 段階 2（段階 1 は仮の実装） |
+| 2 | Windows の API は windows-sys を直接使う。用途別のクレートは足さない（例外は 8 章の webview2-com・windows-core） | 全体 |
+| 3 | 資格情報は案 A（windows-sys の CredWriteW など）。macOS は今のまま Keychain | 段階 3 |
+| 4 | テキストエディタで開く：VS Code があれば VS Code、なければメモ帳 | 段階 3 |
+| 5 | キー割り当ては ⌘ を Ctrl に置き換える。WebView2 のブラウザの既定のキー（Ctrl+R の再読み込みなど）は切る | 段階 1（C9） |
+| 6 | 改行：(a) exact の比較で CRLF を LF に直す（Windows だけ）、(b) 期待出力を保存するときに LF に直す、(c) .gitattributes を足す、のすべて | (c) は段階 1（C2）、(a)(b) は段階 2 |
+| 7 | Python に `-X utf8` を付ける。PyPy で使えるかは段階 2 で確かめる | 段階 2 |
+| 8 | Defender の初回の遅れ：(d) 注意を出すだけ。優先度は低い | 段階 2 以降 |
+| 9 | 手元のビルドでスタックを大きくする。値は段階 2 で決める | 段階 2 |
+| 10 | C++ のコンパイラは既存の MinGW-Builds を勧める。settings.json の cpp.compiler の指定と、決まった場所の探索の両方に対応する | 段階 2 |
+| 11 | clangd・basedpyright の場所の指定を settings.json に足す | 段階 4 |
+| 12 | デバッグは今回の移植に含めない（段階 6 は後回し） | — |
+| 13 | check_name で `\` と `:` を断るのは Windows だけ | 段階 1（C5） |
+| 14 | incognito が効かなかったときの対策は、段階 3 で確かめてから決める | 段階 3 |
+| 15 | bundle.targets は nsis だけ（Windows）。署名はしない | 段階 1（C10） |
+| 16 | メニューは「ファイル」に設定・終了をまとめる最小限の変更 | 段階 1（C8） |
+| 追加 1 | 段階 1 の順：コンパイルを通す変更を先にし、そのあと 4.10 の Windows のテストを書いて失敗を確かめてから直す | 段階 1 |
+| 追加 2 | 4.10 はテストと修正を 1 つのコミットにまとめ、直す前の失敗をメッセージに書く | 段階 1（C5） |
+| 追加 3 | WebView2 の既定のキーを切るために、webview2-com・windows-core を Windows だけの依存として足す（2 の例外） | 段階 1（C9） |
+| 追加 4 | process.rs は段階 1 では仮の Windows 実装（直接の子だけを止める・メモリは測らない）。関数の形は変えず、段階 2 で中身を Job Object に差し替える | 段階 1（C3）・段階 2 |
+| 追加 5 | macOS を壊さないため、CI（GitHub Actions。macos-latest・windows-latest）を足す。push は利用者が許可してから | 段階 1（C4b） |
 
 ---
 
