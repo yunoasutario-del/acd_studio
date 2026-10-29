@@ -899,7 +899,7 @@ impl LspControl {
         Ok(false)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn start_with(
         &self,
         command: Command,
@@ -913,7 +913,7 @@ impl LspControl {
     }
 
     // パッケージの組が変わったとき（コンテストのフォルダに問題を足したなど）も、起動し直す（D-171）
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn start_with_projects(
         &self,
         command: Command,
@@ -932,7 +932,7 @@ impl LspControl {
     }
 
     // 偽のサーバーの単体テスト用：許可リストにない方法（hello・quit など）で偽のサーバーを動かす
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn send_unchecked(&self, text: &str) -> Result<(), String> {
         self.send_checked(text, false)
     }
@@ -1141,6 +1141,7 @@ mod tests {
         assert_eq!(path_of_uri("file:///a%ZZ"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn checks_messages_against_the_allow_list() {
         let root = temp_dir("allow-root");
@@ -1226,6 +1227,7 @@ mod tests {
         assert!(check_message(&change(&limit), &root).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn locates_files_inside_the_workspace() {
         let root = temp_dir("locate-root").canonicalize().unwrap();
@@ -1263,6 +1265,7 @@ mod tests {
         assert_eq!(locate_in_workspace(&root, "https://example.com/a.rs"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn send_rejects_messages_outside_the_allow_list() {
         let control = LspControl::default();
@@ -1286,6 +1289,7 @@ mod tests {
     // 偽のサーバー（perl）。受け取ったメッセージを、method と id だけにして返す。
     // 起動したら子（sleep）の pid を標準エラーに出す。shutdown には答え、exit で終わる。
     // ignore_shutdown なら shutdown に答えず、終わらない
+    #[cfg(unix)]
     fn fake_server(ignore_shutdown: bool) -> Command {
         let script = r#"
             $| = 1;
@@ -1337,6 +1341,7 @@ mod tests {
     }
 
     // 条件を満たすまで、2 秒まで待つ
+    #[cfg(unix)]
     fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
         (0..200).any(|_| {
             let met = condition();
@@ -1347,6 +1352,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn child_pid(events: &Arc<Mutex<Vec<LspEvent>>>) -> libc::pid_t {
         let mut pid = None;
         assert!(wait_until(|| {
@@ -1360,6 +1366,7 @@ mod tests {
     }
 
     // pid のプロセスがもういないか（process.rs のテストと同じ確かめ方）
+    #[cfg(unix)]
     fn gone(pid: libc::pid_t) -> bool {
         wait_until(|| {
             // SAFETY: シグナル 0 は送らず、存在だけを確かめる
@@ -1375,6 +1382,7 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn relays_messages_and_stops_gracefully() {
         let control = LspControl::default();
@@ -1436,6 +1444,7 @@ mod tests {
         assert!(control.send("{}").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn keeps_the_order_of_messages() {
         let control = LspControl::default();
@@ -1471,6 +1480,7 @@ mod tests {
         control.stop();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_during_restart_leaves_nothing() {
         let control = Arc::new(LspControl::default());
@@ -1515,6 +1525,7 @@ mod tests {
         assert_eq!(exits, 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restarts_for_another_session() {
         let control = LspControl::default();
@@ -1546,6 +1557,7 @@ mod tests {
         control.stop();
     }
 
+    #[cfg(unix)]
     #[test]
     fn restarts_when_the_packages_change() {
         let control = LspControl::default();
@@ -1573,6 +1585,7 @@ mod tests {
         control.stop();
     }
 
+    #[cfg(unix)]
     #[test]
     fn reports_server_that_exits_by_itself() {
         let control = LspControl::default();
@@ -1606,6 +1619,7 @@ mod tests {
         assert_eq!(exits, 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stops_reading_broken_output() {
         let control = LspControl::default();
@@ -1638,6 +1652,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn kills_server_that_ignores_shutdown() {
         let control = LspControl::default();
@@ -1666,6 +1681,7 @@ mod tests {
         assert!(gone(child), "子孫のプロセスが残っている");
     }
 
+    #[cfg(unix)]
     #[test]
     fn restarts_for_another_package() {
         let control = LspControl::default();
@@ -1823,6 +1839,7 @@ mod tests {
         assert!(args.contains(&"--enable-config=false".to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn restarts_for_another_language() {
         let control = LspControl::default();

@@ -496,6 +496,7 @@ pub fn trash_file(root: &Path, relative: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     // テスト用の一時フォルダ。終わったら消す
@@ -631,18 +632,26 @@ mod tests {
         }
         assert!(!base.0.join("outside/sample-1.out").exists());
         // 外を指すフォルダのリンクの先には書かない
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("pkg/linked")).unwrap();
+        #[cfg(unix)]
         assert!(write_expected(&ws, "pkg/linked/sample-1.out", "x", never).is_err());
+        #[cfg(unix)]
         assert!(!base.0.join("outside/sample-1.out").exists());
         // 外を指す .out のリンクの先には書かない
+        #[cfg(unix)]
         fs::write(base.0.join("outside/target.txt"), "secret").unwrap();
+        #[cfg(unix)]
         symlink(
             base.0.join("outside/target.txt"),
             ws.join("pkg/test/sample-4.out"),
         )
         .unwrap();
+        #[cfg(unix)]
         fs::write(ws.join("pkg/test/sample-4.in"), "").unwrap();
+        #[cfg(unix)]
         assert!(write_expected(&ws, "pkg/test/sample-4.out", "x", || true).is_err());
+        #[cfg(unix)]
         assert_eq!(
             fs::read_to_string(base.0.join("outside/target.txt")).unwrap(),
             "secret"
@@ -701,7 +710,9 @@ mod tests {
             None
         );
         assert_eq!(locate_in_package(&ws, "", "../outside/secret.txt"), None);
+        #[cfg(unix)]
         symlink(&secret, ws.join("pkg/src/link.rs")).unwrap();
+        #[cfg(unix)]
         assert_eq!(locate_in_package(&ws, "pkg", "src/link.rs"), None);
         // ws2 のような、名前が前方一致する別のフォルダは作業領域の中ではない
         assert_eq!(locate_in_package(&ws, "pkg", "../../ws2/other.txt"), None);
@@ -740,6 +751,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_sibling_with_common_prefix() {
         let (base, ws) = setup("prefix");
@@ -751,6 +763,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_links_to_outside() {
         let (base, ws) = setup("outside");
@@ -765,6 +778,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn allows_links_to_inside() {
         let (_base, ws) = setup("link-inside");
@@ -772,6 +786,7 @@ mod tests {
         assert_eq!(resolve(&ws, "main-link"), Ok(ws.join("src/main.rs")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn lists_directories_first_then_names() {
         let (base, ws) = setup("list");
@@ -827,6 +842,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn writes_only_existing_files() {
         let (base, ws) = setup("write");
         write_existing(&ws, "src/main.rs", "fn main() { 1; }", None).unwrap();
@@ -837,8 +853,11 @@ mod tests {
         assert!(write_existing(&ws, "new.rs", "", None).is_err());
         assert!(!ws.join("new.rs").exists());
         assert!(write_existing(&ws, "src", "", None).is_err());
+        #[cfg(unix)]
         symlink(base.0.join("outside/secret.txt"), ws.join("secret-link")).unwrap();
+        #[cfg(unix)]
         assert!(write_existing(&ws, "secret-link", "changed", None).is_err());
+        #[cfg(unix)]
         assert_eq!(
             fs::read_to_string(base.0.join("outside/secret.txt")).unwrap(),
             "secret"
@@ -846,6 +865,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn creates_files_without_overwriting() {
         let (base, ws) = setup("create");
         assert_eq!(
@@ -865,12 +885,16 @@ mod tests {
         for name in ["", ".", "..", "a/b", "a\0b"] {
             assert!(create_file(&ws, "", name).is_err(), "{name:?}");
         }
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("dir-link")).unwrap();
+        #[cfg(unix)]
         assert!(create_file(&ws, "dir-link", "x.txt").is_err());
+        #[cfg(unix)]
         assert!(!base.0.join("outside/x.txt").exists());
     }
 
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn renames_files_in_same_folder() {
         let (base, ws) = setup("rename");
         assert_eq!(
@@ -912,16 +936,20 @@ mod tests {
         assert!(ws.join("source/lib.rs").exists());
         assert!(rename_file(&ws, "", "x").is_err());
         // 外を指すリンクは、リンク自体の名前を変える（リンクの先は変わらない）
+        #[cfg(unix)]
         symlink(base.0.join("outside/secret.txt"), ws.join("secret-link")).unwrap();
+        #[cfg(unix)]
         assert_eq!(
             rename_file(&ws, "secret-link", "renamed-link"),
             Ok("renamed-link".to_string())
         );
+        #[cfg(unix)]
         assert!(base.0.join("outside/secret.txt").exists());
     }
 
     // D-157：フォルダの作成・数え方・見分け方
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn creates_counts_and_tells_folders() {
         let (base, ws) = setup("folder");
         assert_eq!(
@@ -935,17 +963,24 @@ mod tests {
         // 名前・場所の確かめ
         assert!(create_folder(&ws, "src", "a/b").is_err());
         assert!(create_folder(&ws, "src", "..").is_err());
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("dir-link")).unwrap();
+        #[cfg(unix)]
         assert!(create_folder(&ws, "dir-link", "x").is_err());
+        #[cfg(unix)]
         assert!(!base.0.join("outside/x").exists());
         // 数える：中のフォルダの中も数え、リンクはたどらない。上限で止める
         fs::write(ws.join("src/util/a.rs"), "").unwrap();
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("src/util/out-link")).unwrap();
+        #[cfg(unix)]
         assert_eq!(count_files(&ws.join("src"), 10_000), 3);
+        #[cfg(unix)]
         assert_eq!(count_files(&ws.join("src"), 2), 2);
         // フォルダか：リンクは先がフォルダでもフォルダとしない。ルートは断る
         assert_eq!(is_folder(&ws, "src"), Ok(true));
         assert_eq!(is_folder(&ws, "src/main.rs"), Ok(false));
+        #[cfg(unix)]
         assert_eq!(is_folder(&ws, "dir-link"), Ok(false));
         assert!(is_folder(&ws, "").is_err());
     }
@@ -974,6 +1009,7 @@ mod tests {
         assert_eq!(current_stamp(&ws, "no-such-file"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn keeps_permissions_and_hard_links_when_writing() {
         use std::os::unix::fs::PermissionsExt;
@@ -1004,6 +1040,7 @@ mod tests {
     }
 
     // リンクを削除すると、リンク自体だけが消え、リンクの先（ファイル・フォルダ）は残る（D-102）
+    #[cfg(unix)]
     #[test]
     fn deletes_links_without_touching_targets() {
         let (base, ws) = setup("trash-links");
@@ -1026,6 +1063,7 @@ mod tests {
         assert!(fs::symlink_metadata(ws.join("broken-link")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_link_loops_and_missing() {
         let (_base, ws) = setup("loop");

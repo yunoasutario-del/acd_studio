@@ -198,6 +198,7 @@ mod tests {
         assert!(found.location.starts_with("~/.cargo/registry/src/"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_everything_else() {
         let home = TempDir::new("refused");
@@ -270,6 +271,7 @@ mod tests {
         assert!(allowed_roots(None, None, None).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn reads_cpp_headers_without_extensions() {
         let dir = TempDir::new("cpp");
@@ -310,6 +312,7 @@ mod tests {
     }
 
     // Python の場所の .py・.pyi（D-225）
+    #[cfg(unix)]
     #[test]
     fn reads_python_sources() {
         let dir = TempDir::new("python");

@@ -1239,6 +1239,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_folders_that_point_outside() {
         let root = TempDir::new("outside");

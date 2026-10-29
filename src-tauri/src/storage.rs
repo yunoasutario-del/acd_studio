@@ -903,8 +903,12 @@ mod tests {
         assert_eq!(load_state(&dir.0), Ok(Loaded::Missing));
         save_state(&dir.0, &sample_state()).unwrap();
         assert_eq!(load_state(&dir.0), Ok(Loaded::Ok(sample_state())));
+        // パーミッションは Unix だけ（Windows には 0600・0700 がない）
+        #[cfg(unix)]
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        #[cfg(unix)]
         assert_eq!(mode(&dir.0.join(STATE_FILE)), 0o600);
+        #[cfg(unix)]
         assert_eq!(mode(&dir.0), 0o700);
         // 一時ファイルは残らない
         let names: Vec<_> = fs::read_dir(&dir.0)
@@ -1045,11 +1049,13 @@ mod tests {
                 denied: Vec::new()
             }))
         );
+        #[cfg(unix)]
         let mode = fs::metadata(dir.0.join(TRUSTED_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
+        #[cfg(unix)]
         assert_eq!(mode, 0o600);
         // 文字列でない要素や、形の違うファイルは退避する（何も信頼していないものとして扱われる）
         for bad in [
@@ -1253,11 +1259,13 @@ mod tests {
         assert_eq!(loaded.key_bindings, bindings);
         assert_eq!(loaded.appearance, appearance);
         assert!(loaded.appearance_problems.is_empty());
+        #[cfg(unix)]
         let mode = fs::metadata(dir.0.join(SETTINGS_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
+        #[cfg(unix)]
         assert_eq!(mode, 0o600);
         // 範囲の外の大きさは書かない
         let mut bad = appearance.clone();

@@ -1770,6 +1770,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stops_a_case_at_the_time_limit() {
         // 時間の制限で止めて TLE にする（D-141）。sh で 2 秒待つスクリプトを、制限 200 ms で動かす

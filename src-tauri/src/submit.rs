@@ -2358,6 +2358,7 @@ mod tests {
         assert_eq!(jst(1_793_012_400, 'T'), "2026-10-26T20:00:00+09:00");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepares_a_cpp_submission() {
         let base =

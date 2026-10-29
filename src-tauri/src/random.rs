@@ -688,6 +688,7 @@ mod tests {
         assert!(!folder.join("random-11.in").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn does_not_save_outside_the_workspace() {
         let ws = workspace("outside");
@@ -1126,6 +1127,7 @@ fn main() {
     // Python の生成器・愚直解・解答で試す（Phase 19 作業 1。D-220〜D-222）。手元にジャッジと同じ CPython 3.13 がないので、
     // 版だけを「Python 3.13.7」と答え、ほかは Homebrew の python3 に渡す代わりの処理系で動かす（版の確かめ・構文の確かめ・
     // 命令の組み立て・example の名前を確かめる。Python の版の違いによる動きの違いは確かめない）
+    #[cfg(unix)]
     #[test]
     fn finds_differences_with_python_programs() {
         let real = Path::new("/opt/homebrew/bin/python3");

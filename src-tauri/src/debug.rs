@@ -1727,6 +1727,7 @@ mod tests {
         assert_eq!(strip_hash("a::h4b2b0ff0f5cdd15z"), "a::h4b2b0ff0f5cdd15z");
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_breakpoints_only_in_workspace_rust_files() {
         let ws = workspace("paths");
@@ -1889,6 +1890,7 @@ mod tests {
     }
 
     // アダプターが止めなかったデバッグ対象を、pid で止める
+    #[cfg(unix)]
     #[test]
     fn stops_leftover_debuggee() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
@@ -2519,6 +2521,7 @@ int main() {
 
     // ---- 本物の debugpy を使うテスト（D-226）。処理系と、アプリのフォルダの python/<処理系> の debugpy が要る ----
 
+    #[cfg(unix)]
     const PYTHON_SOLUTION: &str = "import sys
 
 
@@ -2546,17 +2549,22 @@ def main():
 main()
 ";
     // 行番号（PYTHON_SOLUTION の中）
+    #[cfg(unix)]
     const PY_LINE_TOTAL: u32 = 7;
+    #[cfg(unix)]
     const PY_LINE_RETURN: u32 = 8;
+    #[cfg(unix)]
     const PY_LINE_KEY_ERROR: u32 = 17;
 
     // 利用者がアプリのフォルダに入れた debugpy（なければ None）
+    #[cfg(unix)]
     fn installed_python_tools() -> Option<PathBuf> {
         let tools = PathBuf::from(std::env::var_os("HOME")?)
             .join("Library/Application Support/io.github.ishigaki892.acdstudio/python");
         tools.is_dir().then_some(tools)
     }
 
+    #[cfg(unix)]
     fn python_session(
         pkg: &Path,
         root: &Path,
@@ -2651,6 +2659,7 @@ main()
     }
 
     // 止まる → スタック → 変数 → 式 → ステップ → 続行して終わる。例外で止まる。exit() では止まらない。止める
+    #[cfg(unix)]
     #[test]
     fn debugs_python_with_real_debugpy() {
         let Some(tools) = installed_python_tools() else {

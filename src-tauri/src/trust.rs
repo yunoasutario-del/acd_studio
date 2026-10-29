@@ -215,6 +215,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn does_not_follow_links_but_reports_them() {
         let dir = TempDir::new("links");

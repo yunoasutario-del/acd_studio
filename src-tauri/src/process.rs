@@ -840,7 +840,8 @@ pub fn run_pair(
     })
 }
 
-#[cfg(test)]
+// /bin/sh・perl・kill を使うので Unix だけ。Windows の仮の実装のテストは下の windows_tests
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1244,5 +1245,159 @@ mod tests {
         assert_eq!(result.transcript[0], (Side::Solution, b"0\n".to_vec()));
         assert_eq!(result.transcript[1], (Side::Judge, b"0\n".to_vec()));
         assert_eq!(result.transcript[1998], (Side::Solution, b"999\n".to_vec()));
+    }
+}
+
+// Windows の仮の実装（段階 1）のテスト。cmd.exe の組み込みのコマンドだけで動かす（子孫を作らないもの）。
+// 子孫を止めること・使用メモリは、段階 2 の Job Object で確かめる
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+
+    // cmd /c に、引用の加工をせずにそのまま渡す
+    fn cmd(script: &str) -> Command {
+        let mut command = Command::new("cmd");
+        command.arg("/c").raw_arg(script);
+        command
+    }
+
+    fn limits(time_ms: u64, output: usize) -> Limits {
+        Limits {
+            memory: None,
+            time: Some(Duration::from_millis(time_ms)),
+            output,
+        }
+    }
+
+    fn run_cmd(script: &str, limits: &Limits) -> RunResult {
+        run(
+            cmd(script),
+            None,
+            limits,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn captures_output_and_exit_code() {
+        let result = run_cmd("echo out& 1>&2 echo err& exit /b 3", &limits(5000, 1024));
+        assert_eq!(result.outcome, Outcome::Exited(3));
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err");
+        assert!(!result.output_left_open);
+        // 使用メモリは段階 1 では測らない
+        assert_eq!(result.max_rss_bytes, None);
+    }
+
+    #[test]
+    fn passes_stdin_from_file() {
+        let path =
+            std::env::temp_dir().join(format!("atcoder-studio-win-stdin-{}", std::process::id()));
+        std::fs::write(&path, "1 2\n").unwrap();
+        let mut findstr = Command::new("findstr");
+        findstr.arg("^");
+        let result = run(
+            findstr,
+            Some(File::open(&path).unwrap()),
+            &limits(5000, 1024),
+            &Arc::new(AtomicBool::new(false)),
+            |_, _| {},
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "1 2");
+    }
+
+    #[test]
+    fn stops_at_time_limit() {
+        let result = run_cmd("for /l %i in () do @rem", &limits(300, 1024));
+        assert_eq!(result.outcome, Outcome::TimedOut);
+        assert!(result.elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn stops_when_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let result = run(
+            cmd("for /l %i in () do @rem"),
+            None,
+            &limits(5000, 1024),
+            &cancel,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.outcome, Outcome::Stopped);
+        assert!(result.elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn stops_at_output_limit() {
+        let result = run_cmd("for /l %i in () do @echo yyyyyyyyyyyyyyyy", &limits(10000, 64 * 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
+        assert_eq!(result.stdout.len(), 64 * 1024);
+    }
+
+    #[test]
+    fn reads_both_streams_without_blocking() {
+        // 標準エラーに、パイプの容量より多く書いてから、標準出力に書く（片方だけを読むと詰まる）
+        let result = run_cmd(
+            "(for /l %i in (1,1,3000) do @(1>&2 echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx))& echo done",
+            &limits(20000, 4 * 1024 * 1024),
+        );
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert!(result.stderr.len() > 100_000, "{}", result.stderr.len());
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "done");
+    }
+
+    #[test]
+    fn relays_between_two_processes() {
+        // 解答が 5 を出して終わる。ジャッジ（findstr）は届いた行を返し、EOF で終わる
+        let result = run_pair(
+            cmd("echo 5"),
+            {
+                let mut judge = Command::new("findstr");
+                judge.arg("^");
+                judge
+            },
+            &limits(5000, 1024),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert!(!result.timed_out && !result.stopped);
+        let text: Vec<(Side, String)> = result
+            .transcript
+            .iter()
+            .map(|(side, bytes)| (*side, String::from_utf8_lossy(bytes).trim().to_string()))
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                (Side::Solution, "5".to_string()),
+                (Side::Judge, "5".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn times_out_and_stops_both() {
+        let result = run_pair(
+            cmd("for /l %i in () do @rem"),
+            cmd("for /l %i in () do @rem"),
+            &limits(300, 1024),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(result.timed_out);
+        assert!(result.elapsed < Duration::from_secs(3));
     }
 }
