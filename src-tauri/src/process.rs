@@ -72,6 +72,21 @@ pub struct Limits {
     pub memory: Option<u64>,
 }
 
+// 外部のプログラムを起動する Command を作る。Unix では Command::new と同じ。
+// Windows では、窓だけで端末を持たない IDE からコンソールのプログラム（cargo・g++・解答など）を起動すると、そのたびに
+// コンソールの窓が出る（推測。未確認）ので、CREATE_NO_WINDOW を付ける（Windows 移植の段階 1 C6。docs/windows-port-plan.md 4.6）。
+// creation_flags は上書きなので、段階 2 で CREATE_SUSPENDED などを足すときも、ここで組み合わせる
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(unix, allow(unused_mut))]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
+}
+
 // プロセスの番号の型（Unix は pid_t。Windows の番号は u32 だが、Unix と同じ i32 で持ち、使うときに u32 に戻す）
 #[cfg(unix)]
 pub type Pid = libc::pid_t;

@@ -130,7 +130,7 @@ fn ask_trust(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.to_string_lossy().into_owned());
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = toolchain::home_dir();
     let message = trust::confirmation_message(&name, &trust::inspect(root, home.as_deref()));
     let trusted = app
         .dialog()
@@ -1719,8 +1719,9 @@ pub async fn import_vscode_snippets(
 ) -> Result<snippets::Imported, String> {
     let dir = app_dir(&app)?;
     let home =
-        std::env::var_os("HOME").ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
-    let source = PathBuf::from(home)
+        toolchain::home_dir().ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
+    // Windows の VS Code の場所（%APPDATA%\Code\User\snippets）にするのは段階 3
+    let source = home
         .join("Library/Application Support/Code/User/snippets")
         .join(snippets::vscode_file_name(language));
     tauri::async_runtime::spawn_blocking(move || {

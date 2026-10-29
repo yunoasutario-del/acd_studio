@@ -123,7 +123,7 @@ pub fn read_source(
     cpp_roots: &[PathBuf],
     python_roots: &[PathBuf],
 ) -> Result<ReadOnlySource, String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::toolchain::home_dir();
     let rustup_home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from);
     let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
     let roots = allowed_roots(

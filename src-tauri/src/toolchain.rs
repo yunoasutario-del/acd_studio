@@ -12,13 +12,30 @@ use serde::Deserialize;
 
 use crate::language::Language;
 
+// 利用者のホームのフォルダ。Unix は HOME（これまでどおり）。Windows では HOME はふつう設定されていないので、
+// std::env::home_dir（USERPROFILE）を使う（Windows 移植の段階 1 C6）
+#[cfg(unix)]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(windows)]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir()
+}
+
+// 実行ファイルの名前。Windows では `.exe` を付ける（Unix ではそのまま。Windows 移植の段階 1 C6）
+pub fn exe_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
 // cargo を探す。PATH で見つからなければ ~/.cargo/bin/cargo（rustup）を使う（D-098）。
 // それもなければ、Homebrew の置き場所（Apple Silicon の /opt/homebrew/bin、Intel の /usr/local/bin）を探す
 // （Phase 10 作業 13）。Finder から起動したアプリは、シェルの PATH を引き継がないと思われる（推測・未確認）
 const HOMEBREW_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 
 pub fn find_cargo() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = home_dir();
     let homebrew: Vec<PathBuf> = HOMEBREW_DIRS.iter().map(PathBuf::from).collect();
     find_cargo_in(
         std::env::var_os("PATH").as_deref(),
@@ -35,18 +52,18 @@ fn find_cargo_in(
 ) -> Option<PathBuf> {
     let from_path = path.and_then(|paths| {
         std::env::split_paths(paths)
-            .map(|dir| dir.join("cargo"))
+            .map(|dir| dir.join(exe_name("cargo")))
             .find(|path| path.is_file())
     });
     from_path
         .or_else(|| {
-            let path = home?.join(".cargo/bin/cargo");
+            let path = home?.join(".cargo/bin").join(exe_name("cargo"));
             path.is_file().then_some(path)
         })
         .or_else(|| {
             homebrew
                 .iter()
-                .map(|dir| dir.join("cargo"))
+                .map(|dir| dir.join(exe_name("cargo")))
                 .find(|path| path.is_file())
         })
 }
@@ -86,7 +103,7 @@ pub fn clear_ide_env(command: &mut Command) {
 // rustup が手元にない版を自動で取得しないように RUSTUP_AUTO_INSTALL=0 を付ける（D-107）。
 // 利用者が自分で RUSTUP_AUTO_INSTALL を設定していれば、その値を使う
 pub fn cargo_command(program: &Path, dir: &Path) -> Command {
-    let mut command = Command::new(program);
+    let mut command = crate::process::command(program);
     command.current_dir(dir);
     clear_ide_env(&mut command);
     if std::env::var_os("RUSTUP_AUTO_INSTALL").is_none() {
@@ -106,7 +123,7 @@ pub const JUDGE_NOTE: &str = "rustc 1.89.0、edition 2024（AtCoder の 2025/10 
 fn rustc_beside(cargo: &Path) -> PathBuf {
     cargo
         .parent()
-        .map(|dir| dir.join("rustc"))
+        .map(|dir| dir.join(exe_name("rustc")))
         .filter(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from("rustc"))
 }
@@ -459,24 +476,25 @@ mod tests {
         }
         let brews = vec![base.join("none"), brew.clone()];
         let path_var = std::ffi::OsString::from(path_dir.as_os_str());
+        let cargo = exe_name("cargo");
         assert_eq!(find_cargo_in(Some(&path_var), Some(&home), &brews), None);
         // Homebrew だけにある
-        std::fs::write(brew.join("cargo"), "").unwrap();
+        std::fs::write(brew.join(&cargo), "").unwrap();
         assert_eq!(
             find_cargo_in(Some(&path_var), Some(&home), &brews),
-            Some(brew.join("cargo"))
+            Some(brew.join(&cargo))
         );
         // rustup（~/.cargo/bin）が Homebrew より先
-        std::fs::write(home.join(".cargo/bin/cargo"), "").unwrap();
+        std::fs::write(home.join(".cargo/bin").join(&cargo), "").unwrap();
         assert_eq!(
             find_cargo_in(Some(&path_var), Some(&home), &brews),
-            Some(home.join(".cargo/bin/cargo"))
+            Some(home.join(".cargo/bin").join(&cargo))
         );
         // PATH がいちばん先
-        std::fs::write(path_dir.join("cargo"), "").unwrap();
+        std::fs::write(path_dir.join(&cargo), "").unwrap();
         assert_eq!(
             find_cargo_in(Some(&path_var), Some(&home), &brews),
-            Some(path_dir.join("cargo"))
+            Some(path_dir.join(&cargo))
         );
         let _ = std::fs::remove_dir_all(&base);
     }

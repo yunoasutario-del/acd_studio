@@ -917,7 +917,7 @@ fn build_cpp(
             message: format!("ビルドの置き場所（target/）を作れません：{error}"),
         });
     }
-    let mut build = Command::new(compiler);
+    let mut build = crate::process::command(compiler);
     build.current_dir(dir).args(args);
     toolchain::clear_ide_env(&mut build);
     let mut build_log = Display::new(channel, LogKind::Build, "ビルドの出力");
@@ -990,7 +990,7 @@ impl Program {
     }
 
     pub(crate) fn command(&self) -> Command {
-        let mut command = Command::new(&self.path);
+        let mut command = crate::process::command(&self.path);
         command.args(&self.args);
         command
     }

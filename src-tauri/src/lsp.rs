@@ -664,7 +664,7 @@ impl Launch {
 fn find_rust_analyzer() -> Result<PathBuf, String> {
     let cargo = find_cargo()
         .ok_or_else(|| "cargo が見つからないので、rust-analyzer を探せません".to_string())?;
-    let path = cargo.with_file_name("rust-analyzer");
+    let path = cargo.with_file_name(toolchain::exe_name("rust-analyzer"));
     if path.is_file() {
         Ok(path)
     } else {
@@ -738,7 +738,7 @@ pub fn clangd(
     options: Value,
 ) -> Result<Launch, String> {
     let program = find_clangd()?;
-    let mut command = Command::new(program);
+    let mut command = crate::process::command(program);
     command.args(clangd_args(compiler)?);
     toolchain::clear_ide_env(&mut command);
     Ok(Launch {
@@ -789,7 +789,7 @@ pub fn basedpyright(
     interpreter: Option<&Path>,
 ) -> Result<Launch, String> {
     let program = find_basedpyright()?;
-    let mut command = Command::new(program);
+    let mut command = crate::process::command(program);
     command.arg("--stdio");
     toolchain::clear_ide_env(&mut command);
     Ok(Launch {
