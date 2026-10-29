@@ -35,7 +35,7 @@ AtCoder Studio（Tauri 2。今は macOS 専用）を Windows 11 x64 で動かす
 | Defender | リアルタイム保護は有効（Get-MpComputerStatus）。除外の一覧は管理者でないと読めない | 確認済み |
 | Smart App Control | VerifiedAndReputablePolicyState = 0（無効） | 確認済み |
 | git | `core.autocrlf=true`（`C:/Program Files/Git/etc/gitconfig`）。作業ツリーのテキストは CRLF（`git ls-files --eol`） | 確認済み |
-| 開発者モード | レジストリの値を読めなかった（シンボリックリンクを作るテストに関係） | 不明 |
+| 開発者モード | レジストリの値は読めなかった。管理者でない利用者ではシンボリックリンクを作れず（「Administrator privilege required」）、ジャンクションは作れた（2026-10-29。段階 1 C4） | シンボリックリンク・ジャンクション：確認済み／開発者モードの設定：不明 |
 
 ---
 
@@ -142,7 +142,7 @@ session.rs の Keychain を使うテスト、storage.rs の 0o600・0o700 の検
 | python.rs:40–46・152–203 | `python3.13`・`pypy3.11`・`pypy3` を Homebrew、PATH の順に | Windows の公式の CPython は `python.exe`（版の付いた名前は入らない。推測）。py ランチャー（`py -3.13`）、`%LOCALAPPDATA%\Programs\Python\Python313\python.exe`、PyPy は `pypy3.exe`（推測）。WindowsApps の 0 バイトのエイリアスは除く（実体がないことは確認済み） | 箇所：確認済み／代替案：未確認 |
 | lsp.rs:751–765・802–810 | `basedpyright-langserver` を探し、リンクをたどった先の `dist/typeshed-fallback` を使う | pip 版なら `Scripts\basedpyright-langserver.exe`、npm 版なら `.cmd`（4.8）。typeshed の場所の求め方を版ごとに調べ直す（未確認） | 箇所：確認済み／代替案：未確認 |
 | commands.rs:133、sources.rs:126、toolchain.rs:21、debug.rs:225・865 | `HOME` を読む | Windows では HOME は普通は設定されていない（Git Bash の中だけ。推測）→ `std::env::home_dir()`（Rust 1.86 で Windows の動きが直った。推測）か USERPROFILE | 箇所：確認済み／代替案：未確認 |
-| commands.rs:1514–1519 | `app_config_dir()`（macOS は `~/Library/Application Support/<識別子>`） | Windows は `%APPDATA%\io.github.ishigaki892.acdstudio`（Roaming）になる（推測。起動して確かめる） | 箇所：確認済み／代替案：未確認 |
+| commands.rs:1514–1519 | `app_config_dir()`（macOS は `~/Library/Application Support/<識別子>`） | Windows は `%APPDATA%\io.github.ishigaki892.acdstudio`（Roaming）。`npm run tauri dev` で起動して、instance.lock・settings.json・state.json ができた（段階 1 C8） | 確認済み |
 | commands.rs:1713–1725、snippets.rs:67・100 | VS Code のスニペット `~/Library/Application Support/Code/User/snippets/` | `%APPDATA%\Code\User\snippets\`（この環境にフォルダがあることは確認済み） | 箇所：確認済み、フォルダも確認済み／代替案：未確認 |
 | lsp.rs:147–159・265–306 | `file_uri`・`path_of_uri` が `/` で始まる Unix のパスを前提にする | `file:///C:/…` の形にし、ドライブ名の大文字・小文字と `%3A` の揺れを吸収する。src/editor/lsp.ts:301–315 の documentUri も合わせる | 箇所：確認済み／代替案：未確認 |
 | workspace.rs:59–71 など canonicalize の各所 | canonicalize は Windows では `\\?\C:\…` を返す（推測） | dunce（Cargo.lock に 1.0.5 がある）で普通の形にしてから、外部ツール・URI・表示に渡す | 箇所：確認済み／代替案：未確認 |
@@ -151,7 +151,7 @@ session.rs の Keychain を使うテスト、storage.rs の 0o600・0o700 の検
 | storage.rs:13・441・466・469・820 | アプリのフォルダを 0o700、ファイルを 0o600 で作る | Windows では cfg で外す（`%APPDATA%` は利用者だけの ACL。推測）。必要なら ACL を明示する | 箇所：確認済み／代替案：未確認 |
 | storage.rs:814–828 | 単一起動のロック（`File::try_lock`） | Windows でも LockFileEx で動く（推測。2 つ起動して確かめる） | 箇所：確認済み／代替案：未確認 |
 | storage.rs:448–473 | 一時ファイルに書いて rename で置き換える | Windows の rename は置き換えに対応（MoveFileExW）。相手のファイルをほかのプロセス（エディタ・Defender）が開いていると失敗しうる（推測）→ 失敗したら少し待って再試行 | 箇所：確認済み／代替案：未確認 |
-| src/panels/logLinks.ts:11–13 | `src/main.rs:5:10` の形だけを場所として読む（`\` を含まない） | Windows の rustc・cargo は `src\main.rs` と出す（推測）→ `\` も区切りとして受け付ける。今のままだと `main.rs:5:10` だけに一致して、別のファイルへ移動しうる | 箇所：確認済み／代替案：未確認 |
+| src/panels/logLinks.ts:11–13 | `src/main.rs:5:10` の形だけを場所として読む（`\` を含まない） | Windows の rustc の診断のパスは `examples\gen.rs` のように `\` 区切り（random.rs のテストで確認済み。段階 1 C7）→ `\` も区切りとして受け付ける。今のままだと `main.rs:5:10` だけに一致して、別のファイルへ移動しうる | 箇所：確認済み／代替案：未確認 |
 | run.rs:1457–1466、workspace.rs:310–320 | 相対パスを `/` でつなぐ | Windows でも components を `/` でつないでいるので、そのままでよい（推測） | 箇所：確認済み／代替案：未確認 |
 
 ### 3.4 画面・メニュー・設定
@@ -193,7 +193,7 @@ IDE は窓の Cookie から REVEL_SESSION だけを読む（session.rs:522–537
 
 手順 A（incognito の確かめ方）
 
-1. WebView2 の利用者データのフォルダの実際の場所を確かめる（`%LOCALAPPDATA%\io.github.ishigaki892.acdstudio\EBWebView` と推測）
+1. WebView2 の利用者データのフォルダは `%LOCALAPPDATA%\io.github.ishigaki892.acdstudio\EBWebView`（段階 1 で起動したときにできた。確認済み）
 2. ログインの前・ログイン中・ログインの窓を閉じたあと・アプリを終えたあとに、フォルダの中のファイル一覧と更新日時を記録する
 3. `Default\Network\Cookies`・`Default\Login Data`・`Default\Web Data`・`Default\History` などに、`atcoder.jp`・`REVEL_SESSION`・利用者名・パスワードの文字列が残っていないかを検索する
 4. InPrivate の一時フォルダがどこに作られ、閉じたときに消えるかを見る
@@ -332,7 +332,7 @@ C++ の解答に手元だけで `_setmode` を入れる案は、ジャッジと�
 | 項目 | 内容 | 確認状況 |
 | --- | --- | --- |
 | check_name（workspace.rs:302–308） | `/`・NUL・`.`・`..`・空だけを断る。`\` と `:` は見ていない | 確認済み（コード） |
-| Windows の Path の動き | `\` も区切りとして扱う。`join` に接頭辞（`C:`）や根（`\`）のあるパスを渡すと、前の部分を置き換える | 標準ライブラリの文書の記述（Windows での実行は未確認） |
+| Windows の Path の動き | `\` も区切りとして扱う。`join` に接頭辞（`C:`）や根（`\`）のあるパスを渡すと、前の部分を置き換える。さらに `\\?\` の付いたパスに join すると `..` がその場で解決される（`\\?\C:\base\ws` + `..\escape.txt` → `\\?\C:\base\escape.txt`） | 確認済み（小さなプログラムで。段階 1 C5） |
 | 外に出られる経路 | check_name を通った名前は canonicalize されずに `join` される。そのため次の経路で作業領域の外を触れる可能性が高い。create_file（workspace.rs:417–436）・create_folder（:377–391）：名前 `..\x`・`C:\x`・`C:x` で外にファイル・フォルダを作る（作ったあとで to_relative が失敗しても、作ったものは残る）。rename_file（:441–466）：新しい名前 `..\..\x` で外へ移す。entry_path（:356–367）を通る trash_file（:479–486）・is_link（:469–473）・is_folder（:370–374）：相対パスの最後の要素を `..\..\secret` にすると外のファイルをゴミ箱に移す（commands.rs:517 の削除） | 推測（コードからの推測。未確認） |
 | 直し方 | Windows では、`\`・`:`・`<>"|?*`・制御文字・予約名・末尾の `.` と空白を check_name で断る。macOS でも `\` と `:` を断るかは決める項目（macOS ではどちらもファイル名に使える） | 未確認（まだ行っていない） |
 | check_relative（workspace.rs:38–56） | `split('/')` で空の要素だけを見るが、続く `Path::components` が Windows では `\` も区切りとして扱い、`..`（ParentDir）・`C:`（Prefix）・`\`（RootDir）・UNC を断る。resolve（:58–71）は canonicalize して starts_with で確かめる。このため `\` を含む相対パスで外に出ることはない見込み | 推測（未確認） |
@@ -463,6 +463,71 @@ Unix 側の文字を変えたときは、そのコミットの報告に明記す
 - 画面の操作は利用者が確かめる：フォルダを開く・ファイル一覧・編集・Ctrl+S で保存・メニュー・Ctrl+R で再読み込みしない・Ctrl+C/V・設定の画面のキーの表示・
   2 つ目の起動が断られる・release の exe でコンソールの窓が出ない
 - macOS：`cargo check --target aarch64-apple-darwin --all-targets` を試す（依存の C のビルドで失敗すれば未確認）。本当の確認は CI の macos-latest
+
+### 段階 1 の結果（2026-10-30）
+
+コミット（windows-port ブランチ。push はまだしていない）
+
+| 順 | コミット | 入れたもの | 確かめたこと |
+| --- | --- | --- | --- |
+| C1 | 8ebec58 | この文書（9.1 と段階 1 の表） | — |
+| C2 | ba5de4d | .gitattributes | 索引は変わらず、作業ツリーの CRLF は 0 個。tauri-build が作るファイルの「改行だけの差」も消えた |
+| C3 | 0583e30 | Windows で cargo build が通る（win.rs を新しく作った） | cargo build・cargo clippy が警告なし |
+| C4 | 070e78d | Windows で cargo test --no-run が通る | cargo clippy --all-targets が警告なし。Windows の仮の実装のテスト 11 件が通る |
+| C4b | 01ec1d2 | .github/workflows/ci.yml | まだ動かしていない（push の許可を待っている） |
+| C5 | 4309b65 | 4.10 のパスの検証（テストと修正） | 直す前に 5 件中 4 件が失敗し、直したあと workspace のテスト 18 件が通る |
+| C6 | b77689f | process::command（CREATE_NO_WINDOW）・home_dir・exe_name | 該当のテストが通る |
+| C7 | a13907a | Windows で cargo test が通る（同時の保存の再試行、確認の画面のパスの表示を直した） | 226 件が通り、25 件が ignore、失敗 0 |
+| C8 | 7aeb134 | Windows のメニュー（「ファイル」「編集」） | dev で起動。「ファイル」「編集」が表示されることは利用者が画面で確認（コミットのメッセージには「未確認」と書いたが、そのあと確認された） |
+| C9 | 31b051f | キー割り当てを Ctrl に、WebView2 のブラウザの既定のキーを切る | npm run build が通る。新しい settings.json は meta 0 件・ctrl 11 件（⌘ だった 11 件がすべて Ctrl に。残り 8 件はもともと ⌘ を使わない F キーなど） |
+| C10 | （このコミット） | src-tauri/tauri.windows.conf.json、この節 | npm run tauri build（8 分 9 秒）で bundle/nsis/AtCoder Studio_0.1.0_x64-setup.exe（3,877,393 バイト）だけができた。NSIS 3.13 と nsis_tauri_utils v0.5.3 は tauri-cli が GitHub から取ってきた |
+
+Windows で飛ばしているテスト（`#[cfg_attr(windows, ignore = "…")]`。理由に直す段階を書いた。25 件）
+
+| 段階 | 件数 | テスト | 理由 |
+| --- | --- | --- | --- |
+| 2 | 3 | interactive::tests_interactively_with_real_programs、random::finds_differences_with_real_programs、scaffold::cargo_reads_created_packages_under_a_parent_workspace | 使用メモリを測らない／rustc の診断のパスが `\` 区切り／cargo の出力のパスと canonicalize の `\\?\` の違い |
+| 3・5 | 13 | session の 4 件、problem::reads_with_the_session_only_after_a_404_when_logged_in、submit の 8 件 | /usr/bin/security（Keychain）と /usr/bin/curl |
+| 4 | 4 | sources の 3 件、lsp::overrides_initialize_and_answers_configuration | file: の URI・`\\?\`・パスの区切り |
+| 6 | 5 | debug の 5 件 | lldb-dap（デバッグは今回の移植に含めない） |
+
+Unix 専用にしたテスト（`#[cfg(unix)]`）：シンボリックリンク・Unix のパーミッション・/bin/sh・perl・kill・/bin/cat を使うもの（関数ごとに 34 件と、process.rs の sh のテストの mod 全体）。
+workspace.rs の 4 件と storage.rs の 3 件は、リンク・パーミッションの文だけを Unix に限り、ほかは Windows でも動かしている。Windows で同じことを確かめるテストは、後の段階で足す。
+
+Unix 側を変えた箇所（cfg・属性を付ける以外の文字の変更。どれも Unix では同じ値・同じ動きのはず。macOS での確認は未確認で、CI の macos-latest で確かめる）
+
+- `child.id() as libc::pid_t` → `as Pid`（10 か所）と、lsp.rs・debug.rs の `use` に Pid
+- 外部コマンドの 11 か所の `Command::new` → `crate::process::command`
+- HOME を読む 4 か所 → `toolchain::home_dir()`、cargo・rustc・rust-analyzer の名前 → `exe_name(...)`（find_cargo_in のテストも）
+- storage.rs の write_atomic の最後を `#[cfg(unix)] return fs::rename(&tmp, path);` に
+- trust.rs の作業領域の中の表示を `display_inside`（Unix は同じ `to_string_lossy`）に
+- keybindings.ts の既定の表を `forPlatform([...])` で包んだ。SettingsDialog の文言 2 つ、RunButtons のヒント 2 つを OS ごとに（macOS では同じ文字）
+- lsp.rs の `#[cfg(test)]` 3 か所と process.rs の 1 か所を `#[cfg(all(test, unix))]` に
+
+段階 1 で新しく確認済みになったこと
+
+- Rust の `Path::join` は、`\\?\` の付いたパスで `..` をその場で解決する（4.10。小さなプログラムで確認）。直す前は、新しいファイル・フォルダ・名前の変更・削除の対象で作業領域の外に出られた
+- アプリのフォルダは `%APPDATA%\io.github.ishigaki892.acdstudio`、WebView2 の利用者データは `%LOCALAPPDATA%\io.github.ishigaki892.acdstudio\EBWebView`
+- 起動したときに作られる settings.json には、キー割り当ての全体が書かれる
+- rustc の診断のパスは `\` 区切り
+- Windows の名前の変更は、同じファイルを同時に置き換えていると失敗する（アクセス拒否・共有違反）。少し待って試し直せば通る
+- この機械では、管理者でないとシンボリックリンクを作れない（ジャンクションは作れる）
+- macOS 向けの `cargo check --target aarch64-apple-darwin` は、この機械では依存の objc2-exception-helper の C のビルド（MinGW の cc が使われる）で失敗するので、Unix の経路のコンパイルはここでは確かめられない
+
+段階 1 のあとも未確認のこと（画面の操作は利用者に確かめてもらう）
+
+- macOS で、ビルド・clippy・テストが今までどおり通ること（CI の macos-latest。push の許可のあと）。ci.yml が正しく動くか
+- メニューの各項目を押したときの動き（表示は確認済み）
+- Ctrl+S で保存・Ctrl+R で実行して再読み込みしない・Ctrl+C/V/Z が使える・設定の画面のキーの表示が `Ctrl+…` の形
+- ブラウザの既定のキーを切ったことの効果（F5・Ctrl+F・Ctrl+P・Ctrl+Shift+I など）
+- release の exe（target\release\atcoder-studio.exe か、インストーラーで入れたもの）で、操作のたびにコンソールの窓が出ないこと
+- 2 つ目の起動が断られること（単一起動のロック）
+- フォルダを開いたときの確認の画面のパスの表示（テストでは確認済み）
+
+既知の問題（まだ直さない。9.1 の追加の判断）
+
+- 前の版が書いた settings.json に ⌘（meta）の割り当てが残っていると、Windows ではそのキーを押せない。Windows 版はまだ配っていないので、今は対象の利用者がいない
+- 仮の実装の限界：止めるのは直接の子だけで子孫は残る、使用メモリを測らない（MLE にならない）。段階 2 で Job Object にする
 
 ### 段階 2：問題の取得とサンプルテスト（AC・WA・RE・TLE・MLE）
 
@@ -601,8 +666,6 @@ Unix 側の文字を変えたときは、そのコミットの報告に明記す
 - 3 章の代替案のすべて（Windows で動かしていない）
 - std の Command が `.exe` のないパスに `.exe` を補うか
 - curl.exe が今の引数と `--config -` で同じに動くか
-- app_config_dir の実際の場所、WebView2 の利用者データのフォルダの場所
-- Windows の rustc・cargo の診断のパスの区切り（`\` になるか）
 - menu.rs の macOS 向けの項目を Windows で使ったときの動き
 - WebView2 のブラウザの既定のキー（Ctrl+R など）と、keydown の preventDefault の効き方
 - 4.1：資格情報マネージャーの値の大きさの上限、incognito の効き方、パスワードの自動保存・自動入力の既定値
@@ -613,14 +676,14 @@ Unix 側の文字を変えたときは、そのコミットの報告に明記す
 - 4.7：実行中の exe の上書きの失敗、TerminateJobObject が非同期か
 - 4.8：引数の引用、.cmd の制約、clangd の `--query-driver` の読み方、`\\?\` を受け付けないツール
 - 4.9：BrokenPipe、ハンドルの継承、CRLF の影響
-- 4.10：Windows の Path の join の動き（文書の記述どおりか）、check_name の経路で外に出られること、`:`・末尾の `.` と空白、大文字・小文字の比較
+- 4.10：`:`・末尾の `.` と空白・予約名を Windows が実際にどう扱うか（段階 1 では名前で断ったので、断る前の動きは確かめていない）、大文字・小文字の比較
 - 5 章：WinLibs・MSYS2・CPython・PyPy の入手できる版、ジャッジのパッケージの Windows 用の wheel、MSVC の Rust の主スレッドのスタック、std::thread・std::print のリンクと実行
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
 - macOS の動きを壊していないこと（macOS の機械で確かめる）
 
 不明（調べても分からなかった）
 
-- 開発者モードの状態（レジストリの値を読めなかった）
+- 開発者モードの設定（レジストリの値を読めなかった。シンボリックリンクを作れないことは確認済み）
 - 実際の REVEL_SESSION の長さ
 - Windows 11 でフォルダの中の予約名（NUL など）が装置を指すか
 - 8.3 の短い名前がこのボリュームで作られるか
