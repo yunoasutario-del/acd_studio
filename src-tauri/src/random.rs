@@ -807,6 +807,7 @@ fn main() {
 
     // ビルドから保存・停止まで、実際のプログラムで確かめる。cargo が要る（cargo build はネットワークを使わない）
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 2（rustc の診断のパスの区切りが \\ になる）で直す。docs/windows-port-plan.md 7 章")]
     fn finds_differences_with_real_programs() {
         let ws = workspace("e2e");
         let pkg = ws.0.join("pkg");

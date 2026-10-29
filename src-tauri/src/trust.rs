@@ -75,17 +75,52 @@ impl Walk {
             {
                 // ファイルと、リンク（先は調べない）
                 let shown = path.strip_prefix(root).unwrap_or(&path);
-                self.inspection
-                    .found
-                    .push(shown.to_string_lossy().into_owned());
+                self.inspection.found.push(display_inside(shown));
             }
         }
     }
 }
 
+// 作業領域の中のファイルの表示（作業領域のルートからの相対パス）
+#[cfg(unix)]
+fn display_inside(shown: &Path) -> String {
+    shown.to_string_lossy().into_owned()
+}
+
+#[cfg(unix)]
 fn display_above(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) => format!("~/{}", rest.to_string_lossy()),
+        None => path.to_string_lossy().into_owned(),
+    }
+}
+
+// Windows（移植の段階 1 C7）：確認の画面に出す形をそろえる。作業領域の中・ホームの下の相対の部分は、ファイル一覧などと同じ `/` 区切り。
+// 作業領域のルートは canonicalize した `\\?\C:\…` の形で、ホーム（home_dir）には `\\?\` がないので、外してから比べ、表示にも出さない
+#[cfg(windows)]
+fn without_verbatim(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        // `\\?\UNC\server\share` は `\\server\share` に戻す
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+            None => PathBuf::from(rest),
+        },
+        None => path.to_path_buf(),
+    }
+}
+
+#[cfg(windows)]
+fn display_inside(shown: &Path) -> String {
+    without_verbatim(shown).to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(windows)]
+fn display_above(path: &Path, home: Option<&Path>) -> String {
+    let path = without_verbatim(path);
+    let home = home.map(without_verbatim);
+    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => format!("~/{}", rest.to_string_lossy().replace('\\', "/")),
         None => path.to_string_lossy().into_owned(),
     }
 }
@@ -259,7 +294,28 @@ mod tests {
         // ホームの外なら絶対パスで表示する
         let found = inspect(&root, None).found;
         let shown = dir.0.join("rust-toolchain").to_string_lossy().into_owned();
-        assert!(found.contains(&shown));
+        // Windows では canonicalize が付ける `\\?\` を表示に出さない
+        #[cfg(windows)]
+        let shown = shown.strip_prefix(r"\\?\").unwrap().to_string();
+        assert!(found.contains(&shown), "{found:?}");
+    }
+
+    // Windows：作業領域のルートは canonicalize した `\\?\C:\…`、ホームは home_dir の `\\?\` のない形（実際の起動と同じ組み合わせ）でも、
+    // ホームの下は `~/…`、中は `/` 区切りで表示する
+    #[cfg(windows)]
+    #[test]
+    fn shows_windows_paths_like_unix_paths() {
+        let dir = TempDir::new("windows");
+        dir.file("rust-toolchain");
+        dir.file("sub/ws/b/.cargo/config.toml");
+        let root = dir.0.join("sub/ws");
+        assert!(root.to_string_lossy().starts_with(r"\\?\"), "{root:?}");
+        let home = without_verbatim(&dir.0);
+        assert!(!home.to_string_lossy().starts_with(r"\\?\"), "{home:?}");
+        let found = inspect(&root, Some(&home)).found;
+        assert!(found.contains(&"b/.cargo/config.toml".to_string()), "{found:?}");
+        assert!(found.contains(&"~/rust-toolchain".to_string()), "{found:?}");
+        assert!(found.iter().all(|path| !path.contains(r"\\?\")), "{found:?}");
     }
 
     #[test]

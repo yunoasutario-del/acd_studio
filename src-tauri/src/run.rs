@@ -1876,6 +1876,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // /bin/cat を使う。Windows で同じことを確かめるテストは段階 2 で足す
     fn judges_cases_with_a_real_program() {
         // cat は入力をそのまま出力する
         let dir = std::env::temp_dir().join(format!("atcoder-studio-judge-{}", std::process::id()));

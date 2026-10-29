@@ -616,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn reads_with_the_session_only_after_a_404_when_logged_in() {
         let keychain = TestKeychain::new("problem-fallback");
         let client = keychain.client();

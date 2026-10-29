@@ -493,7 +493,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        // Windows では、同時に置き換えていると失敗するので、少し待って試し直す（win.rs。Windows 移植の段階 1 C7）
+        #[cfg(windows)]
+        drop(file);
+        #[cfg(windows)]
+        return crate::win::rename_replacing(&tmp, path);
+        #[cfg(unix)]
+        return fs::rename(&tmp, path);
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);

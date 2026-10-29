@@ -137,6 +137,24 @@ pub fn same_entry(a: &Path, b: &Path) -> bool {
     }
 }
 
+// 名前の変更で置き換える（fs::rename）。Windows では、同じファイルをほかのスレッド・プロセスが同時に置き換えている・開いていると、
+// 「アクセスが拒否されました」（5）・「共有違反」（32）で失敗する（同時に保存するテストで確認済み）。その間だけ少し待って試し直す
+// （docs/windows-port-plan.md 3.3。待つのは合わせて最大で約 2 秒）
+pub fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    const RETRIES: u32 = 100;
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut tries = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) && tries < RETRIES => {
+                tries += 1;
+                std::thread::sleep(WAIT);
+            }
+            result => return result,
+        }
+    }
+}
+
 // ---- 時刻 ----
 
 // 1601-01-01 から 1970-01-01 までの、100 ナノ秒の数
