@@ -3,9 +3,11 @@
 # ない runner では、それを使うテストは自分で飛ぶ
 name: CI
 
+# どのブランチ（main を含む）への push でも、PR でも動く。同じリポジトリのブランチから PR を作ると、
+# push と pull_request の両方で 2 回動く
 on:
   push:
-    branches: [windows-port]
+  pull_request:
   workflow_dispatch:
 
 permissions:
