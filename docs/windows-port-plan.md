@@ -557,6 +557,20 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 
 - 前の版が書いた settings.json に ⌘（meta）の割り当てが残っていると、Windows ではそのキーを押せない。Windows 版はまだ配っていないので、今は対象の利用者がいない
 - 仮の実装の限界：止めるのは直接の子だけで子孫は残る、使用メモリを測らない（MLE にならない）。段階 2 で Job Object にする
+- **ランダムテストの「止める」の競合（段階 1 より前からある。random.rs と process.rs の Unix の経路は段階 1 で変えていない〔git diff main で確認〕）**：
+  CI の macos-latest で random::tests::finds_differences_with_real_programs が、ときどき random.rs:997 で
+  `Failed { message: "生成器が失敗しました（seed 107）：出力の全体を得られませんでした" }` になって失敗する（run 41060782033、4cdcf06。
+  文書だけのコミットで、同じコードの a313c53 の CI は通っている）。流れ（コードで確認。どちらが先に起きるかは runner の混み具合による）：
+  1. テストの 7（:982–1001）は、3 回目（seed 107）の RandomProgress の知らせで止める印を立てるので、生成器を起動する前に印が立っている
+  2. process::run（process.rs:376–410）は、子が動いている間だけ止める印を Stopped にする（:394）。生成器はすぐ終わるので、終わりを先に知ると Exited(0)
+  3. 残りの出力を読むループ（:422）は、止める印があればすぐやめる。標準出力・標準エラーが閉じきっていなければ output_left_open が true（:451）
+  4. run_helper（random.rs:134–135）は Exited(0) で output_left_open のとき「出力の全体を得られませんでした」の失敗にする
+  
+  利用者への影響（推測）：生成器・愚直解が終わるのと同時に止めると「止めました」ではなく「生成器（愚直解）が失敗しました」と出る。
+  解答も同じで、run.rs:1239 で OutputIncomplete になり、ランダムテストの失敗として random-N に保存されうる。
+  直し方（2026-10-30 に決めた）：段階 1 の PR とは分け、merge のあと段階 2 の前に、random.rs だけで直す（run_helper と解答の判定で、
+  止める印が立っていて output_left_open なら止めたことにする）。process.rs の Unix の経路は変えない。CI ではこのテストを飛ばさず、
+  たまたま落ちたら GitHub の「Re-run failed jobs」でやり直す
 
 ### 段階 2：問題の取得とサンプルテスト（AC・WA・RE・TLE・MLE）
 
