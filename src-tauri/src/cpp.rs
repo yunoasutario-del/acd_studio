@@ -108,7 +108,7 @@ fn find_compiler_in(path_var: Option<&OsStr>, brews: &[PathBuf]) -> Option<PathB
 // 版の表示（`--version` の 1 行目）と、版の番号（`-dumpfullversion`）。GCC でなければ Err
 pub fn version(compiler: &Path) -> Result<(String, String), String> {
     let output = |arg: &str| -> Result<String, String> {
-        let mut command = Command::new(compiler);
+        let mut command = crate::process::command(compiler);
         command.arg(arg);
         crate::toolchain::clear_ide_env(&mut command);
         let output = command
@@ -343,7 +343,7 @@ fn parse_search_dirs(stderr: &str) -> Vec<PathBuf> {
 // 定義ジャンプの行き先として、読み取り専用で開いてよい C++ のヘッダーの場所（D-210・D-133）。
 // GCC の検索の場所（`g++ -E -v`）、SDK の usr/include、AC Library。canonicalize 済み、ないものは載せない
 pub fn header_dirs(compiler: &Path, ac_library: Option<&Path>) -> Vec<PathBuf> {
-    let mut command = Command::new(compiler);
+    let mut command = crate::process::command(compiler);
     command.args(["-E", "-v", "-x", "c++", "/dev/null"]);
     crate::toolchain::clear_ide_env(&mut command);
     let mut dirs = command

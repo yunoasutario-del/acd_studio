@@ -27,6 +27,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -43,7 +44,9 @@ use tauri::ipc::Channel;
 use crate::language::LangSettings;
 use crate::language::Language;
 use crate::lsp::{Decoder, encode, file_uri};
-use crate::process::{exited_without_reaping, kill_group};
+#[cfg(windows)]
+use crate::process::ProcessGroupShim;
+use crate::process::{Pid, exited_without_reaping, kill_group};
 use crate::python::{self, Interpreter};
 use crate::run::{self, Finish, LogKind, Prepared, RunEvent, info, prepare, relative, send};
 use crate::toolchain::{self, RustcPaths, Target};
@@ -932,7 +935,7 @@ impl Client {
         // 出力は、つないでから読む（それまでは debugpy がつなぎを待つので、デバッグ対象は出力しない）
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id() as Pid;
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let until = Instant::now() + CONNECT_WAIT;
         let stream = loop {
@@ -1201,7 +1204,7 @@ impl Client {
     // terminate は送らない。強制的に止めたなら true。debugpy では child がデバッグ対象そのもので、exited の知らせが
     // 来ないので、終了コードを child から受け取る（D-226）
     fn shutdown(&self, child: &mut Child) -> bool {
-        let pid = child.id() as libc::pid_t;
+        let pid = child.id() as Pid;
         // 止める前に、自分で終わっていたか（debugpy の終了コードは、このときだけ使う）
         let ended = exited_without_reaping(pid);
         if !ended {
@@ -1234,12 +1237,32 @@ impl Client {
 }
 
 // pid のプロセスがあるか（回収されていないものを含む）
+#[cfg(unix)]
 fn alive(pid: i32) -> bool {
     // SAFETY: シグナル 0 は送らずに、あるかだけを確かめる
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+// Windows：まだ動いているか。デバッグは今回の移植に含めないので、段階 1 ではコンパイルが通るようにするだけ（docs/windows-port-plan.md 9.1 の 12）
+#[cfg(windows)]
+fn alive(pid: i32) -> bool {
+    crate::win::is_alive(pid as u32)
+}
+
+// Windows：デバッグ対象が残っていれば止める（Unix の stop_debuggee と同じ流れ）
+#[cfg(windows)]
+fn stop_debuggee(pid: i32) {
+    let until = Instant::now() + DEBUGGEE_WAIT;
+    while alive(pid) && Instant::now() < until {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if alive(pid) {
+        crate::win::terminate(pid as u32);
+    }
+}
+
 // デバッグ対象が残っていれば SIGKILL を送り、少しの間、なくなるのを待つ
+#[cfg(unix)]
 fn stop_debuggee(pid: i32) {
     let until = Instant::now() + DEBUGGEE_WAIT;
     while alive(pid) && Instant::now() < until {
@@ -1455,7 +1478,7 @@ pub fn debug_target(
             stopped = wait_until_end(&child, &notices, cancel);
             // debugpy は、デバッグ対象が終わる少し前に terminated を送る。自分で終わるのを少し待ち、終了コードを受け取る
             if !stopped && matches!(adapter, Adapter::Debugpy(_)) {
-                let pid = child.id() as libc::pid_t;
+                let pid = child.id() as Pid;
                 let until = Instant::now() + DISCONNECT_WAIT;
                 while !exited_without_reaping(pid) && Instant::now() < until {
                     thread::sleep(POLL_INTERVAL);
@@ -1643,7 +1666,7 @@ fn start_session(
 
 // 終わる（terminated）・止める印・アダプターの終了を待つ。止める印で終えたなら true
 fn wait_until_end(child: &Child, notices: &Receiver<Notice>, cancel: &Arc<AtomicBool>) -> bool {
-    let pid = child.id() as libc::pid_t;
+    let pid = child.id() as Pid;
     loop {
         if cancel.load(Ordering::SeqCst) {
             return true;
@@ -1704,6 +1727,7 @@ mod tests {
         assert_eq!(strip_hash("a::h4b2b0ff0f5cdd15z"), "a::h4b2b0ff0f5cdd15z");
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepts_breakpoints_only_in_workspace_rust_files() {
         let ws = workspace("paths");
@@ -1800,6 +1824,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
     fn builds_launch_configuration() {
         let init = initialize_arguments();
         assert_eq!(init["$__lldb_sourceInitFile"], false);
@@ -1866,6 +1891,7 @@ mod tests {
     }
 
     // アダプターが止めなかったデバッグ対象を、pid で止める
+    #[cfg(unix)]
     #[test]
     fn stops_leftover_debuggee() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
@@ -1883,6 +1909,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
     fn reports_missing_adapter() {
         let error = find_adapter(Path::new("/nonexistent/xcrun")).unwrap_err();
         assert!(error.starts_with(ADAPTER_MISSING), "{error}");
@@ -2127,6 +2154,7 @@ fn main() {
 
     // 止まる → スタック → 変数 → ステップ → 式 → 続行して終わる
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
     fn debugs_with_real_lldb_dap() {
         let (ws, pkg) = package("e2e");
         write(&pkg.join("test/input.txt"), "5\n3 1 4 1 5\n");
@@ -2387,6 +2415,7 @@ int main() {
 
     // 動いている間に止める・一時停止・panic
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
     fn stops_pauses_and_catches_panics() {
         let (ws, pkg) = package("stop");
         write(&pkg.join("test/sample-1.in"), "1 7 spin\n");
@@ -2463,6 +2492,7 @@ int main() {
     // 初期化ファイルの出力は launch の答えより前なので画面に出さない（捨てる）。そこで、読んだらプログラムの
     // 環境変数に目印が付くようにして、プログラムの出力で確かめる
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
     fn ignores_lldbinit_and_does_not_wait_for_input() {
         let (ws, pkg) = package("init");
         let home = ws.0.join("home");
@@ -2496,6 +2526,7 @@ int main() {
 
     // ---- 本物の debugpy を使うテスト（D-226）。処理系と、アプリのフォルダの python/<処理系> の debugpy が要る ----
 
+    #[cfg(unix)]
     const PYTHON_SOLUTION: &str = "import sys
 
 
@@ -2523,17 +2554,22 @@ def main():
 main()
 ";
     // 行番号（PYTHON_SOLUTION の中）
+    #[cfg(unix)]
     const PY_LINE_TOTAL: u32 = 7;
+    #[cfg(unix)]
     const PY_LINE_RETURN: u32 = 8;
+    #[cfg(unix)]
     const PY_LINE_KEY_ERROR: u32 = 17;
 
     // 利用者がアプリのフォルダに入れた debugpy（なければ None）
+    #[cfg(unix)]
     fn installed_python_tools() -> Option<PathBuf> {
         let tools = PathBuf::from(std::env::var_os("HOME")?)
             .join("Library/Application Support/io.github.ishigaki892.acdstudio/python");
         tools.is_dir().then_some(tools)
     }
 
+    #[cfg(unix)]
     fn python_session(
         pkg: &Path,
         root: &Path,
@@ -2628,6 +2664,7 @@ main()
     }
 
     // 止まる → スタック → 変数 → 式 → ステップ → 続行して終わる。例外で止まる。exit() では止まらない。止める
+    #[cfg(unix)]
     #[test]
     fn debugs_python_with_real_debugpy() {
         let Some(tools) = installed_python_tools() else {

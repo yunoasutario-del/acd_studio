@@ -25,6 +25,8 @@ mod storage;
 mod submit;
 mod toolchain;
 mod trust;
+#[cfg(windows)]
+mod win;
 mod workspace;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +51,29 @@ fn request_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     }
     let _ = app.emit("close-requested", ());
     true
+}
+
+// Windows：WebView2 のブラウザの既定のキー（Ctrl+R・F5 の再読み込み、Ctrl+F の検索、Ctrl+P の印刷など）を切り、
+// アプリのキー割り当て（Ctrl+R は実行）に回す（Windows 移植の段階 1 C9。docs/windows-port-plan.md 9.1 の 5）。
+// Tauri 2.12.4 には設定がないので、WebView2 の設定を直接変える。コピー・貼り付けなどの編集のキーが使えるままかは未確認
+#[cfg(windows)]
+fn disable_browser_keys<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+    let _ = window.with_webview(|webview| {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+        use windows_core::Interface;
+        // SAFETY: Tauri から渡された、生きている WebView2 のコントローラーを、このクロージャーの中でだけ使う
+        unsafe {
+            let Ok(core) = webview.controller().CoreWebView2() else {
+                return;
+            };
+            let Ok(settings) = core.Settings() else {
+                return;
+            };
+            if let Ok(settings) = settings.cast::<ICoreWebView2Settings3>() {
+                let _ = settings.SetAreBrowserAcceleratorKeysEnabled(false);
+            }
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -94,6 +119,10 @@ pub fn run() {
         })
         // 2 つ目の起動なら知らせて終わる（D-040）
         .setup(|app| {
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                disable_browser_keys(&window);
+            }
             let dir = app.path().app_config_dir()?;
             match storage::acquire_instance_lock(&dir) {
                 Ok(Some(lock)) => {

@@ -1,0 +1,12 @@
+# 改行は LF にそろえる（Windows の core.autocrlf=true でも作業ツリーを LF にする。docs/windows-port-plan.md 4.3・9.1 の 6）
+* text=auto eol=lf
+
+# Windows でしか使わないスクリプトは CRLF（今は該当するファイルがない）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 画像
+*.png binary
+*.ico binary
+*.icns binary

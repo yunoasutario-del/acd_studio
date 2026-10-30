@@ -1474,7 +1474,17 @@ pub fn last_test_summary(
     text
 }
 
+// Windows：例：10/26 20:12（手元の時刻）。Unix の localtime_r の代わりに Windows の API で変える
+#[cfg(windows)]
+fn local_time(ms: u64) -> String {
+    match crate::win::local_month_day_time(ms) {
+        Some((month, day, hour, minute)) => format!("{month:02}/{day:02} {hour:02}:{minute:02}"),
+        None => String::new(),
+    }
+}
+
 // 例：10/26 20:12（手元の時刻）
+#[cfg(unix)]
 fn local_time(ms: u64) -> String {
     let secs = (ms / 1000) as libc::time_t;
     // SAFETY: localtime_r は、渡した tm に書くだけ（スレッドごとの領域を使わない）
@@ -2348,6 +2358,7 @@ mod tests {
         assert_eq!(jst(1_793_012_400, 'T'), "2026-10-26T20:00:00+09:00");
     }
 
+    #[cfg(unix)]
     #[test]
     fn prepares_a_cpp_submission() {
         let base =
@@ -2787,6 +2798,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn submits_in_the_contest_period_and_tracks_the_judge() {
         let keychain = TestKeychain::new("submit-flow");
         keychain.0.save("old-session").unwrap();
@@ -2872,6 +2884,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn sends_nothing_when_cancelled_or_out_of_period() {
         let keychain = TestKeychain::new("submit-cancel");
         keychain.0.save("session").unwrap();
@@ -2932,6 +2945,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn refuses_without_login_or_with_turnstile() {
         // ログインしていない（Keychain に値がない）：フォームを読まない
         let keychain = TestKeychain::new("submit-nologin");
@@ -3010,6 +3024,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn reports_a_rejected_submission() {
         let keychain = TestKeychain::new("submit-rejected");
         keychain.0.save("session").unwrap();
@@ -3059,6 +3074,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn stops_tracking_when_the_status_cannot_be_read() {
         let keychain = TestKeychain::new("submit-unreadable");
         keychain.0.save("session").unwrap();
@@ -3409,6 +3425,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn reads_every_page_of_the_contest() {
         let dir = status_app_dir("pages");
         let keychain = TestKeychain::new("status-pages");
@@ -3453,6 +3470,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn stops_at_the_page_limit() {
         let dir = status_app_dir("limit");
         let keychain = TestKeychain::new("status-limit");
@@ -3476,6 +3494,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
     fn reports_login_and_failures() {
         let dir = status_app_dir("fail");
         // Keychain にない：読みに行かない

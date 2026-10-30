@@ -24,11 +24,27 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2.8.3"
 trash = "5.2.9"
-libc = "0.2.190"
 # 問題ページの HTML の読み取り（Phase 3a 作業 1）。Tauri が使っているものと同じ版（P3a-02）
 dom_query = { version = "0.28.0", default-features = false }
 # フォルダ全体の検索の正規表現（Phase 12 作業 2。D-183）。Tauri の依存として Cargo.lock にあった版と同じ
 regex = "1.13.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+# Windows の API（Windows 移植。docs/windows-port-plan.md 8 章・9.1 の 2）。Tauri の依存として Cargo.lock にあった版と同じ
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
+# WebView2 のブラウザの既定のキー（Ctrl+R の再読み込みなど）を切るため（9.1 の 5。windows-sys だけの方針の例外。8 章）。
+# Tauri 2.12.4 には設定がなく、with_webview の controller() がこの型を返す。どちらも Tauri の依存として Cargo.lock にあった版と同じ
+webview2-com = "0.39.1"
+windows-core = "0.62.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

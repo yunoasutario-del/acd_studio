@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,8 +84,15 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
     let binding = |command: &str, key: &str, (meta, alt, shift): (bool, bool, bool)| KeyBinding {
         command: command.to_string(),
         key: key.to_string(),
+        #[cfg(target_os = "macos")]
         meta,
+        #[cfg(target_os = "macos")]
         ctrl: false,
+        // macOS 以外では ⌘ の代わりに Ctrl を使う（Windows 移植の段階 1 C9。docs/windows-port-plan.md 9.1 の 5）
+        #[cfg(not(target_os = "macos"))]
+        meta: false,
+        #[cfg(not(target_os = "macos"))]
+        ctrl: meta,
         alt,
         shift,
     };
@@ -434,6 +442,28 @@ pub enum Loaded<T> {
     Broken(PathBuf),
 }
 
+// Windows には Unix のパーミッション（0700・0600）がない。Unix の DirBuilderExt・OpenOptionsExt の mode と
+// 同じ名前で何もしないものを置き、Unix と同じ書き方のまま動くようにする。アプリのフォルダ（%APPDATA% の下）は
+// 利用者だけが読み書きできる ACL になっていると思われる（推測。未確認。docs/windows-port-plan.md 3.3）
+#[cfg(windows)]
+trait ModeShim {
+    fn mode(&mut self, mode: u32) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl ModeShim for fs::DirBuilder {
+    fn mode(&mut self, _mode: u32) -> &mut Self {
+        self
+    }
+}
+
+#[cfg(windows)]
+impl ModeShim for fs::OpenOptions {
+    fn mode(&mut self, _mode: u32) -> &mut Self {
+        self
+    }
+}
+
 // アプリのフォルダを作る（所有者だけが読み書きできる 0700）
 pub fn ensure_dir(dir: &Path) -> Result<(), String> {
     fs::DirBuilder::new()
@@ -466,10 +496,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .mode(0o600)
             .open(&tmp)?;
         // すでにあった一時ファイルの権限も 0600 にそろえる
+        #[cfg(unix)]
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        // Windows では、同時に置き換えていると失敗するので、少し待って試し直す（win.rs。Windows 移植の段階 1 C7）
+        #[cfg(windows)]
+        drop(file);
+        #[cfg(windows)]
+        return crate::win::rename_replacing(&tmp, path);
+        #[cfg(unix)]
+        return fs::rename(&tmp, path);
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -879,8 +916,12 @@ mod tests {
         assert_eq!(load_state(&dir.0), Ok(Loaded::Missing));
         save_state(&dir.0, &sample_state()).unwrap();
         assert_eq!(load_state(&dir.0), Ok(Loaded::Ok(sample_state())));
+        // パーミッションは Unix だけ（Windows には 0600・0700 がない）
+        #[cfg(unix)]
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        #[cfg(unix)]
         assert_eq!(mode(&dir.0.join(STATE_FILE)), 0o600);
+        #[cfg(unix)]
         assert_eq!(mode(&dir.0), 0o700);
         // 一時ファイルは残らない
         let names: Vec<_> = fs::read_dir(&dir.0)
@@ -1021,11 +1062,13 @@ mod tests {
                 denied: Vec::new()
             }))
         );
+        #[cfg(unix)]
         let mode = fs::metadata(dir.0.join(TRUSTED_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
+        #[cfg(unix)]
         assert_eq!(mode, 0o600);
         // 文字列でない要素や、形の違うファイルは退避する（何も信頼していないものとして扱われる）
         for bad in [
@@ -1229,11 +1272,13 @@ mod tests {
         assert_eq!(loaded.key_bindings, bindings);
         assert_eq!(loaded.appearance, appearance);
         assert!(loaded.appearance_problems.is_empty());
+        #[cfg(unix)]
         let mode = fs::metadata(dir.0.join(SETTINGS_FILE))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
+        #[cfg(unix)]
         assert_eq!(mode, 0o600);
         // 範囲の外の大きさは書かない
         let mut bad = appearance.clone();
@@ -1527,6 +1572,21 @@ mod tests {
             (format.key.as_str(), format.meta, format.alt, format.shift),
             ("f", false, true, true)
         );
+    }
+
+    // macOS 以外：⌘ を使う割り当てはなく、⌘ だったものは Ctrl になる（9.1 の 5）
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_key_bindings_use_ctrl_outside_macos() {
+        let bindings = default_key_bindings();
+        assert!(bindings.iter().all(|b| !b.meta));
+        let save = bindings.iter().find(|b| b.command == "save").unwrap();
+        assert_eq!((save.key.as_str(), save.ctrl, save.shift), ("s", true, false));
+        let test = bindings.iter().find(|b| b.command == "test").unwrap();
+        assert_eq!((test.key.as_str(), test.ctrl, test.shift), ("r", true, true));
+        // ⌘ を使わなかったもの（F12・⇧⌥F）は Ctrl も使わない
+        let format = bindings.iter().find(|b| b.command == "formatDocument").unwrap();
+        assert!(!format.ctrl);
     }
 
     #[test]

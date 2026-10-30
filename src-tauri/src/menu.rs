@@ -7,6 +7,8 @@
 // - Quit を独自の項目にする。終える前に未保存のタブを保存するため（D-084）
 // - アプリの項目に「設定…」を加える（Phase 8 作業 6。D-159。ショートカットはキー割り当ての表の ⌘,）
 
+// AboutMetadata は macOS のメニューだけで使う
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Runtime};
 
@@ -17,6 +19,56 @@ pub const RESTART_RUST_ANALYZER: &str = "restartRustAnalyzer";
 pub const OPEN_SETTINGS: &str = "openSettings";
 pub const QUIT: &str = "quit";
 
+// Windows（macOS 以外）のメニュー（Windows 移植の段階 1 C8。docs/windows-port-plan.md 9.1 の 16）：最小限の変更として、
+// アプリ名のメニューをやめ、「ファイル」に設定・終了をまとめる。メニューは窓の中に出る。
+// services・hide_others・fullscreen は、muda の文書で Windows では使えないとされているので付けない。
+// 編集の項目が Windows で使えるかは、muda の文書に使えないという記述がないことからの推測（動かして確かめる）
+#[cfg(not(target_os = "macos"))]
+pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    Menu::with_items(
+        app,
+        &[
+            &Submenu::with_items(
+                app,
+                "ファイル",
+                true,
+                &[
+                    &MenuItem::with_id(app, OPEN_FOLDER, "フォルダを開く…", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, CLOSE_TAB, "タブを閉じる", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(
+                        app,
+                        RESTART_RUST_ANALYZER,
+                        "言語サーバーを再起動",
+                        true,
+                        None::<&str>,
+                    )?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, OPEN_SETTINGS, "設定…", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, QUIT, "終了", true, Some("CmdOrCtrl+Q"))?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "編集",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, Some("取り消す"))?,
+                    &PredefinedMenuItem::redo(app, Some("やり直す"))?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, Some("カット"))?,
+                    &PredefinedMenuItem::copy(app, Some("コピー"))?,
+                    &PredefinedMenuItem::paste(app, Some("ペースト"))?,
+                    &PredefinedMenuItem::select_all(app, Some("すべてを選択"))?,
+                ],
+            )?,
+        ],
+    )
+}
+
+#[cfg(target_os = "macos")]
 pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let pkg_info = app.package_info();
     let config = app.config();

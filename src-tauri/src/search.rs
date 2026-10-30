@@ -538,6 +538,7 @@ pub fn undo_replace(root: &Path, control: &SearchControl) -> Result<UndoResult, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
@@ -581,6 +582,7 @@ mod tests {
         result.files.iter().map(|file| file.path.as_str()).collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn finds_lines_and_skips_excluded_places() {
         let dir = TempDir::new("walk");

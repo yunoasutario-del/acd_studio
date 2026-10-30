@@ -227,7 +227,7 @@ pub fn parse_version(text: &str) -> Option<Version> {
 }
 
 pub fn version(interpreter: &Path) -> Result<Version, String> {
-    let mut command = Command::new(interpreter);
+    let mut command = crate::process::command(interpreter);
     command.arg("--version");
     crate::toolchain::clear_ide_env(&mut command);
     let output = command
@@ -369,7 +369,7 @@ pub struct Import {
 // main.py の import を読む（提出の前の検査。D-224）。パッケージのフォルダで動かし、-I で、そのフォルダの
 // モジュール（ast.py など）を読ませない
 pub fn imports(interpreter: &Path, source: &Path) -> Result<Vec<Import>, String> {
-    let mut command = Command::new(interpreter);
+    let mut command = crate::process::command(interpreter);
     if let Some(dir) = source.parent() {
         command.current_dir(dir);
     }
@@ -401,7 +401,7 @@ pub fn imports(interpreter: &Path, source: &Path) -> Result<Vec<Import>, String>
 // 処理系の標準ライブラリ・site-packages の場所（定義ジャンプの行き先を読み取り専用で開く。D-225）。
 // -I で、今のフォルダ・利用者の site-packages・PYTHON… の環境変数を入れない。読めなければ空
 pub fn library_dirs(interpreter: &Path) -> Vec<PathBuf> {
-    let mut command = Command::new(interpreter);
+    let mut command = crate::process::command(interpreter);
     command.args([
         "-I",
         "-B",
@@ -498,7 +498,7 @@ pub fn program(interpreter: &Path, script: &str) -> Program {
 const CHECK: &str = "import sys\np = sys.argv[1]\ntry:\n    compile(open(p, 'rb').read(), p, 'exec')\nexcept (SyntaxError, ValueError) as e:\n    print(getattr(e, 'lineno', None) or 0, getattr(e, 'offset', None) or 0, getattr(e, 'msg', None) or str(e), sep='\\t')\n    sys.exit(1)\n";
 
 pub fn check_command(interpreter: &Path, dir: &Path, script: &str) -> Command {
-    let mut command = Command::new(interpreter);
+    let mut command = crate::process::command(interpreter);
     command
         .current_dir(dir)
         .args(["-E", "-B", "-c", CHECK, script]);

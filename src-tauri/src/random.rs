@@ -7,7 +7,11 @@
 
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+// Windows では、パイプの読み口はハンドル。Unix と同じ書き方のまま File にする
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -684,6 +688,7 @@ mod tests {
         assert!(!folder.join("random-11.in").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn does_not_save_outside_the_workspace() {
         let ws = workspace("outside");
@@ -802,6 +807,7 @@ fn main() {
 
     // ビルドから保存・停止まで、実際のプログラムで確かめる。cargo が要る（cargo build はネットワークを使わない）
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 2（rustc の診断のパスの区切りが \\ になる）で直す。docs/windows-port-plan.md 7 章")]
     fn finds_differences_with_real_programs() {
         let ws = workspace("e2e");
         let pkg = ws.0.join("pkg");
@@ -1122,6 +1128,7 @@ fn main() {
     // Python の生成器・愚直解・解答で試す（Phase 19 作業 1。D-220〜D-222）。手元にジャッジと同じ CPython 3.13 がないので、
     // 版だけを「Python 3.13.7」と答え、ほかは Homebrew の python3 に渡す代わりの処理系で動かす（版の確かめ・構文の確かめ・
     // 命令の組み立て・example の名前を確かめる。Python の版の違いによる動きの違いは確かめない）
+    #[cfg(unix)]
     #[test]
     fn finds_differences_with_python_programs() {
         let real = Path::new("/opt/homebrew/bin/python3");

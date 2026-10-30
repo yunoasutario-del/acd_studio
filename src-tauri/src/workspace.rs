@@ -47,6 +47,11 @@ fn check_relative(relative: &str) -> Result<&Path, PathError> {
     let path = Path::new(relative);
     for component in path.components() {
         match component {
+            // Windows では、要素ごとに Windows の名前として使えるかも確かめる（代替データストリーム・予約名・末尾の `.`。C5）
+            #[cfg(windows)]
+            Component::Normal(part) if !part.to_str().is_some_and(windows_name_ok) => {
+                return Err(PathError::Invalid);
+            }
             Component::Normal(_) | Component::CurDir => {}
             // 絶対パス（RootDir・Prefix）と `..`
             _ => return Err(PathError::Invalid),
@@ -304,7 +309,48 @@ fn check_name(name: &str) -> Result<&str, String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err("使えない名前です".to_string());
     }
+    #[cfg(windows)]
+    if !windows_name_ok(name) {
+        return Err("使えない名前です".to_string());
+    }
     Ok(name)
+}
+
+// Windows のファイル名として、作業領域の中の 1 つの要素だけを指す名前か（Windows 移植の段階 1 C5。docs/windows-port-plan.md 4.10）。
+// Windows では `\` も区切りで、`C:`・`\` で始まる名前を join すると前の部分が置き換わり、`\\?\` の付いたパスに join すると `..` が
+// その場で解決される（確認済み）。`:` は代替データストリーム、予約名（NUL・CON・COM1 など。拡張子が付いても）は装置を指し、
+// 末尾の `.`・空白は Windows が取り除くので別の名前を指す。どれも断る
+#[cfg(windows)]
+fn windows_name_ok(name: &str) -> bool {
+    const RESERVED: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+    if name
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return false;
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+    // 予約名は、最初の `.` より前を、末尾の空白を除いて、大文字・小文字を区別せずに比べる（`nul.txt`・`NUL .txt` も装置）
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if RESERVED.contains(&stem.as_str()) {
+        return false;
+    }
+    // COM0〜COM9・LPT0〜LPT9 と、上付きの数字（¹²³）のもの
+    let device = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    !device.is_some_and(|rest| {
+        let mut chars = rest.chars();
+        matches!(
+            (chars.next(), chars.next()),
+            (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+        )
+    })
 }
 
 // 作業領域の中の実際のパスを、ルートからの相対パス（区切りは `/`）にする
@@ -453,10 +499,17 @@ pub fn rename_file(root: &Path, relative: &str, new_name: &str) -> Result<String
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let case_only = old_name != new_name && old_name.to_lowercase() == new_name.to_lowercase();
+        #[cfg(unix)]
         let same = fs::symlink_metadata(&from).is_ok_and(|current| {
             use std::os::unix::fs::MetadataExt;
             current.dev() == existing.dev() && current.ino() == existing.ino()
         });
+        // Windows：リンク自体のボリュームのシリアル番号とファイルの番号で比べる（Unix の dev・ino にあたる）
+        #[cfg(windows)]
+        let same = {
+            let _ = &existing;
+            crate::win::same_entry(&from, &to)
+        };
         if !(case_only && same) {
             return Err("同じ名前のファイルまたはフォルダがあります".to_string());
         }
@@ -489,6 +542,7 @@ pub fn trash_file(root: &Path, relative: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     // テスト用の一時フォルダ。終わったら消す
@@ -624,18 +678,26 @@ mod tests {
         }
         assert!(!base.0.join("outside/sample-1.out").exists());
         // 外を指すフォルダのリンクの先には書かない
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("pkg/linked")).unwrap();
+        #[cfg(unix)]
         assert!(write_expected(&ws, "pkg/linked/sample-1.out", "x", never).is_err());
+        #[cfg(unix)]
         assert!(!base.0.join("outside/sample-1.out").exists());
         // 外を指す .out のリンクの先には書かない
+        #[cfg(unix)]
         fs::write(base.0.join("outside/target.txt"), "secret").unwrap();
+        #[cfg(unix)]
         symlink(
             base.0.join("outside/target.txt"),
             ws.join("pkg/test/sample-4.out"),
         )
         .unwrap();
+        #[cfg(unix)]
         fs::write(ws.join("pkg/test/sample-4.in"), "").unwrap();
+        #[cfg(unix)]
         assert!(write_expected(&ws, "pkg/test/sample-4.out", "x", || true).is_err());
+        #[cfg(unix)]
         assert_eq!(
             fs::read_to_string(base.0.join("outside/target.txt")).unwrap(),
             "secret"
@@ -694,7 +756,9 @@ mod tests {
             None
         );
         assert_eq!(locate_in_package(&ws, "", "../outside/secret.txt"), None);
+        #[cfg(unix)]
         symlink(&secret, ws.join("pkg/src/link.rs")).unwrap();
+        #[cfg(unix)]
         assert_eq!(locate_in_package(&ws, "pkg", "src/link.rs"), None);
         // ws2 のような、名前が前方一致する別のフォルダは作業領域の中ではない
         assert_eq!(locate_in_package(&ws, "pkg", "../../ws2/other.txt"), None);
@@ -733,6 +797,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_sibling_with_common_prefix() {
         let (base, ws) = setup("prefix");
@@ -744,6 +809,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_links_to_outside() {
         let (base, ws) = setup("outside");
@@ -758,6 +824,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn allows_links_to_inside() {
         let (_base, ws) = setup("link-inside");
@@ -765,6 +832,7 @@ mod tests {
         assert_eq!(resolve(&ws, "main-link"), Ok(ws.join("src/main.rs")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn lists_directories_first_then_names() {
         let (base, ws) = setup("list");
@@ -820,6 +888,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn writes_only_existing_files() {
         let (base, ws) = setup("write");
         write_existing(&ws, "src/main.rs", "fn main() { 1; }", None).unwrap();
@@ -830,8 +899,11 @@ mod tests {
         assert!(write_existing(&ws, "new.rs", "", None).is_err());
         assert!(!ws.join("new.rs").exists());
         assert!(write_existing(&ws, "src", "", None).is_err());
+        #[cfg(unix)]
         symlink(base.0.join("outside/secret.txt"), ws.join("secret-link")).unwrap();
+        #[cfg(unix)]
         assert!(write_existing(&ws, "secret-link", "changed", None).is_err());
+        #[cfg(unix)]
         assert_eq!(
             fs::read_to_string(base.0.join("outside/secret.txt")).unwrap(),
             "secret"
@@ -839,6 +911,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn creates_files_without_overwriting() {
         let (base, ws) = setup("create");
         assert_eq!(
@@ -858,12 +931,16 @@ mod tests {
         for name in ["", ".", "..", "a/b", "a\0b"] {
             assert!(create_file(&ws, "", name).is_err(), "{name:?}");
         }
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("dir-link")).unwrap();
+        #[cfg(unix)]
         assert!(create_file(&ws, "dir-link", "x.txt").is_err());
+        #[cfg(unix)]
         assert!(!base.0.join("outside/x.txt").exists());
     }
 
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn renames_files_in_same_folder() {
         let (base, ws) = setup("rename");
         assert_eq!(
@@ -905,16 +982,20 @@ mod tests {
         assert!(ws.join("source/lib.rs").exists());
         assert!(rename_file(&ws, "", "x").is_err());
         // 外を指すリンクは、リンク自体の名前を変える（リンクの先は変わらない）
+        #[cfg(unix)]
         symlink(base.0.join("outside/secret.txt"), ws.join("secret-link")).unwrap();
+        #[cfg(unix)]
         assert_eq!(
             rename_file(&ws, "secret-link", "renamed-link"),
             Ok("renamed-link".to_string())
         );
+        #[cfg(unix)]
         assert!(base.0.join("outside/secret.txt").exists());
     }
 
     // D-157：フォルダの作成・数え方・見分け方
     #[test]
+    #[cfg_attr(windows, allow(unused_variables))] // base は、Unix だけのリンクのテストで使う
     fn creates_counts_and_tells_folders() {
         let (base, ws) = setup("folder");
         assert_eq!(
@@ -928,17 +1009,24 @@ mod tests {
         // 名前・場所の確かめ
         assert!(create_folder(&ws, "src", "a/b").is_err());
         assert!(create_folder(&ws, "src", "..").is_err());
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("dir-link")).unwrap();
+        #[cfg(unix)]
         assert!(create_folder(&ws, "dir-link", "x").is_err());
+        #[cfg(unix)]
         assert!(!base.0.join("outside/x").exists());
         // 数える：中のフォルダの中も数え、リンクはたどらない。上限で止める
         fs::write(ws.join("src/util/a.rs"), "").unwrap();
+        #[cfg(unix)]
         symlink(base.0.join("outside"), ws.join("src/util/out-link")).unwrap();
+        #[cfg(unix)]
         assert_eq!(count_files(&ws.join("src"), 10_000), 3);
+        #[cfg(unix)]
         assert_eq!(count_files(&ws.join("src"), 2), 2);
         // フォルダか：リンクは先がフォルダでもフォルダとしない。ルートは断る
         assert_eq!(is_folder(&ws, "src"), Ok(true));
         assert_eq!(is_folder(&ws, "src/main.rs"), Ok(false));
+        #[cfg(unix)]
         assert_eq!(is_folder(&ws, "dir-link"), Ok(false));
         assert!(is_folder(&ws, "").is_err());
     }
@@ -967,6 +1055,7 @@ mod tests {
         assert_eq!(current_stamp(&ws, "no-such-file"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn keeps_permissions_and_hard_links_when_writing() {
         use std::os::unix::fs::PermissionsExt;
@@ -997,6 +1086,7 @@ mod tests {
     }
 
     // リンクを削除すると、リンク自体だけが消え、リンクの先（ファイル・フォルダ）は残る（D-102）
+    #[cfg(unix)]
     #[test]
     fn deletes_links_without_touching_targets() {
         let (base, ws) = setup("trash-links");
@@ -1019,6 +1109,7 @@ mod tests {
         assert!(fs::symlink_metadata(ws.join("broken-link")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_link_loops_and_missing() {
         let (_base, ws) = setup("loop");
@@ -1026,5 +1117,172 @@ mod tests {
         symlink(ws.join("loop-a"), ws.join("loop-b")).unwrap();
         assert_eq!(resolve(&ws, "loop-a"), Err(PathError::NotFound));
         assert_eq!(resolve(&ws, "no-such-file"), Err(PathError::NotFound));
+    }
+
+    // ---- Windows のパスで作業領域の外に出ない（Windows 移植の段階 1 C5。docs/windows-port-plan.md 4.10） ----
+    //
+    // Windows では `\` も区切りで、`C:`・`C:\` で始まる名前を join すると前の部分が置き換わる。予約名（NUL など）は装置を指し、
+    // `a:b` は代替データストリーム、末尾の `.`・空白は取り除かれる。作業領域のルートは canonicalize した `\\?\C:\…` の形
+    // （commands.rs の open_workspace と同じ）と、`\\?\` のない形の両方で試す
+
+    // `\\?\C:\…` から `\\?\` を取った形（UNC は使わない）
+    #[cfg(windows)]
+    fn plain(path: &Path) -> PathBuf {
+        let text = path.to_string_lossy();
+        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_string())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_only_names() {
+        for name in [
+            r"a\b",
+            r"..\x",
+            r"C:\x",
+            "C:x",
+            "ab:s",
+            "x.",
+            "x ",
+            "x. ",
+            "NUL",
+            "nul",
+            "nul.txt",
+            "NUL .txt",
+            "CON",
+            "aux",
+            "PRN",
+            "COM1",
+            "com9.log",
+            "LPT1",
+            "COM\u{b9}",
+            "CONIN$",
+            "a<b",
+            "a>b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\"b",
+            "a\u{1}b",
+            "a\tb",
+        ] {
+            assert!(check_name(name).is_err(), "{name:?}");
+        }
+        for name in [
+            "main.rs",
+            "sample-1.out",
+            "a b.txt",
+            "日本語.txt",
+            ".gitignore",
+            "CONFIG",
+            "nul2",
+            "console.txt",
+            "a.b.c",
+        ] {
+            assert_eq!(check_name(name), Ok(name), "{name:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creates_nothing_outside_with_windows_names() {
+        let (base, ws) = setup("win-create");
+        let outside = base.0.join("outside");
+        for root in [ws.clone(), plain(&ws)] {
+            let escaping = [
+                r"..\escape-file.txt".to_string(),
+                format!(r"{}\abs-file.txt", plain(&outside).display()),
+            ];
+            for name in &escaping {
+                assert!(create_file(&root, "", name).is_err(), "{root:?} {name:?}");
+                assert!(create_file(&root, "src", name).is_err(), "{root:?} {name:?}");
+            }
+            assert!(!base.0.join("escape-file.txt").exists());
+            assert!(!ws.join("escape-file.txt").exists());
+            assert!(!outside.join("abs-file.txt").exists());
+            let escaping_dirs = [
+                r"..\escape-dir".to_string(),
+                format!(r"{}\abs-dir", plain(&outside).display()),
+            ];
+            for name in &escaping_dirs {
+                assert!(create_folder(&root, "", name).is_err(), "{root:?} {name:?}");
+            }
+            assert!(!base.0.join("escape-dir").exists());
+            assert!(!outside.join("abs-dir").exists());
+            // 予約名・代替データストリーム・末尾の `.`
+            for name in ["NUL", "nul.txt", "main.rs:hidden", "x."] {
+                assert!(create_file(&root, "src", name).is_err(), "{root:?} {name:?}");
+            }
+        }
+        // ふつうの名前は作れる（作業領域のルートは canonicalize したものだけを受け付けるので、`\\?\` の付いた形で試す）
+        assert_eq!(create_file(&ws, "src", "ok.rs"), Ok("src/ok.rs".to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn renames_nothing_outside_with_windows_names() {
+        let (base, ws) = setup("win-rename");
+        fs::write(ws.join("src/a.txt"), "a").unwrap();
+        for root in [ws.clone(), plain(&ws)] {
+            for name in [
+                r"..\moved.txt".to_string(),
+                r"..\..\moved.txt".to_string(),
+                format!(r"{}\moved.txt", plain(&base.0.join("outside")).display()),
+                "a.txt:stream".to_string(),
+                "moved.txt.".to_string(),
+            ] {
+                assert!(rename_file(&root, "src/a.txt", &name).is_err(), "{root:?} {name:?}");
+            }
+            assert!(ws.join("src/a.txt").exists());
+            assert!(!ws.join("moved.txt").exists());
+            assert!(!base.0.join("moved.txt").exists());
+            assert!(!base.0.join("outside/moved.txt").exists());
+        }
+    }
+
+    // 削除（ゴミ箱に移す）・名前の変更の対象を決める entry_path。trash_file は外のファイルを本当にゴミ箱に入れてしまうので、
+    // 同じ経路の entry_path・is_folder・is_link で確かめる
+    #[cfg(windows)]
+    #[test]
+    fn finds_no_entry_outside_with_windows_names() {
+        let (base, ws) = setup("win-entry");
+        for root in [ws.clone(), plain(&ws)] {
+            for path in [
+                r"src/..\..\outside\secret.txt".to_string(),
+                r"..\outside\secret.txt".to_string(),
+                format!(r"src/{}", plain(&base.0.join("outside/secret.txt")).display()),
+                format!("{}", plain(&base.0.join("outside/secret.txt")).display()),
+            ] {
+                assert!(entry_path(&root, &path).is_err(), "{root:?} {path:?}");
+                assert!(is_folder(&root, &path).is_err(), "{root:?} {path:?}");
+                assert!(is_link(&root, &path).is_err(), "{root:?} {path:?}");
+            }
+        }
+        // 作業領域の中のものは見つかる（ルートは canonicalize した形）
+        assert!(entry_path(&ws, "src/main.rs").is_ok());
+        assert!(base.0.join("outside/secret.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_nothing_outside_with_windows_paths() {
+        let (base, ws) = setup("win-resolve");
+        fs::write(ws.join("src/ab"), "ab").unwrap();
+        for root in [ws.clone(), plain(&ws)] {
+            for path in [
+                r"src\..\..\outside\secret.txt",
+                r"..\outside\secret.txt",
+                r"C:\Windows\win.ini",
+                r"C:x",
+                r"\x",
+                r"\\server\share\x",
+                // 代替データストリーム・末尾の `.`・予約名
+                "src/ab:s",
+                "src/main.rs.",
+                "src/NUL",
+            ] {
+                assert!(resolve(&root, path).is_err(), "{root:?} {path:?}");
+            }
+        }
+        assert!(base.0.join("outside/secret.txt").exists());
     }
 }

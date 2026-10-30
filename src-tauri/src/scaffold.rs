@@ -1239,6 +1239,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_folders_that_point_outside() {
         let root = TempDir::new("outside");
@@ -1398,6 +1399,7 @@ mod tests {
     // 作ったパッケージを、本物の cargo で読む。上のフォルダのワークスペースとぶつからず、
     // ビルドの置き場所がコンテストのフォルダの target になり、IDE が実行の対象を決められる（AC7a-02・AC7a-09 の一部）
     #[test]
+    #[cfg_attr(windows, ignore = "Windows：段階 2（cargo の出力のパスと、canonicalize が付ける接頭辞の違い）で直す。docs/windows-port-plan.md 7 章")]
     fn cargo_reads_created_packages_under_a_parent_workspace() {
         let root = TempDir::new("cargo");
         std::fs::write(

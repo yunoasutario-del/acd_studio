@@ -1,5 +1,6 @@
 import type { StepAction } from "../ipc/debug";
 import type { ButtonView, debugButtons } from "./runState";
+import { IS_MAC } from "../keybindings";
 
 type Props = {
   run: ButtonView;
@@ -98,8 +99,8 @@ function RunButtons({
           />
           <RunButton view={debugging.next} hint="ステップオーバー（F10）" onClick={() => onDebugAction("next")} />
           <RunButton view={debugging.stepIn} hint="ステップイン（F11）" onClick={() => onDebugAction("stepIn")} />
-          <RunButton view={debugging.stepOut} hint="ステップアウト（⇧F11）" onClick={() => onDebugAction("stepOut")} />
-          <RunButton view={debugging.stop} hint="デバッグを止める（⌘.）" onClick={onDebugStop} />
+          <RunButton view={debugging.stepOut} hint={IS_MAC ? "ステップアウト（⇧F11）" : "ステップアウト（Shift+F11）"} onClick={() => onDebugAction("stepOut")} />
+          <RunButton view={debugging.stop} hint={IS_MAC ? "デバッグを止める（⌘.）" : "デバッグを止める（Ctrl+.）"} onClick={onDebugStop} />
         </span>
       ) : (
         <RunButton view={debug} hint={hint ? `${hint}（F5）` : undefined} onClick={onDebug} />
