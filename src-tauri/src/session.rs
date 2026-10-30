@@ -591,7 +591,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn saves_loads_and_deletes_in_keychain() {
         let keychain = TestKeychain::new("roundtrip");
         assert_eq!(keychain.0.load().unwrap(), None);
@@ -731,7 +734,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn posts_with_session_and_rotates_cookie() {
         let keychain = TestKeychain::new("post");
         keychain.0.save("old-session").unwrap();
@@ -776,7 +782,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn treats_login_redirect_as_logged_out() {
         let keychain = TestKeychain::new("expired");
         keychain.0.save("expired-session").unwrap();
@@ -798,7 +807,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn keeps_the_saved_session_until_the_window_is_logged_in() {
         let keychain = TestKeychain::new("confirm");
         keychain.0.save("saved-session").unwrap();

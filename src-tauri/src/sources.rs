@@ -177,7 +177,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn reads_rust_sources_in_the_allowed_places() {
         let home = TempDir::new("allowed");
         let std_src = home.file(
@@ -232,7 +235,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn checks_the_size_and_the_encoding() {
         let home = TempDir::new("limits");
         let big = home.file(
@@ -253,7 +259,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn honors_rustup_home_and_cargo_home() {
         let dir = TempDir::new("env");
         let custom_rustup = dir.file("rustup/toolchains/t/a.rs", b"// a");

@@ -1355,7 +1355,10 @@ mod windows_tests {
 
     #[test]
     fn stops_at_output_limit() {
-        let result = run_cmd("for /l %i in () do @echo yyyyyyyyyyyyyyyy", &limits(10000, 64 * 1024));
+        let result = run_cmd(
+            "for /l %i in () do @echo yyyyyyyyyyyyyyyy",
+            &limits(10000, 64 * 1024),
+        );
         assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
         assert_eq!(result.stdout.len(), 64 * 1024);
     }

@@ -862,7 +862,10 @@ fn main() {
 
     // ビルドから判定・停止まで、実際のプログラムで確かめる。cargo が要る
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 2（使用メモリの計測。Job Object）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 2（使用メモリの計測。Job Object）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn tests_interactively_with_real_programs() {
         let ws = workspace("e2e");
         let pkg = ws.0.join("pkg");

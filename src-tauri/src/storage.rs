@@ -1581,11 +1581,20 @@ mod tests {
         let bindings = default_key_bindings();
         assert!(bindings.iter().all(|b| !b.meta));
         let save = bindings.iter().find(|b| b.command == "save").unwrap();
-        assert_eq!((save.key.as_str(), save.ctrl, save.shift), ("s", true, false));
+        assert_eq!(
+            (save.key.as_str(), save.ctrl, save.shift),
+            ("s", true, false)
+        );
         let test = bindings.iter().find(|b| b.command == "test").unwrap();
-        assert_eq!((test.key.as_str(), test.ctrl, test.shift), ("r", true, true));
+        assert_eq!(
+            (test.key.as_str(), test.ctrl, test.shift),
+            ("r", true, true)
+        );
         // ⌘ を使わなかったもの（F12・⇧⌥F）は Ctrl も使わない
-        let format = bindings.iter().find(|b| b.command == "formatDocument").unwrap();
+        let format = bindings
+            .iter()
+            .find(|b| b.command == "formatDocument")
+            .unwrap();
         assert!(!format.ctrl);
     }
 

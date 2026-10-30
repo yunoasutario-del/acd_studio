@@ -1031,7 +1031,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：段階 4（LSP に渡すパスの区切りと URI）で直す。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：段階 4（LSP に渡すパスの区切りと URI）で直す。docs/windows-port-plan.md 7 章"
+    )]
     fn overrides_initialize_and_answers_configuration() {
         let dir = Path::new("/ws/problems/abc001_a");
         let mut message = json!({
