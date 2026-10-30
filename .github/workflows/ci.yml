@@ -63,8 +63,8 @@ jobs:
         run: cargo clippy --all-targets
 
       # debugs_with_real_lldb_dap は macos-latest で、ステップアウトのあとも <alloc::vec::Vec<i64>>::as_slice の中に
-      # いて失敗する（debug.rs:2221。run 41021999618）。原因は分かっていない。段階 1 はデバッグのコードを変えていないので、
-      # CI では飛ばし、段階 6 か Mac の手元で確かめる（docs/windows-port-plan.md「段階 1 のあとも未確認のこと」）。
+      # いて失敗する（debug.rs:2221。run 41021999618）。原因は分かっていない。段階 1 の debug.rs の変更は型の名前・cfg・
+      # Windows の関数の追加だけで、Unix の動きは変えていないので、CI では飛ばし、段階 6 か Mac の手元で確かめる（docs/windows-port-plan.md「段階 1 のあとも未確認のこと」）。
       # Windows ではもともと ignore なので、両方の OS で同じ指定にする
       - name: cargo test
         working-directory: src-tauri

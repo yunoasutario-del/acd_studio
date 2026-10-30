@@ -528,7 +528,7 @@ CI の macos-latest の失敗（2026-10-30。どれも debugs_with_real_lldb_dap
 - **debug::tests::debugs_with_real_lldb_dap（CI では飛ばしている）**：macos-latest で、ステップイン（debug.rs:2215）のあとのステップアウト（:2219）で main に戻らず、
   一番上のフレームが `<alloc::vec::Vec<i64>>::as_slice` のまま（:2221 の `assert_eq!` が失敗）。ステップインでどの関数に入ったかは、テストが `assert_ne!` しか見ないのでログにない。
   考えられる原因（どれも推測）：1.99.0 の標準ライブラリや runner の Xcode の lldb-dap で、ステップイン・アウトの止まる場所が違う／
-  wait_stopped がステップインの 2 つ目の stopped を拾い、ステップアウトが終わる前にスタックを読んだ。段階 1 はデバッグのコードを変えていない（git diff main で確認）。
+  wait_stopped がステップインの 2 つ目の stopped を拾い、ステップアウトが終わる前にスタックを読んだ。段階 1 の debug.rs の変更は型の名前・cfg・Windows の関数の追加だけで、Unix の動きは変えていない（git diff main で確認）。
   段階 6 か、Mac の手元（rustup の既定を 1.99.0 にして）で `cargo test debugs_with_real_lldb_dap` を動かして確かめる。確かめたら ci.yml の `--skip` を外す
 - メニューの各項目を押したときの動き（表示は確認済み）
 - Ctrl+S で保存・Ctrl+R で実行して再読み込みしない・Ctrl+C/V/Z が使える・設定の画面のキーの表示が `Ctrl+…` の形
