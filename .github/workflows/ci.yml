@@ -34,15 +34,21 @@ jobs:
 
       # src-tauri/rust-toolchain.toml の版（rustfmt・clippy を含む）を入れる。引数なしの toolchain install が
       # rust-toolchain.toml を読むのは rustup 1.28 以降（runner の rustup の版は未確認）。
+      # テストが一時フォルダに作るパッケージは rust-toolchain.toml の外にあり、IDE は RUSTUP_TOOLCHAIN を外す（D-104）ので、
+      # rustup の既定のツールチェーンでビルドされる。runner の既定（stable）は版が動き、同じ版でも別のフォルダになるので、
+      # rust-toolchain.toml の版を既定にする。
       # rust-src は debug.rs の debugs_with_real_lldb_dap が使う（標準ライブラリのフレームを rust-src の場所に読み替える）。
       # 開発の機械には入っている前提なので、rust-toolchain.toml には足さず CI だけで入れる
       - name: Rust toolchain
         working-directory: src-tauri
+        shell: bash
         run: |
           rustup --version
           rustup toolchain install
+          rustup default "$(rustup show active-toolchain | cut -d ' ' -f 1)"
           rustup component add rust-src
           rustc --version
+          (cd "$RUNNER_TEMP" && rustup show active-toolchain && rustc -vV)
 
       - uses: Swatinem/rust-cache@v2
         with:
