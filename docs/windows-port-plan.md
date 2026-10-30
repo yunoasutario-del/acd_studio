@@ -466,7 +466,7 @@ Unix 側の文字を変えたときは、そのコミットの報告に明記す
 
 ### 段階 1 の結果（2026-10-30）
 
-コミット（windows-port ブランチ。push はまだしていない）
+コミット（windows-port ブランチ。2026-10-30 に利用者の許可を得て origin/windows-port に push した）
 
 | 順 | コミット | 入れたもの | 確かめたこと |
 | --- | --- | --- | --- |
@@ -474,13 +474,13 @@ Unix 側の文字を変えたときは、そのコミットの報告に明記す
 | C2 | ba5de4d | .gitattributes | 索引は変わらず、作業ツリーの CRLF は 0 個。tauri-build が作るファイルの「改行だけの差」も消えた |
 | C3 | 0583e30 | Windows で cargo build が通る（win.rs を新しく作った） | cargo build・cargo clippy が警告なし |
 | C4 | 070e78d | Windows で cargo test --no-run が通る | cargo clippy --all-targets が警告なし。Windows の仮の実装のテスト 11 件が通る |
-| C4b | 01ec1d2・1f9e681・866d3a4・（このコミット） | .github/workflows/ci.yml | push したあと（2026-10-30）、windows-latest は最初から通った。macos-latest は debug::tests::debugs_with_real_lldb_dap だけが失敗した（289 件が通り、失敗 1）。下の「CI の macos-latest の失敗」 |
+| C4b | 01ec1d2・1f9e681・866d3a4・12ba8a3・a313c53 | .github/workflows/ci.yml | push したあと（2026-10-30）、windows-latest は最初から通った。macos-latest は debug::tests::debugs_with_real_lldb_dap だけが失敗した（289 件が通り、失敗 1）。直したあと、a313c53 の CI（run 41023624709）で macos-latest・windows-latest ともすべての段階が通った（このテストは飛ばした）。下の「CI の macos-latest の失敗」 |
 | C5 | 4309b65 | 4.10 のパスの検証（テストと修正） | 直す前に 5 件中 4 件が失敗し、直したあと workspace のテスト 18 件が通る |
 | C6 | b77689f | process::command（CREATE_NO_WINDOW）・home_dir・exe_name | 該当のテストが通る |
 | C7 | a13907a | Windows で cargo test が通る（同時の保存の再試行、確認の画面のパスの表示を直した） | 226 件が通り、25 件が ignore、失敗 0 |
 | C8 | 7aeb134 | Windows のメニュー（「ファイル」「編集」） | dev で起動。「ファイル」「編集」が表示されることは利用者が画面で確認（コミットのメッセージには「未確認」と書いたが、そのあと確認された） |
 | C9 | 31b051f | キー割り当てを Ctrl に、WebView2 のブラウザの既定のキーを切る | npm run build が通る。新しい settings.json は meta 0 件・ctrl 11 件（⌘ だった 11 件がすべて Ctrl に。残り 8 件はもともと ⌘ を使わない F キーなど） |
-| C10 | （このコミット） | src-tauri/tauri.windows.conf.json、この節 | npm run tauri build（8 分 9 秒）で bundle/nsis/AtCoder Studio_0.1.0_x64-setup.exe（3,877,393 バイト）だけができた。NSIS 3.13 と nsis_tauri_utils v0.5.3 は tauri-cli が GitHub から取ってきた |
+| C10 | f661fe5 | src-tauri/tauri.windows.conf.json、この節 | npm run tauri build（8 分 9 秒）で bundle/nsis/AtCoder Studio_0.1.0_x64-setup.exe（3,877,393 バイト）だけができた。NSIS 3.13 と nsis_tauri_utils v0.5.3 は tauri-cli が GitHub から取ってきた |
 
 Windows で飛ばしているテスト（`#[cfg_attr(windows, ignore = "…")]`。理由に直す段階を書いた。25 件）
 
@@ -494,7 +494,7 @@ Windows で飛ばしているテスト（`#[cfg_attr(windows, ignore = "…")]`�
 Unix 専用にしたテスト（`#[cfg(unix)]`）：シンボリックリンク・Unix のパーミッション・/bin/sh・perl・kill・/bin/cat を使うもの（関数ごとに 34 件と、process.rs の sh のテストの mod 全体）。
 workspace.rs の 4 件と storage.rs の 3 件は、リンク・パーミッションの文だけを Unix に限り、ほかは Windows でも動かしている。Windows で同じことを確かめるテストは、後の段階で足す。
 
-Unix 側を変えた箇所（cfg・属性を付ける以外の文字の変更。どれも Unix では同じ値・同じ動きのはず。macOS での確認は未確認で、CI の macos-latest で確かめる）
+Unix 側を変えた箇所（cfg・属性を付ける以外の文字の変更。どれも Unix では同じ値・同じ動きのはず。CI の macos-latest で cargo build・cargo clippy --all-targets・cargo test が通った〔run 41023624709。debugs_with_real_lldb_dap は飛ばした〕。手元の Mac での画面の操作は未確認）
 
 - `child.id() as libc::pid_t` → `as Pid`（10 か所）と、lsp.rs・debug.rs の `use` に Pid
 - 外部コマンドの 11 か所の `Command::new` → `crate::process::command`
@@ -520,11 +520,13 @@ CI の macos-latest の失敗（2026-10-30。どれも debugs_with_real_lldb_dap
 | --- | --- | --- |
 | 40971221506（f661fe5） | debug.rs:2188。標準ライブラリのフレームのパスが `/rustc/58cf8f9…` のまま | rust-src がない。debug.rs:394–403 は rust-src があるときだけ target.source-map を設定する → 1f9e681 で CI だけ rust-src を入れた |
 | 41020045065（1f9e681） | 同じ debug.rs:2188。パスは `/rustc/b940084…` | テストのパッケージは一時フォルダ（debug.rs:1698–1706）にあって rust-toolchain.toml の外にあり、cargo_command は RUSTUP_TOOLCHAIN を外す（D-104）ので、rustup の既定でビルドされる。b940084 は 1.99.0 のコミット（手元で確認済み）なので版は同じで、既定は別の名前（stable と推測）のフォルダ。rust-src は 1.99.0 のフォルダにだけ入っていた → 866d3a4 で rust-toolchain.toml の版を既定にした |
-| 41021999618（866d3a4） | debug.rs:2221。ステップアウトのあとも一番上のフレームが `<alloc::vec::Vec<i64>>::as_slice` で、`solution::main` に戻らない（2188 は通った） | 原因は分かっていない（下の未確認のこと）→ CI では `--skip debug::tests::debugs_with_real_lldb_dap` で飛ばす |
+| 41021999618（866d3a4） | debug.rs:2221。ステップアウトのあとも一番上のフレームが `<alloc::vec::Vec<i64>>::as_slice` で、`solution::main` に戻らない（2188 は通った） | 原因は分かっていない（下の未確認のこと）→ 12ba8a3 で、CI では `--skip debug::tests::debugs_with_real_lldb_dap` で飛ばす |
+| 41023624709（a313c53） | なし。macos-latest・windows-latest ともすべての段階が成功（GitHub の API で確認） | — |
 
 段階 1 のあとも未確認のこと（画面の操作は利用者に確かめてもらう）
 
-- macOS で、ビルド・clippy・テストが今までどおり通ること（CI の macos-latest。debugs_with_real_lldb_dap を飛ばした結果は、このコミットの CI で見る）
+- macOS の clippy の警告の有無：ci.yml の `cargo clippy --all-targets` は `-D warnings` を付けていないので、警告があっても段階は成功になる。ログは認証しないと読めず、見ていない
+- macOS のテストの件数（通った件数・飛ばした件数）：run 41023624709 のログを見ていない
 - **debug::tests::debugs_with_real_lldb_dap（CI では飛ばしている）**：macos-latest で、ステップイン（debug.rs:2215）のあとのステップアウト（:2219）で main に戻らず、
   一番上のフレームが `<alloc::vec::Vec<i64>>::as_slice` のまま（:2221 の `assert_eq!` が失敗）。ステップインでどの関数に入ったかは、テストが `assert_ne!` しか見ないのでログにない。
   考えられる原因（どれも推測）：1.99.0 の標準ライブラリや runner の Xcode の lldb-dap で、ステップイン・アウトの止まる場所が違う／
@@ -692,7 +694,7 @@ CI の macos-latest の失敗（2026-10-30。どれも debugs_with_real_lldb_dap
 - 4.10：`:`・末尾の `.` と空白・予約名を Windows が実際にどう扱うか（段階 1 では名前で断ったので、断る前の動きは確かめていない）、大文字・小文字の比較
 - 5 章：WinLibs・MSYS2・CPython・PyPy の入手できる版、ジャッジのパッケージの Windows 用の wheel、MSVC の Rust の主スレッドのスタック、std::thread・std::print のリンクと実行
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
-- macOS の動きを壊していないこと（macOS の機械で確かめる）
+- macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709〕。clippy の警告の有無、debugs_with_real_lldb_dap、画面の操作は macOS の機械で確かめる）
 
 不明（調べても分からなかった）
 
