@@ -571,6 +571,11 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
   直し方（2026-10-30 に決めた）：段階 1 の PR とは分け、merge のあと段階 2 の前に、random.rs だけで直す（run_helper と解答の判定で、
   止める印が立っていて output_left_open なら止めたことにする）。process.rs の Unix の経路は変えない。CI ではこのテストを飛ばさず、
   たまたま落ちたら GitHub の「Re-run failed jobs」でやり直す
+  
+  → 直した（2026-10-30、ブランチ fix-random-stop-race）。random.rs に stopped_while_reading を足し、生成器・愚直解の結果の分け方を
+  helper_of に分けて、そこと解答の判定（run_random）で使う。テスト treats_output_cut_by_stop_as_stopped は、結果を作って確かめる
+  （実際のプログラムでは起きるかどうかが混み具合による）。直す前は、このテストの最初の確認（Stopped になる）が失敗した。
+  同じブランチで、ci.yml をどのブランチの push でも、PR でも動くようにした（今までは windows-port への push だけ）
 
 ### 段階 2：問題の取得とサンプルテスト（AC・WA・RE・TLE・MLE）
 
