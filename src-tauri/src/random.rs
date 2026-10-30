@@ -125,10 +125,30 @@ fn run_helper(
         cancel,
         |_, _| {},
     );
-    let result = match result {
-        Ok(result) => result,
-        Err(message) => return Helper::Failed(format!("{what}を起動できません：{message}")),
-    };
+    match result {
+        Ok(result) => helper_of(what, seed, result, cancel, emit),
+        Err(message) => Helper::Failed(format!("{what}を起動できません：{message}")),
+    }
+}
+
+// process::run は、子が動いている間だけ止める印を Stopped にし、子が終わったあとの残りの出力の読み取りは、止める印があれば
+// すぐやめる。そのため、止める印と子の終わりが重なると、Stopped ではなく、出力が途中の結果（Exited(0) などで output_left_open）になる。
+// 出力が途中なのは止めたためなので、ランダムテストでは止めたことにする（失敗として数えない・保存しない）
+fn stopped_while_reading(result: &process::RunResult, cancel: &AtomicBool) -> bool {
+    result.output_left_open && cancel.load(Ordering::SeqCst)
+}
+
+// 生成器・愚直解の 1 回の結果を、成功・止めた・失敗に分ける
+fn helper_of(
+    what: &str,
+    seed: u64,
+    result: process::RunResult,
+    cancel: &AtomicBool,
+    emit: &mut dyn FnMut(RunEvent),
+) -> Helper {
+    if stopped_while_reading(&result, cancel) {
+        return Helper::Stopped;
+    }
     let reason = match result.outcome {
         Outcome::Stopped => return Helper::Stopped,
         Outcome::Exited(0) if !result.output_left_open => return Helper::Done(result.stdout),
@@ -348,7 +368,7 @@ pub(crate) fn run_random(
             Err(message) => return Finish::Failed { message },
         };
         let verdict = verdict_of(&result, Some(&expected), plan.settings);
-        if matches!(verdict, Verdict::Interrupted) {
+        if matches!(verdict, Verdict::Interrupted) || stopped_while_reading(&result, cancel) {
             interrupted = true;
             break;
         }
@@ -705,6 +725,42 @@ mod tests {
         // 作業領域の外のフォルダを直接渡しても保存しない
         assert!(save_case(&ws.0, &outside.0, b"1", b"2").is_err());
         assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+    }
+
+    // 止める印と子の終わりが重なり、出力が途中の結果になったときは、生成器・愚直解・解答の失敗ではなく止めたことにする。
+    // 実際のプログラムでは起きるかどうかが混み具合による（CI の macos-latest で finds_differences_with_real_programs の 7 が
+    // ときどき「生成器が失敗しました（seed 107）：出力の全体を得られませんでした」になった）ので、結果を作って確かめる
+    #[test]
+    fn treats_output_cut_by_stop_as_stopped() {
+        let result = |output_left_open: bool| process::RunResult {
+            outcome: Outcome::Exited(0),
+            stdout: b"107\n".to_vec(),
+            stderr: Vec::new(),
+            elapsed: std::time::Duration::from_millis(1),
+            output_left_open,
+            max_rss_bytes: None,
+        };
+        let stopped = AtomicBool::new(true);
+        let running = AtomicBool::new(false);
+        let mut emit = |_: RunEvent| {};
+        assert!(matches!(
+            helper_of("生成器", 107, result(true), &stopped, &mut emit),
+            Helper::Stopped
+        ));
+        // 止めていなければ、今までどおり失敗
+        assert!(matches!(
+            helper_of("生成器", 107, result(true), &running, &mut emit),
+            Helper::Failed(message) if message.contains("生成器が失敗しました（seed 107）：出力の全体を得られませんでした")
+        ));
+        // 出力を読み切っていれば、止める印が立っていても成功（止めるのは次の回の前）
+        assert!(matches!(
+            helper_of("生成器", 107, result(false), &stopped, &mut emit),
+            Helper::Done(bytes) if bytes == b"107\n"
+        ));
+        // 解答の結果も同じ判定で、止めたことにする
+        assert!(stopped_while_reading(&result(true), &stopped));
+        assert!(!stopped_while_reading(&result(true), &running));
+        assert!(!stopped_while_reading(&result(false), &stopped));
     }
 
     // ---- 実際に cargo でビルドして動かす確認 ----
