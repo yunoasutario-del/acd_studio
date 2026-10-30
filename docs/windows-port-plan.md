@@ -523,8 +523,27 @@ CI の macos-latest の失敗（2026-10-30。どれも debugs_with_real_lldb_dap
 | 41021999618（866d3a4） | debug.rs:2221。ステップアウトのあとも一番上のフレームが `<alloc::vec::Vec<i64>>::as_slice` で、`solution::main` に戻らない（2188 は通った） | 原因は分かっていない（下の未確認のこと）→ 12ba8a3 で、CI では `--skip debug::tests::debugs_with_real_lldb_dap` で飛ばす |
 | 41023624709（a313c53） | なし。macos-latest・windows-latest ともすべての段階が成功（GitHub の API で確認） | — |
 
-段階 1 のあとも未確認のこと（画面の操作は利用者に確かめてもらう）
+画面の操作の確認（2026-10-30。利用者が Windows 11 で確かめた。1〜5 は dev〔npm run tauri dev〕、6・7 は release〔src-tauri\target\release\atcoder-studio.exe、f661fe5 でビルド。そのあとのコミットは ci.yml と文書だけ〕。
+試しのフォルダは `cargo new` の Rust のパッケージに `fn main() {}` の build.rs を足したもの。空の build.rs は main がなくビルドが失敗する）
 
+| 番号 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1 | メニューの各項目（フォルダを開く・タブを閉じる・言語サーバーを再起動・設定・終了、編集の各項目） | OK。言語サーバーの再起動は「Unknown binary 'rust-analyzer.exe' in official toolchain 'stable-x86_64-pc-windows-msvc'」の知らせ（rust-analyzer の component が入っていないため。探し方と案内は段階 4） |
+| 2 | Ctrl+S・Ctrl+R（再読み込みしない）・Ctrl+Shift+R・Ctrl+C/V/X/Z/A・Ctrl+B・Ctrl+W | OK。保存の印は Ctrl+S の前に自動保存で消えたので、Ctrl+S そのものの保存は自動保存と区別できていない |
+| 3 | ブラウザの既定のキー（F5・Ctrl+F・Ctrl+P・Ctrl+Shift+I・F12） | F5・Ctrl+F・Ctrl+P は OK。release では Ctrl+Shift+I・F12 とも DevTools は開かない。dev では Ctrl+Shift+I で DevTools が開いた（下の注） |
+| 4 | 設定の画面のキーの表示が `Ctrl+…` の形 | OK |
+| 5 | フォルダを開いたときの確認の画面のパスの表示 | OK（`build.rs` とだけ表示。`\\?\` はなし） |
+| 6 | release で、フォルダを開く・信頼・実行・サンプルテスト・言語サーバーの再起動のときにコンソールの窓が出ない | OK |
+| 7 | 2 つ目の起動が断られる | OK |
+
+注（3 の dev の Ctrl+Shift+I）：Tauri は debug のビルド（`debug_assertions`、または tauri の `devtools` feature。このプロジェクトは付けていない）のときだけ、
+Ctrl+Shift+I の keydown で DevTools を開く JS を入れる（tauri-2.12.4 の src/webview/plugin.rs:204–222、scripts/toggle-devtools.js。ソースで確認済み）。
+WebView2 のブラウザの既定のキーとは別の仕組みなので、SetAreBrowserAcceleratorKeysEnabled(false) では止まらない。release ではこの JS が入らず、
+wry が SetAreDevToolsEnabled に devtools の設定（release では false）を渡す（wry-0.57.0 の webview2/mod.rs:640）ので開かない。不具合ではなく、直さない
+
+段階 1 のあとも未確認のこと
+
+- Ctrl+S で保存されること（自動保存と区別して確かめる。自動保存を切るか、保存の前に書き換えてすぐ Ctrl+S を押す）
 - macOS の clippy の警告の有無：ci.yml の `cargo clippy --all-targets` は `-D warnings` を付けていないので、警告があっても段階は成功になる。ログは認証しないと読めず、見ていない
 - macOS のテストの件数（通った件数・飛ばした件数）：run 41023624709 のログを見ていない
 - **debug::tests::debugs_with_real_lldb_dap（CI では飛ばしている）**：macos-latest で、ステップイン（debug.rs:2215）のあとのステップアウト（:2219）で main に戻らず、
@@ -532,12 +551,7 @@ CI の macos-latest の失敗（2026-10-30。どれも debugs_with_real_lldb_dap
   考えられる原因（どれも推測）：1.99.0 の標準ライブラリや runner の Xcode の lldb-dap で、ステップイン・アウトの止まる場所が違う／
   wait_stopped がステップインの 2 つ目の stopped を拾い、ステップアウトが終わる前にスタックを読んだ。段階 1 の debug.rs の変更は型の名前・cfg・Windows の関数の追加だけで、Unix の動きは変えていない（git diff main で確認）。
   段階 6 か、Mac の手元（rustup の既定を 1.99.0 にして）で `cargo test debugs_with_real_lldb_dap` を動かして確かめる。確かめたら ci.yml の `--skip` を外す
-- メニューの各項目を押したときの動き（表示は確認済み）
-- Ctrl+S で保存・Ctrl+R で実行して再読み込みしない・Ctrl+C/V/Z が使える・設定の画面のキーの表示が `Ctrl+…` の形
-- ブラウザの既定のキーを切ったことの効果（F5・Ctrl+F・Ctrl+P・Ctrl+Shift+I など）
-- release の exe（target\release\atcoder-studio.exe か、インストーラーで入れたもの）で、操作のたびにコンソールの窓が出ないこと
-- 2 つ目の起動が断られること（単一起動のロック）
-- フォルダを開いたときの確認の画面のパスの表示（テストでは確認済み）
+- インストーラー（nsis）で入れた exe での動き（画面の確認は target\release の exe で行った）
 
 既知の問題（まだ直さない。9.1 の追加の判断）
 
