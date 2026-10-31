@@ -29,7 +29,12 @@ AtCoder Studio（Tauri 2。今は macOS 専用）を Windows 11 x64 で動かす
 | WebView2 | 156.0.4314.50 | 確認済み |
 | 既存の GCC | `C:\Program Files (x86)\mingw64`：MinGW-Builds 5.0.0 の g++ 15.2.0（x86_64-w64-mingw32、`--threads=win32 --exceptions=seh --with-default-msvcrt=ucrt`）、gdb 16.3 | 確認済み |
 | curl | `C:\Windows\system32\curl.exe` 8.21.0（Schannel） | 確認済み |
-| Python | `%LOCALAPPDATA%\Microsoft\WindowsApps` の 0 バイトの実行エイリアス（python.exe・python3.exe）だけ。実体は入っていない | 確認済み |
+| Python（段階 1 まで） | `%LOCALAPPDATA%\Microsoft\WindowsApps` の 0 バイトの実行エイリアス（python.exe・python3.exe）だけ。実体は入っていない | 確認済み |
+| CPython（2026-10-31 に入れた） | 3.13.7。`winget install --id Python.Python.3.13 --version 3.13.7 --scope user --exact --custom "PrependPath=0 Include_launcher=0 AssociateFiles=0 Shortcuts=0 Include_test=0"`（python.org の python-3.13.7-amd64.exe。ハッシュは winget が照合）。`%LOCALAPPDATA%\Programs\Python\Python313\python.exe`（exe は python.exe・pythonw.exe だけで、`python3.13.exe` はない）。`--version` は `Python 3.13.7`（MSC v.1944 64 bit）。py ランチャー・関連付け・スタートメニューは入れていない。PEP 514 のキー `HKCU\Software\Python\PythonCore\3.13`（InstallPath の ExecutablePath が上の python.exe）ができた。`%LOCALAPPDATA%\Package Cache` の中身は見ていない | 確認済み（Package Cache は未確認） |
+| PyPy（2026-10-31 に入れた） | 3.11 v7.3.20。downloads.python.org の pypy3.11-v7.3.20-win64.zip（32,758,691 バイト）の SHA256 が pypy.org/checksums.html の値（a8d36f6c…0755b）と一致したことを確かめてから、`%LOCALAPPDATA%\Programs\pypy3.11-v7.3.20-win64\` に展開した（展開の前に、展開先がないこと、zip の一番上が 1 つのフォルダだけであること、`..`・`:`・先頭の `\` を含む名前が 0 個であることを確かめた）。exe は pypy.exe・pypy3.exe・pypy3.11.exe・python.exe・python3.exe・python3.11.exe など。`--version` は `Python 3.11.13 … [PyPy 7.3.20 with MSC v.1941 64 bit]` | 確認済み |
+| Python の確かめたこと | CPython・PyPy とも、`-X utf8 -c "print('あ')"` が終了コード 0 で、出力は `E3 81 82 0D 0A`（UTF-8・CRLF）。`-E -B -X int_max_str_digits=0 -X utf8` で動き、`sys.flags` で各フラグが効いていること、`str(10**5000)` が通ることを確かめた。`-X utf8` がないと、CPython はパイプへ cp932 で出し（`あ` は `82 A0`）、絵文字で UnicodeEncodeError（終了コード 1）。PyPy は付けなくても utf-8。どれも PowerShell（端末）から起動した子で、GUI から起動した子では未確認 | 確認済み（GUI からは未確認） |
+| PATH・実行エイリアス | Python を入れたあとも、利用者・システムの PATH は入れる前と同じ。WindowsApps のエイリアスもそのまま（`where python` はエイリアスだけ）。そのため、今の探し方では CPython・PyPy は見つからない（段階 2 の S7 で直す） | 確認済み |
+| ジャッジのパッケージ | numpy などは入れていない | 確認済み |
 | ほかのツール | clangd・basedpyright・lldb-dap・perl・sh は PATH にない | 確認済み |
 | VS Code | 入っている（code.cmd）。`%APPDATA%\Code\User\snippets` がある | 確認済み |
 | Defender | リアルタイム保護は有効（Get-MpComputerStatus）。除外の一覧は管理者でないと読めない | 確認済み |
@@ -233,7 +238,7 @@ IDE は窓の Cookie から REVEL_SESSION だけを読む（session.rs:522–537
 | 項目 | 内容 | 確認状況 |
 | --- | --- | --- |
 | MinGW の C++ の標準出力 | `std::cout << "a\nb\n"` をパイプで受けると `61 0D 0A 62 0D 0A`（CRLF）になった | 確認済み |
-| CPython の Windows の標準出力 | `\n` を `\r\n` にする（推測） | 未確認（Python を入れて同じようにバイトを見る） |
+| CPython・PyPy の Windows の標準出力 | `print` の `\n` が、パイプでは `\r\n` になった（どちらも `E3 81 82 0D 0A`。2026-10-31） | 確認済み |
 | Rust の println! | 変えない（推測） | 未確認 |
 | 比較：whitespace・float | compare.rs:150–153 の is_space が `\r` を空白として扱うので、CRLF でも WA にならない | 確認済み（コード） |
 | 比較：exact | compare.rs:194 はバイトの完全一致なので、**C++・Python の解答は CRLF になって WA になる**（上の結果からの推測。比較の実行は未確認） | 未確認 |
@@ -256,8 +261,8 @@ C++ の解答に手元だけで `_setmode` を入れる案は、ジャッジと�
 | GUI から起動した子 | 端末を持たない子は既定のコードページ（932）で出力する（推測） | 未確認 |
 | g++ の診断 | 本文は英語（MinGW-Builds は NLS なし。推測）。日本語を含むパスやソースの文字列は CP932 のバイトで出うる（推測）。process の出力は from_utf8_lossy などで読むので文字化けで済むが、logLinks の場所の照合が外れる | 未確認 |
 | Python の `-E` | python.rs:489・504、debug.rs:283 で `-E` を付けている（確認済み）。`-E` は PYTHON で始まる環境変数を無視するので、**PYTHONUTF8・PYTHONIOENCODING を設定しても効かない**（-E の仕様は資料の記述で、未確認） | 付けていること：確認済み／効かないこと：未確認 |
-| Python の標準入出力 | パイプのときはロケールの文字コード（cp932）になる（推測）。日本語を出す解答は文字化けし、cp932 で表せない文字は UnicodeEncodeError で RE になる（推測） | 未確認 |
-| 案 | `-X utf8` を付ける（`-E` と両立する。ジャッジの Linux は UTF-8 なので挙動はむしろ近づく。推測）。PyPy 3.11 が `-X utf8` を受け付けるかは未確認 | 未確認 |
+| Python の標準入出力 | CPython はパイプのとき cp932 で出した（`あ` は `82 A0`）。cp932 で表せない文字（絵文字）は UnicodeEncodeError で終了コード 1（RE）。PyPy 3.11 は付けなくても utf-8 だった（2026-10-31。端末から起動した子で） | 確認済み（GUI から起動した子では未確認） |
+| 案 | `-X utf8` を付ける（9.1 の 7）。CPython・PyPy とも `-E` と一緒に受け付け、`sys.flags.utf8_mode` が 1 になり、`あ` を UTF-8 で出した（2026-10-31） | 確認済み |
 | cargo・rustc の出力 | UTF-8（推測） | 未確認 |
 | 確かめ方 | `print("あ")` の main.py と、日本語を含むフォルダの main.cpp のエラーで、実行ログの表示を見る | 未確認（まだ行っていない） |
 
@@ -375,7 +380,7 @@ OS の違いによる差（ジャッジは Linux の x86_64）
 | `long` の大きさ | MinGW では 4 バイト（`static_assert(sizeof(long)==4)` が通った）。ジャッジの Linux は 8 バイト（推測）。`long` で 64 ビットの値を扱う解答は、手元だけで桁あふれする | MinGW：確認済み／ジャッジ：推測 |
 | `long double` | 16 バイト、仮数 64 ビット（x87 の 80 ビット）。Linux の x86_64 と同じ形（推測） | MinGW：確認済み |
 | `__int128` | 使える | 確認済み（`-fsyntax-only`） |
-| スタックの大きさ | Windows の exe の既定のスタックは小さい（MinGW の ld の既定値は不明）。ジャッジのスタックの大きさも不明。深い再帰が手元だけで落ちる（0xC00000FD）おそれ → 手元のビルドに `-Wl,--stack,<バイト>` を付けるかは決める項目 | 不明 |
+| スタックの大きさ | MinGW の g++ で作った exe の既定の予約は 2 MiB（`objdump -p` の SizeOfStackReserve が 0x200000）。`-Wl,--stack,536870912` を付けると 0x20000000 になった。ジャッジのスタックの大きさは不明。深い再帰が手元だけで落ちる（0xC00000FD）おそれ → 手元のビルドで 1 GiB にする（9.1 の 9・追加 6） | 既定値・付け方：確認済み／ジャッジ：不明 |
 | `-march=native`・`-fopenmp`・`-pthread`・`-static` | cpp.rs:22 の文のとおり、今も手元では付けていない | 確認済み（コード） |
 | AC Library | ヘッダーだけなので動く見込み | 推測（未確認） |
 
@@ -383,16 +388,16 @@ OS の違いによる差（ジャッジは Linux の x86_64）
 
 | 候補 | 入手方法 | ジャッジとの一致 | 確認状況 |
 | --- | --- | --- | --- |
-| CPython 3.13 | python.org の 3.13.7 のインストーラー（版を合わせられる。推測）、または winget の `Python.Python.3.13`（入る細かい版は未確認） | 3.13 で同じ。ジャッジのパッケージ（numpy など、python.rs:294 以降の一覧）は pip で入れる。Windows 用の wheel がないものがあるかは未確認 | 未確認 |
-| PyPy 3.11 v7.3.20 | pypy.org の Windows 64 ビットの zip（v7.3.20 があるかは未確認） | 版を合わせられる見込み | 未確認 |
-| 注意 | WindowsApps の 0 バイトの実行エイリアス（python.exe・python3.exe）は実体がない（確認済み）。探すときに除く。`python3.13.exe` という名前は Windows の公式版には入らない（推測） | — | 一部確認済み |
+| CPython 3.13 | winget の `Python.Python.3.13` で `--version 3.13.7` を選べる（3.13.0〜3.13.16 がある。中身は python.org のインストーラー） | 3.13.7 で同じ（1 章）。ジャッジのパッケージ（numpy など、python.rs:294 以降の一覧）は pip で入れる。Windows 用の wheel がないものがあるかは未確認 | 入手と版：確認済み／パッケージ：未確認 |
+| PyPy 3.11 v7.3.20 | pypy.org の Windows 64 ビットの zip（pypy3.11-v7.3.20-win64.zip）がある | 版が同じ（1 章） | 確認済み |
+| 注意 | WindowsApps の 0 バイトの実行エイリアス（python.exe・python3.exe）は実体がない。探すときに除く。`python3.13.exe` という名前は Windows の公式版には入らない（python.exe・pythonw.exe だけ） | — | 確認済み |
 
 ### 5.3 Rust
 
 | 項目 | 内容 | 確認状況 |
 | --- | --- | --- |
 | ジャッジの版 | `rustup toolchain install 1.89.0`（x86_64-pc-windows-msvc）。MSVC のリンカーは VS 18 BuildTools で足りる見込み | 未確認 |
-| 主スレッドのスタック | Windows の MSVC ターゲットの主スレッドのスタックは 1 MiB（推測。Linux は 8 MiB）。深い再帰が手元だけで落ちうる → 手元だけ `-C link-arg=/STACK:<バイト>` を付けるかは決める項目 | 未確認 |
+| 主スレッドのスタック | rustc（x86_64-pc-windows-msvc）で作った exe の既定の予約は 1 MiB（SizeOfStackReserve が 0x100000）。深い再帰が手元だけで落ちうる → 手元のビルドで 1 GiB にする（9.1 の 9・追加 6・追加 7）。`cargo rustc --bin p -- -C link-arg=/STACK:1073741824` と `cargo rustc --example gen -- …` で、どちらも 0x40000000 になった。`cargo rustc` の `--` の後ろの引数は 1 つの対象にしか渡せない（`--bin` と `--example` を一緒に渡すと「extra arguments to `rustc` can only be passed to one target」で失敗） | 既定値・付け方・1 つの対象の制約：確認済み（2026-10-31。依存のないパッケージで） |
 | rust-analyzer | `rustup component add rust-analyzer`（cargo の隣に rust-analyzer.exe ができる。推測） | 未確認 |
 
 ### 5.4 言語サーバー
@@ -593,6 +598,34 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 - Rust・C++・Python のそれぞれで、AC・WA・RE（0 除算・範囲外・panic・アクセス違反）・TLE（無限ループ）・MLE（大きな配列）になる解答を作り、判定と時間・メモリの表示を確かめる
 - 止めたあとすぐにビルドし直せる（4.7）。タスクマネージャーで子が残っていない
 
+段階 2 は、次のまとまりごとに 1 つずつコミットする（2026-10-31 に決めた順。ブランチは最新の main から作った windows-port-stage2）。
+進め方は段階 1 と同じ：Unix / macOS の経路のコードは cfg を付ける・場所を移す以外は変えず、変えたときはそのコミットの報告に書く。
+各コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test、画面のコードを変えたときは npm run build を通す。
+不具合を直すときは、先にテストを書いて失敗を確かめ、テストと修正を 1 つのコミットにして、直す前の失敗をメッセージに書く。push と PR は利用者が許可してから
+
+| 順 | まとまり | 何を変えるか | どう確認するか |
+| --- | --- | --- | --- |
+| S1 | 文書 | 1 章の Python の行、4.3・4.4・5 章の確かめたこと、この表、9.1 の追加 6〜14 | — |
+| S2 | テスト用の子のプログラム（9.1 の追加 8・14） | `src-tauri/examples/test_child.rs`：引数で動きを選ぶ（出力・終了コード・標準入力をそのまま返す・待つ・回り続ける・孫を作って pid を出す・メモリを使う・落ちる〔アクセス違反・0 除算・スタックあふれ・abort・panic〕・対話の相手）。テストは `target/debug/examples/` から探す。process.rs の Windows のテスト（段階 1 の `cmd /c` のもの）をこれで書き直し、run.rs の `/bin/cat` のテスト（judges_cases_with_a_real_program）の Windows 版を足す | 今の仮の実装で通るものだけを入れる。`cargo test` |
+| S3 | Job Object（9.1 の 1・追加 4・追加 9・追加 10） | win.rs の中身を差し替える。`process_group(0)` の代わりの仕組みで CREATE_SUSPENDED（と CREATE_NO_WINDOW）を付け、spawn の直後に `#[cfg(windows)]` の 1 行で Job に入れる（KILL_ON_JOB_CLOSE）。主スレッドは Toolhelp32 で探して再開する。spawn の直後の 1 行を足すのは process.rs の 3 か所・lsp.rs・debug.rs。kill_group は TerminateJobObject（終了コードは追加 10 の値）のあと、Job の動いているプロセスが 0 になるまで待つ（4.7）。Job に入れていない pid を kill_group・reap に渡したら debug_assert で知らせる。process.rs の関数の形は変えない | 先にテストを書いて失敗を確かめる：時間の上限・止める操作で孫も止まる／子が自然に終わったあとで孫が残らない／Job を閉じると子が消える／止めた直後に exe を上書きできる |
+| S4 | メモリ | current_rss は GetProcessMemoryInfo の WorkingSetSize、最大使用メモリは PeakWorkingSetSize（直接の子だけ。Unix と同じ）。interactive::tests_interactively_with_real_programs の ignore を外す | 先にテスト（実行中に上限で止まる・最大使用メモリが出る）を書いて失敗を確かめる。外したテストが通る（ほかの理由で落ちたら報告する） |
+| S5 | RE の表示（追加 10） | NTSTATUS の名前（0xC0000005・0xC00000FD・0xC0000094・0xC0000409・0xC0000135 など）と 16 進の表示、IDE が止めたときの値の表示。runLog.ts・TestResults.tsx・interactive.rs・random.rs。Unix の終了コードは 0〜255 で重ならないので OS では分けない（共通のコードの文字が変わるので報告に書く） | 子のプログラムで実際に落として、どの終了コードになるかを確かめる（どの値になるかは未確認） |
+| S6 | 改行（9.1 の 6 の a・b） | Windows だけ：exact の比較の前に CRLF を LF に直す／実際の出力を期待出力として保存するときに LF に直す | 先にテスト（CRLF の出力で exact が WA になる、保存した .out に CR が残る）を書いて失敗を確かめる |
+| S7 | Python（9.1 の 7・追加 11） | 探し方：settings → PEP 514 のレジストリ（HKCU → HKLM の 3.13 の ExecutablePath）→ PATH の python.exe（WindowsApps のエイリアスを除き、版を確かめる）。PyPy は settings → PATH（pypy3.11.exe・pypy3.exe）。Windows だけ `-X utf8` を付ける（実行・構文の検査・import の読み取り・ライブラリの場所の読み取り）。案内文を Windows 向けに。random の Python のテスト（finds_differences_with_python_programs）の Windows 版 | 単体テスト。この機械の CPython がレジストリから見つかる。PyPy を画面で試すには settings.json の python.pypy の指定が要る（リポジトリの外なので、変える前に聞く） |
+| S8 | C++（9.1 の 10・追加 12） | `g++.exe` を settings → PATH → 決まった場所（`%ProgramFiles%\mingw64\bin` → `%ProgramFiles(x86)%\mingw64\bin` → `C:\mingw64\bin` → `C:\msys64\ucrt64\bin`。9.1 の 10 の MinGW-Builds を先にする）の順に探す。出力の名前に `.exe`。`/dev/null` → `NUL`。作った exe を動かすときだけ、子の PATH の先頭にコンパイラの bin を足す。GCC_HINT を Windows 向けに | find_compiler_in のテストの Windows 版。builds_and_runs_with_local_gcc を Windows でも動かす。PATH に g++ がない状態で 0xC0000135 にならない |
+| S9 | スタック（9.1 の 9・追加 6・追加 7） | Windows だけ。C++ は `-Wl,--stack,1073741824`。Rust は run.rs の `cargo build --bin … --example … --message-format=json` を、`cargo rustc --bin <名前> --message-format=json -- -C link-arg=/STACK:1073741824` と、example ごとの `cargo rustc --example <名前> …` に分けて続けて動かす（`--` の後ろの引数は 1 つの対象にしか渡せないため。5.3）。ビルドの出力・診断・止める操作は今と同じに扱う | 深い再帰の子が、付けると通り、付けないと 0xC00000FD で落ちる。`objdump -p` で 0x40000000。依存のあるパッケージで、`cargo build` と IDE のビルドを交互にしても依存を作り直さない（未確認。ここで確かめる） |
+| S10 | パスの表記 | rustc の診断の file の `\` を `/` に直す（random のテストが `examples\gen.rs` で失敗している）。logLinks.ts は Windows だけ `\` も区切りとして読む。scaffold のテストは canonicalize したもの同士で比べる（本番のコードは両側を canonicalize して比べているので、テストだけの問題）。random::finds_differences_with_real_programs・scaffold::cargo_reads_created_packages_under_a_parent_workspace の ignore を外す | 外したテストが通る。logLinks のテスト |
+| S11 | 問題の取得 | problem.rs の `/usr/bin/curl` を、Windows では `%SystemRoot%\System32\curl.exe` にする（PATH は探さない） | problem.rs のテスト。画面で問題ページ・問題の一覧を取る |
+| S12 | Defender の注意（9.1 の 8・追加 13） | Windows だけ：ビルドの直後の 1 ケース目が TLE のとき、実行ログに 1 行の注意を出す | 単体テスト |
+| S13 | まとめ | この文書に段階 2 の結果 | 全体の cargo test・cargo clippy --all-targets・npm run build |
+
+段階 2 で利用者が手で確かめること（各コミットのあとに手順を書いて頼む）
+- Rust・C++・CPython・PyPy のそれぞれで、AC・WA・RE（0 除算・範囲外・panic・アクセス違反）・TLE（無限ループ）・MLE（大きな配列）になる解答の判定と、時間・メモリ・RE の名前の表示
+- 孫を作る解答を止めたあと、タスクマネージャーに子が残っていない
+- 止めたあとすぐにビルドし直せる
+- 問題の取得（問題ページ・問題の一覧）
+- 深い再帰の解答が手元で落ちない（S9）
+
 ### 段階 3：ファイル・URL を開く処理、ログイン情報の保存
 
 何を変えるか
@@ -703,6 +736,15 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 | 追加 3 | WebView2 の既定のキーを切るために、webview2-com・windows-core を Windows だけの依存として足す（2 の例外） | 段階 1（C9） |
 | 追加 4 | process.rs は段階 1 では仮の Windows 実装（直接の子だけを止める・メモリは測らない）。関数の形は変えず、段階 2 で中身を Job Object に差し替える | 段階 1（C3）・段階 2 |
 | 追加 5 | macOS を壊さないため、CI（GitHub Actions。macos-latest・windows-latest）を足す。push は利用者が許可してから | 段階 1（C4b） |
+| 追加 6（2026-10-31） | スタックの大きさは 1 GiB（1073741824 バイト）。既定のメモリの上限（1024 MiB）と同じ。予約するだけなので、使った分だけが使用メモリに入る（推測） | 段階 2（S9） |
+| 追加 7（2026-10-31） | Rust のスタックは `cargo rustc … -- -C link-arg=/STACK:N` で付ける（run.rs の cargo build を置き換える。Windows だけ）。依存を作り直さず（未確認。S9 で確かめる）、RUSTFLAGS とも両立するため | 段階 2（S9） |
+| 追加 8（2026-10-31） | テスト用の子のプログラムは `src-tauri/examples/test_child.rs` | 段階 2（S2） |
+| 追加 9（2026-10-31） | Job に入れる処理は、`process_group(0)` の代わりの仕組みで CREATE_SUSPENDED を付け、spawn の直後に `#[cfg(windows)]` の 1 行で行う（Unix 側の文字は変えない） | 段階 2（S3） |
+| 追加 10（2026-10-31） | IDE が止めたとき（TerminateJobObject）の終了コードは専用の値 0xE0AC0001（i32 では -525598719）にして、「IDE が止めました」と表示する。上位の 4 ビットの E は「エラー」と「利用者が定める値」（ビット 29）の印で、Windows の NTSTATUS とは重ならない | 段階 2（S3・S5） |
+| 追加 11（2026-10-31） | Windows での CPython の探し方は、settings → PEP 514 のレジストリ（HKCU → HKLM）→ PATH の python.exe（WindowsApps のエイリアスを除き、版を確かめる）。py ランチャーは使わない | 段階 2（S7） |
+| 追加 12（2026-10-31） | MinGW の DLL：作った exe を動かすときだけ、子の PATH の先頭にコンパイラの bin を足す（`-static` などのビルドの引数は変えない） | 段階 2（S8） |
+| 追加 13（2026-10-31） | Defender の注意は、ビルドの直後の 1 ケース目が TLE のときだけ実行ログに 1 行出す | 段階 2（S12） |
+| 追加 14（2026-10-31） | 子のプログラムを使う新しいテストは Windows だけで動かす。Unix の sh のテストはそのまま | 段階 2（S2〜S4） |
 
 ---
 
@@ -717,15 +759,18 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 - menu.rs の macOS 向けの項目を Windows で使ったときの動き
 - WebView2 のブラウザの既定のキー（Ctrl+R など）と、keydown の preventDefault の効き方
 - 4.1：資格情報マネージャーの値の大きさの上限、incognito の効き方、パスワードの自動保存・自動入力の既定値
-- 4.3：CPython・Rust の出力の改行、exact の比較で WA になること、include_str! の testdata のテスト
-- 4.4：GUI から起動した子のコードページ、g++ が CP932 で出すもの、`-E` で PYTHONUTF8 が無視されること、PyPy の `-X utf8`
+- 4.3：Rust の出力の改行、exact の比較で WA になること、include_str! の testdata のテスト（CPython・PyPy の出力が CRLF になることは 2026-10-31 に確認済み）
+- 4.4：GUI から起動した子のコードページ、g++ が CP932 で出すもの、`-E` で PYTHONUTF8 が無視されること（PyPy が `-X utf8` を受け付けることは 2026-10-31 に確認済み）
 - 4.5：遅れの原因が Defender か、作業領域・大きな exe での遅れ、GetProcessTimes で検査を除けるか
 - 4.6：release で窓が出ること、Job Object との組み合わせ
 - 4.7：実行中の exe の上書きの失敗、TerminateJobObject が非同期か
 - 4.8：引数の引用、.cmd の制約、clangd の `--query-driver` の読み方、`\\?\` を受け付けないツール
 - 4.9：BrokenPipe、ハンドルの継承、CRLF の影響
 - 4.10：`:`・末尾の `.` と空白・予約名を Windows が実際にどう扱うか（段階 1 では名前で断ったので、断る前の動きは確かめていない）、大文字・小文字の比較
-- 5 章：WinLibs・MSYS2・CPython・PyPy の入手できる版、ジャッジのパッケージの Windows 用の wheel、MSVC の Rust の主スレッドのスタック、std::thread・std::print のリンクと実行
+- 5 章：WinLibs・MSYS2 の入手できる版、ジャッジのパッケージの Windows 用の wheel、std::thread・std::print のリンクと実行
+  （CPython 3.13.7・PyPy v7.3.20 の入手、MinGW と MSVC の Rust の既定のスタックは 2026-10-31 に確認済み）
+- 段階 2 の案で前提にしていること：`cargo rustc` の `--` の後ろの引数で依存を作り直さないこと、PATH に g++ がないと MinGW の exe が 0xC0000135 で落ちること、
+  各 NTSTATUS（スタックあふれ・abort・0 除算など）が実際にどの終了コードになるか、PeakWorkingSetSize を終わったプロセスのハンドルで読めるか
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
 - macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709〕。clippy の警告の有無、debugs_with_real_lldb_dap、画面の操作は macOS の機械で確かめる）
 
@@ -735,7 +780,7 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 - 実際の REVEL_SESSION の長さ
 - Windows 11 でフォルダの中の予約名（NUL など）が装置を指すか
 - 8.3 の短い名前がこのボリュームで作られるか
-- MinGW の ld の既定のスタックの大きさ、ジャッジのスタックの大きさ
+- ジャッジのスタックの大きさ（MinGW の ld の既定は 2 MiB と 2026-10-31 に確認済み）
 - CP932 で表せない文字を含む利用者名・フォルダでの MinGW・Python の動き
 - MSYS2 の今の GCC の版
 - Tauri からの WebView2 の自動入力の設定の仕方
