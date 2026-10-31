@@ -2,15 +2,20 @@
 //
 // - プロセス：pid でプロセスを開き、終わるのを待つ・終わったかを確かめる・止める。標準ライブラリの Child がハンドルを
 //   持っている間は、pid は別のプロセスに再利用されない（推測。未確認）
+// - Job：子を Job に入れ、止めるときは子孫ごと止める（段階 2 S3。下の「Job」の節）
 // - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる
 // - 時刻：UNIX 時刻（ミリ秒）を手元の時刻の月・日・時・分にする（Unix の localtime_r にあたる）
 //
-// 限界（段階 1 の仮の実装）：止めるのは直接の子だけで、子孫は残る。使用メモリは測らない。
-// 段階 2 で Job Object（CREATE_SUSPENDED で起動して入れる。9.1 の 1）に置き換える
+// 限界：使用メモリは測らない（段階 2 S4）
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::process::Child;
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
@@ -20,10 +25,19 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+};
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
-    WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcess, OpenThread, PROCESS_ACCESS_RIGHTS,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread,
+    THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
@@ -79,7 +93,7 @@ pub fn is_alive(pid: u32) -> bool {
         .is_some_and(|code| code == STILL_ACTIVE as u32)
 }
 
-// 止める（直接の子だけ。子孫は残る）。終了コードは 1 にする
+// 止める（直接の子だけ。子孫は残る）。終了コードは 1 にする。Job に入れていないプロセス（デバッグの対象など）に使う
 pub fn terminate(pid: u32) {
     if let Some(handle) = open_process(pid, PROCESS_TERMINATE) {
         // SAFETY: 開いたハンドルを渡す。すでに終わっていれば失敗するだけ
@@ -87,6 +101,236 @@ pub fn terminate(pid: u32) {
             TerminateProcess(handle.0, 1);
         }
     }
+}
+
+// ---- Job（段階 2 S3。docs/windows-port-plan.md 9.1 の 1） ----
+//
+// IDE が起動する子（解答・ビルド・言語サーバーなど。process.rs で process_group(0) を付けたもの）は、CREATE_SUSPENDED で
+// 止めたまま起動し、start_in_job で Job に入れてから主スレッドを再開する（子が孫を作る前に Job に入る）。
+// Job には KILL_ON_JOB_CLOSE を付けるので、IDE が異常に終わって Job のハンドルが閉じても、子と孫は止まる。
+// 子孫は Job から抜けられない（JOB_OBJECT_LIMIT_BREAKAWAY_OK を付けない）。
+// Job は pid ごとに覚えておき、kill_job（process.rs の kill_group）で TerminateJobObject し、Job が空になるまで待ってから閉じる
+// （止めた直後に exe を上書きできるように。4.7）。Unix の作り（回収する前に必ずグループを止める）と同じく、kill_job は
+// 子を回収する前に必ず呼ばれる（run・run_pair・lsp の stop・debug の shutdown）。子が自然に終わっていても、残った孫は
+// ここで止まる。2 回目からは何もしない。覚えた pid は release_job（process.rs の reap）で忘れる。lsp・debug は reap を
+// 通らないので、閉じた印だけが残る（同じ pid が再利用されたら上書きする）
+
+// IDE が止めたときの終了コード（9.1 の追加 10）。上位の E は「エラー」と「利用者が定める値」の印で、NTSTATUS と重ならない
+pub const KILLED_EXIT_CODE: u32 = 0xE0AC_0001;
+// 止めたあと、Job の中のプロセスがすべて終わるのを待つ時間の上限
+const JOB_EMPTY_WAIT: Duration = Duration::from_secs(5);
+
+enum Job {
+    Open(Handle),
+    // kill_job で止めて閉じた
+    Closed,
+}
+
+// SAFETY: ハンドルはプロセスの中のどのスレッドからでも使え、閉じられる
+unsafe impl Send for Handle {}
+
+static JOBS: LazyLock<Mutex<HashMap<u32, Job>>> = LazyLock::new(Default::default);
+
+fn jobs() -> MutexGuard<'static, HashMap<u32, Job>> {
+    JOBS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// Job に入れる段階（テストで、それぞれの段階の失敗を起こすのに使う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobStep {
+    Create,
+    Assign,
+    Resume,
+}
+
+// CREATE_SUSPENDED で起動した子を Job に入れ、主スレッドを再開する。失敗したら子を止めて（止まったまま残さない）エラーにする
+pub fn start_in_job(child: &Child) -> Result<(), String> {
+    start_in_job_with(child, |_| false)
+}
+
+// fail が true を返した段階で失敗したことにする（テスト用。本番は常に false）
+pub(crate) fn start_in_job_with(
+    child: &Child,
+    fail: impl Fn(JobStep) -> bool,
+) -> Result<(), String> {
+    let process = child.as_raw_handle() as HANDLE;
+    // 失敗したら子を止める。Job を閉じる前に止める（先に Job を閉じると KILL_ON_JOB_CLOSE で止まり、終了コードが 0 になる）
+    let stop = |message: String| {
+        // SAFETY: Child が持つ、まだ開いているプロセスのハンドルを渡す
+        unsafe {
+            TerminateProcess(process, KILLED_EXIT_CODE);
+        }
+        Err(message)
+    };
+    let job = match create_job(&fail) {
+        Ok(job) => job,
+        Err(message) => return stop(message),
+    };
+    if let Err(message) = enter_job(&job, process, child.id(), &fail) {
+        // job はこのあと（子を止めたあと）閉じる
+        return stop(message);
+    }
+    jobs().insert(child.id(), Job::Open(job));
+    Ok(())
+}
+
+fn last_error(what: &str) -> String {
+    format!("{what}（{}）", std::io::Error::last_os_error())
+}
+
+// KILL_ON_JOB_CLOSE を付けた Job を作る
+fn create_job(fail: &impl Fn(JobStep) -> bool) -> Result<Handle, String> {
+    // SAFETY: 名前もセキュリティ属性もない Job を作る。失敗すれば null が返る
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(last_error("Job を作れません"));
+    }
+    let job = Handle(raw);
+    if fail(JobStep::Create) {
+        return Err("Job を作れません（テスト）".to_string());
+    }
+    // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION はゼロで初期化してよい C の構造体
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: 作った Job と、読む構造体とその大きさを渡す
+    let set = unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if set == 0 {
+        return Err(last_error("Job を設定できません"));
+    }
+    Ok(job)
+}
+
+// 子を Job に入れ、主スレッドを再開する
+fn enter_job(
+    job: &Handle,
+    process: HANDLE,
+    pid: u32,
+    fail: &impl Fn(JobStep) -> bool,
+) -> Result<(), String> {
+    // SAFETY: 作った Job と、Child が持つプロセスのハンドルを渡す
+    if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+        return Err(last_error("Job に入れられません"));
+    }
+    if fail(JobStep::Assign) {
+        return Err("Job に入れられません（テスト）".to_string());
+    }
+    if fail(JobStep::Resume) {
+        return Err("主スレッドを再開できません（テスト）".to_string());
+    }
+    resume_threads(pid)
+}
+
+// pid のプロセスのスレッドを再開する。CREATE_SUSPENDED で起動したばかりなので、スレッドは主スレッドの 1 つだけ（推測）。
+// 標準ライブラリは起動したあと主スレッドのハンドルを閉じるので、スレッドの一覧から探す
+fn resume_threads(pid: u32) -> Result<(), String> {
+    // SAFETY: 引数は値だけ。失敗すれば INVALID_HANDLE_VALUE が返る
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_error("スレッドの一覧を取れません"));
+    }
+    let snapshot = Handle(snapshot);
+    // SAFETY: THREADENTRY32 はゼロで初期化してよい C の構造体。dwSize に大きさを入れてから渡す
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut resumed = 0;
+    // SAFETY: 取った一覧と、書き込み先を渡す
+    let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: 引数は値だけ。失敗すれば null が返る
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                return Err(last_error("主スレッドを開けません"));
+            }
+            let thread = Handle(thread);
+            // SAFETY: 開いたスレッドのハンドルを渡す。失敗すれば u32::MAX が返る
+            if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                return Err(last_error("主スレッドを再開できません"));
+            }
+            resumed += 1;
+        }
+        // SAFETY: 取った一覧と、書き込み先を渡す
+        more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+    }
+    if resumed == 0 {
+        return Err("主スレッドが見つかりません".to_string());
+    }
+    Ok(())
+}
+
+// pid の子の Job の中を、すべて止める（直接の子と孫）。Job が空になるまで待ってから閉じる。
+// 2 回目からは何もしない。Job に入れていない pid なら、作りの誤りなので debug では止め、release では直接の子だけを止める
+pub fn kill_job(pid: u32) {
+    let job = {
+        let mut jobs = jobs();
+        match jobs.get_mut(&pid) {
+            Some(entry) => match std::mem::replace(entry, Job::Closed) {
+                Job::Open(job) => job,
+                Job::Closed => return,
+            },
+            None => {
+                drop(jobs);
+                debug_assert!(
+                    false,
+                    "Job に入れていないプロセス（pid {pid}）を止めようとした"
+                );
+                terminate(pid);
+                return;
+            }
+        }
+    };
+    // SAFETY: 開いている Job のハンドルを渡す
+    unsafe {
+        TerminateJobObject(job.0, KILLED_EXIT_CODE);
+    }
+    wait_until_empty(&job);
+}
+
+// Job の中で動いているプロセスが 0 になるまで待つ（最大 JOB_EMPTY_WAIT）。TerminateJobObject は終わるのを待たずに返る（推測）
+fn wait_until_empty(job: &Handle) {
+    let until = Instant::now() + JOB_EMPTY_WAIT;
+    loop {
+        // SAFETY: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION はゼロで初期化してよい C の構造体
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: 開いている Job と、書き込み先とその大きさを渡す
+        let read = unsafe {
+            QueryInformationJobObject(
+                job.0,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 || info.ActiveProcesses == 0 || Instant::now() >= until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// 回収した子の pid を忘れる。kill_job を呼ばずに回収した（作りの誤り）なら、debug では止め、release では Job を閉じる
+// （KILL_ON_JOB_CLOSE で残りが止まる）
+pub fn release_job(pid: u32) {
+    let entry = jobs().remove(&pid);
+    debug_assert!(
+        matches!(entry, Some(Job::Closed)),
+        "kill_job を呼ばずに回収した、または Job に入れていないプロセス（pid {pid}）"
+    );
+}
+
+// テスト用：止めずに Job のハンドルを閉じる（IDE が異常に終わったときにあたる）
+#[cfg(test)]
+pub(crate) fn close_job_without_terminating(pid: u32) {
+    let entry = jobs().remove(&pid);
+    drop(entry);
 }
 
 // ---- ファイル ----

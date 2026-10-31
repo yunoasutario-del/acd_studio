@@ -18,7 +18,11 @@
 // - echo-lines … EOF まで、読んだ行をそのまま書く
 // - ask:N … 0 から N-1 まで「書いて 1 行読む」を繰り返す
 // - sleep:ミリ秒・spin … 待つ／回り続ける
-// - grandchild … 自分をもう 1 つ（sleep:600000 で）起動し、その pid を 1 行書く。待たない（孫の標準入出力は空）
+// - hold:パス … パスのファイルを作って開いたままにする（Windows では、ほかから開けない・消せないように排他で開き、
+//   閉じたら消える指定にする）。終わるまで持つので、テストはそのファイルが消せるか・消えたかで、このプロセスが
+//   終わったかを知る（pid を使わない。再利用されうるため）
+// - grandchild:パス … 自分をもう 1 つ `hold:パス sleep:30000` で起動し（孫）、パスのファイルができるまで（最大 5 秒）待つ。
+//   孫は待たずに残す。孫の標準入出力は空。孫は 30 秒で自分で終わる（止める仕組みが働かなくても残り続けない）
 // - alloc:MiB … MiB だけ確保して書き込む（使用メモリを増やす）。確保したものは終わるまで持つ
 // - crash:access-violation・crash:stack-overflow・crash:abort・crash:panic・crash:divide-by-zero（x86_64 だけ）
 // - exit:N
@@ -34,8 +38,9 @@ const MIB: usize = 1024 * 1024;
 fn main() {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
-    // alloc で確保したもの（終わるまで持つ）
+    // alloc で確保したもの・hold で開いたファイル（終わるまで持つ）
     let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut held: Vec<std::fs::File> = Vec::new();
     for step in std::env::args().skip(1) {
         let (name, value) = step.split_once(':').unwrap_or((step.as_str(), ""));
         match name {
@@ -90,21 +95,28 @@ fn main() {
             "spin" => loop {
                 std::hint::spin_loop();
             },
+            "hold" => held.push(hold(value)),
             "grandchild" => {
                 let exe = std::env::current_exe().unwrap_or_else(|error| fail(&error.to_string()));
                 // 孫は待たずに残す（止められるかをテストで確かめるため）
                 #[allow(clippy::zombie_processes)]
-                let child = Command::new(exe)
-                    .arg("sleep:600000")
+                Command::new(exe)
+                    .args([format!("hold:{value}"), "sleep:30000".to_string()])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
                     .unwrap_or_else(|error| fail(&error.to_string()));
-                write(
-                    &mut std::io::stdout(),
-                    format!("{}\n", child.id()).as_bytes(),
-                );
+                let path = std::path::Path::new(value);
+                if !(0..500).any(|_| {
+                    let made = path.exists();
+                    if !made {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    made
+                }) {
+                    fail(&format!("孫が {value} を作りません"));
+                }
             }
             "alloc" => {
                 let mut block = vec![0u8; number::<usize>(value) * MIB];
@@ -156,6 +168,29 @@ fn write_forever(stream: &mut impl Write) -> ! {
     loop {
         write(stream, &chunk);
     }
+}
+
+// パスのファイルを作って開く。Windows では共有を許さず（ほかから開けない・消せない）、閉じたら消える指定で開く
+// （このプロセスが自然に終わっても、止められても、印のファイルが残らない）
+fn hold(path: &str) -> std::fs::File {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // GENERIC_WRITE と DELETE（閉じたら消える指定には DELETE が要る）、FILE_FLAG_DELETE_ON_CLOSE
+        // （std だけで作るので、windows-sys を使わずに値を書く）
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options
+            .access_mode(GENERIC_WRITE | DELETE)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    options
+        .open(path)
+        .unwrap_or_else(|error| fail(&format!("{path} を開けません：{error}")))
 }
 
 // 1 行読み、行末の改行（`\r\n` も）を除いて返す。EOF・読めないときは None

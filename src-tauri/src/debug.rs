@@ -870,6 +870,9 @@ impl Client {
         let mut child = command
             .spawn()
             .map_err(|error| format!("lldb-dap を起動できません：{error}"))?;
+        #[cfg(windows)]
+        crate::win::start_in_job(&child)
+            .map_err(|error| format!("lldb-dap を起動できません：{error}"))?;
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         spawn_stderr_reader(
@@ -931,6 +934,9 @@ impl Client {
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
+            .map_err(|error| format!("debugpy を起動できません：{error}"))?;
+        #[cfg(windows)]
+        crate::win::start_in_job(&child)
             .map_err(|error| format!("debugpy を起動できません：{error}"))?;
         // 出力は、つないでから読む（それまでは debugpy がつなぎを待つので、デバッグ対象は出力しない）
         let stdout = child.stdout.take().expect("piped");

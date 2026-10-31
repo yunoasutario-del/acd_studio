@@ -258,7 +258,7 @@ C++ の解答に手元だけで `_setmode` を入れる案は、ジャッジと�
 | 項目 | 内容 | 確認状況 |
 | --- | --- | --- |
 | システムのコードページ | ACP・OEMCP とも 932。今の端末は 65001 | 確認済み |
-| GUI から起動した子 | 端末を持たない子は既定のコードページ（932）で出力する（推測） | 未確認 |
+| GUI から起動した子 | IDE（dev）から起動した解答が起動した ping.exe は、日本語の部分を CP932 で出した。IDE は UTF-8 として表示するので、実行ログで日本語の部分だけが文字化けし、英数字は正しく出た（段階 2 S3 の画面の確かめ。2026-11-01）。直すかどうかは S7 か S13 で案を出してから決める | 確認済み（ping で。ほかのプログラムは未確認） |
 | g++ の診断 | 本文は英語（MinGW-Builds は NLS なし。推測）。日本語を含むパスやソースの文字列は CP932 のバイトで出うる（推測）。process の出力は from_utf8_lossy などで読むので文字化けで済むが、logLinks の場所の照合が外れる | 未確認 |
 | Python の `-E` | python.rs:489・504、debug.rs:283 で `-E` を付けている（確認済み）。`-E` は PYTHON で始まる環境変数を無視するので、**PYTHONUTF8・PYTHONIOENCODING を設定しても効かない**（-E の仕様は資料の記述で、未確認） | 付けていること：確認済み／効かないこと：未確認 |
 | Python の標準入出力 | CPython はパイプのとき cp932 で出した（`あ` は `82 A0`）。cp932 で表せない文字（絵文字）は UnicodeEncodeError で終了コード 1（RE）。PyPy 3.11 は付けなくても utf-8 だった（2026-10-31。端末から起動した子で） | 確認済み（GUI から起動した子では未確認） |
@@ -289,20 +289,22 @@ C++ の解答に手元だけで `_setmode` を入れる案は、ジャッジと�
 | 起動の箇所 | src-tauri/src に `Command::new` が 36 か所、`creation_flags` は 0 か所 | 確認済み |
 | 起こること | コンソールを持たない GUI のプロセスから、cargo・g++・curl・clangd・rust-analyzer・解答などのコンソールのプログラムを起動すると、そのたびに窓が出る（推測） | 未確認（release でビルドして実行・テストを押す） |
 | 対策 | `std::os::windows::process::CommandExt::creation_flags(CREATE_NO_WINDOW)` を、共通の関数（例：toolchain.rs の cargo_command の隣に置く「外部コマンドを作る関数」）で必ず付ける。36 か所を 1 つの関数に寄せる | 未確認 |
-| Job Object との組み合わせ | CREATE_SUSPENDED・CREATE_NO_WINDOW は同時に付けられる（推測）。IDE 自身が別の Job（端末・VS Code など）に入っていても、Windows 8 以降は入れ子にできる（推測） | 未確認 |
+| Job Object との組み合わせ | CREATE_SUSPENDED・CREATE_NO_WINDOW を同時に付けて起動し、Job に入れて再開できた（段階 2 S3 のテスト）。画面の確かめ（2026-11-01）では、dev で解答が起動した ping の窓は出ず、npm と cargo の下で動く IDE から入れた Job が働いた（止める・TLE・子が自然に終わったあと・IDE をタスクの終了で止めたとき、孫まで消えた）。ただし IDE 自身が別の Job に入っていたかは見ていない | 確認済み（dev。IDE が別の Job に入っていたかは未確認） |
 | dev での見え方 | dev は IDE にコンソールがあるので、子は同じコンソールを使い、窓は出ない（推測）。そのため dev だけでは気づけない | 未確認 |
 
 ### 4.7 実行中の exe の上書き
 
 | 項目 | 内容 | 確認状況 |
 | --- | --- | --- |
-| 制約 | Windows では動いている exe に書き込めない・消せない（推測） | 未確認 |
-| 起こること | 前の実行・デバッグ・止めたが終わりきっていない子が残ると、cargo のリンクや g++ の `-o target\main.exe` が「アクセスが拒否されました（os error 5）」などで失敗する（推測） | 未確認 |
-| 止めることとの関係 | TerminateJobObject は終わるのを待たずに返る（推測）。止めたあと、Job の ActiveProcesses が 0 になる（JOBOBJECT_BASIC_ACCOUNTING_INFORMATION、または完了ポートの通知）まで待ってから、run.rs の RunControl を解放する | 未確認 |
-| 抜けた子孫 | macOS の「setsid でグループから抜けた子孫」（process.rs:10–13）にあたるものは、Job に CREATE_BREAKAWAY_FROM_JOB を許さない限り作れない（推測）。Windows の方が止めやすい | 未確認 |
-| ほかの原因 | Defender の検査中のロック（推測）。rust-analyzer の `cargo check` は別のファイルを作るので、普通は衝突しない（推測） | 未確認 |
-| 確かめ方 | 無限ループの解答を実行し、止める→すぐビルド、を繰り返す。デバッグ中にビルドを押す（RunControl で断られることも見る） | 未確認（まだ行っていない） |
-| 失敗したときの文 | 「前の実行が終わっていない可能性があります」の案内を、ビルドの失敗の文に足す | 未確認（まだ行っていない） |
+| 制約 | 動いている exe（孫が使っているものも）には書き込めない。段階 2 S3 の前の仮の実装（直接の子だけを止める）では、止めたあとも孫が使っていて、上書きが os error 32（「別のプロセスが使用中です」）で失敗した | 確認済み（テスト overwrites_the_program_right_after_stopping） |
+| 起こること | 前の実行・デバッグ・止めたが終わりきっていない子が残ると、cargo のリンクや g++ の `-o target\main.exe` が失敗する（推測） | 未確認 |
+| 止めることとの関係 | 段階 2 S3 で、kill_group は TerminateJobObject のあと、Job の ActiveProcesses（JOBOBJECT_BASIC_ACCOUNTING_INFORMATION）が 0 になるまで待ってから Job を閉じる。測ると、TerminateJobObject のあと 0.0〜0.2 ms で 0 になった | 確認済み（下の測定） |
+| 止めたあとの短い間（測定。2026-10-31） | Job が空になり、直接の子の終わりも待ったあとでも、exe を上書きできないことがある。試しのプログラム（scratchpad。コミットしていない。IDE と同じ手順：CREATE_SUSPENDED → Job → 再開 → 孫 → 300 ms 動かす → TerminateJobObject → 空になるまで待つ → 子を待つ → すぐ `fs::write`）で、写してすぐ動かしたとき 40 回中 3 回と 40 回中 5 回、写してから 3 秒待って動かしたとき 30 回中 1 回、os error 32 になった。書けるようになるまで 9.7〜37.4 ms（9 回）。写しただけで動かさないときは 40 回とも書けた。失敗したときに Restart Manager（RmGetList）で調べると、使っているプロセスの一覧は毎回空だった。テスト全体を 20 回くり返したときは、overwrite のテスト（止めたあとすぐ 1 回だけ書く形）が 20 回中 7 回落ちた | 測った値：確認済み／原因（OS が exe の読み込みを少しの間解放しないのか、Restart Manager から見えない Defender などが開いているのか）：未確認 |
+| 抜けた子孫 | macOS の「setsid でグループから抜けた子孫」（process.rs:10–13）にあたるものは、Job に JOB_OBJECT_LIMIT_BREAKAWAY_OK を付けない限り作れない（推測）。段階 2 S3 で、子が作った孫が、時間の上限・止める操作・子が自然に終わったあと・Job を閉じたときに止まることを確かめた | 孫が止まること：確認済み／抜けられないこと：推測 |
+| Job を閉じたとき | KILL_ON_JOB_CLOSE で止まった子の終了コードは 0 だった（KILLED_EXIT_CODE ではない）。IDE が異常に終わったときにあたる | 確認済み（テスト closing_the_job_stops_the_child_and_descendants） |
+| ほかの原因 | rust-analyzer の `cargo check` は別のファイルを作るので、普通は衝突しない（推測） | 未確認 |
+| 確かめ方 | テスト overwrites_the_program_right_after_stopping：止めたあと 2 秒のうちに書けることを確かめ、かかった時間を失敗の文に出す（段階 2 S3）。画面では、孫を作って回り続ける解答を止めた直後にコメントを足してビルドし直すのを 5 回、できるだけ素早く行い、5 回ともエラーなくビルドできた（2026-11-01。dev） | テスト・画面：確認済み（画面の 5 回では失敗は起きなかった） |
+| 失敗したときの文 | 段階 2 S3b：ビルドの前に、出力の exe が書き込みで開けるようになるまで最大 2 秒待ち、開けなければ「前の実行が終わっていない可能性があります」の案内を、ビルドの失敗の文に足す | 未確認（S3b で行う） |
 
 ### 4.8 空白や括弧を含むパス
 
@@ -323,12 +325,12 @@ C++ の解答に手元だけで `_setmode` を入れる案は、ジャッジと�
 | 作り | 標準ライブラリの匿名パイプで、解答とジャッジの標準入出力を、別々のスレッドの同期の読み書きで中継する（spawn_relay、process.rs:437–470） | 確認済み（コード） |
 | Windows で動くか | 同期の読み書きなので、そのまま動く見込み | 推測（未確認） |
 | 相手が終わったあとの書き込み | BrokenPipe（ERROR_BROKEN_PIPE・ERROR_NO_DATA）になり、spawn_relay の `is_err()` で中継をやめる（推測） | 未確認 |
-| ハンドルの継承 | 2 つの子を続けて起動するとき、片方のパイプの端がもう片方に継承されると EOF が届かず止まる。標準ライブラリは起動のときにロックし、子の端だけを継承させる（推測） | 未確認 |
+| ハンドルの継承 | 標準ライブラリ（Rust 1.99.0 の library/std/src/sys/process/windows.rs）は、`inherit_handles` の既定が true（193 行）で、CreateProcessW の bInheritHandles にそのまま渡す（329・416–421 行）。受け継ぐハンドルを絞る仕組み（PROC_THREAD_ATTRIBUTE_HANDLE_LIST）は使わない。子の標準入出力のハンドルは、起動の間だけロックして受け継げるようにする（334–345 行）ので、IDE が続けて起動する 2 つの子（対話テストの解答とジャッジ）が互いのパイプを受け継ぐことはない（ソースから。推測）。一方、子（解答）の中では、自分の標準入出力のハンドルが受け継げるままなので、子が Rust の Command で孫を起動すると、孫の標準入出力を空にしても、子の出力のパイプを孫が受け継ぐ。そのため孫が残っていると、子が終わってもパイプが閉じない（段階 2 S3 の前の仮の実装で、子が自然に終わったあと output_left_open が true になった。PowerShell から孫を作る test_child を動かすと、孫が終わるまで返らなかった）。Job で孫を止めればパイプも閉じる（S3 のテスト stops_descendants_left_after_exit で output_left_open が false）。IDE の側で受け継ぎを止める仕組みは足さない | ソースの記述・孫がパイプを持ち続けること・Job で閉じること：確認済み／2 つの子が互いに受け継がないこと：推測 |
 | 終わり方 | シグナルがないので ExitKind::Signal（process.rs:393–409）は出ない。止めた側の終了コードは TerminateJobObject に渡した値になる | 推測（未確認） |
 | CRLF | C++・Python のジャッジや解答は `\r\n` を出す（C++ は 4.3 で確認済み、Python は未確認）。やり取りの表示に `\r` が混じり、`\r` を考えていないジャッジ（利用者が書いたもの）が読み違えうる | 一部確認済み |
 | バッファ | パイプへの出力は完全バッファ（推測）。flush を忘れたときに TLE になるのは macOS と同じ | 未確認 |
 | ジャッジに渡す入力のパス | interactive.rs:217–219 で `<ケース>.in` のパスを引数で渡す。`\\?\` の形になるかは 4.8 | 未確認 |
-| 確かめ方 | process.rs の run_pair のテスト（:993–1146）を、`/bin/sh` の代わりにテスト用の Rust のプログラムで書き直す。とくに keeps_a_long_exchange_in_order（1000 往復）・finds_who_failed_first・stops_the_other_side_after_a_grace_period。interactive.rs:1215 以降の Python のジャッジのテストも | 未確認（まだ行っていない） |
+| 確かめ方 | process.rs の run_pair のテストを、`/bin/sh` の代わりにテスト用の子のプログラムで書き直した（段階 2 S2・S3）。keeps_a_long_exchange_in_order（1000 往復）・finds_who_failed_first・stops_the_other_side_after_a_grace_period・stops_descendants_of_both_sides が Windows で通る。interactive.rs:1215 以降の Python のジャッジのテストはまだ | run_pair：確認済み／Python のジャッジ：未確認 |
 
 ### 4.10 パスの安全性（作業領域の外を触らないための検証）
 
@@ -606,8 +608,9 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 | 順 | まとまり | 何を変えるか | どう確認するか |
 | --- | --- | --- | --- |
 | S1 | 文書 | 1 章の Python の行、4.3・4.4・5 章の確かめたこと、この表、9.1 の追加 6〜14 | — |
-| S2 | テスト用の子のプログラム（9.1 の追加 8・14） | `src-tauri/examples/test_child.rs`：引数で動きを選ぶ（出力・終了コード・標準入力をそのまま返す・待つ・回り続ける・孫を作って pid を出す・メモリを使う・落ちる〔アクセス違反・0 除算・スタックあふれ・abort・panic〕・対話の相手）。テストは `target/debug/examples/` から探す。process.rs の Windows のテスト（段階 1 の `cmd /c` のもの）をこれで書き直し、run.rs の `/bin/cat` のテスト（judges_cases_with_a_real_program）の Windows 版を足す | 今の仮の実装で通るものだけを入れる。`cargo test` |
-| S3 | Job Object（9.1 の 1・追加 4・追加 9・追加 10） | win.rs の中身を差し替える。`process_group(0)` の代わりの仕組みで CREATE_SUSPENDED（と CREATE_NO_WINDOW）を付け、spawn の直後に `#[cfg(windows)]` の 1 行で Job に入れる（KILL_ON_JOB_CLOSE）。主スレッドは Toolhelp32 で探して再開する。spawn の直後の 1 行を足すのは process.rs の 3 か所・lsp.rs・debug.rs。kill_group は TerminateJobObject（終了コードは追加 10 の値）のあと、Job の動いているプロセスが 0 になるまで待つ（4.7）。Job に入れていない pid を kill_group・reap に渡したら debug_assert で知らせる。process.rs の関数の形は変えない | 先にテストを書いて失敗を確かめる：時間の上限・止める操作で孫も止まる／子が自然に終わったあとで孫が残らない／Job を閉じると子が消える／止めた直後に exe を上書きできる |
+| S2 | テスト用の子のプログラム（9.1 の追加 8・14） | `src-tauri/examples/test_child.rs`：引数で動きを選ぶ（出力・終了コード・標準入力をそのまま返す・待つ・回り続ける・孫を作る・メモリを使う・落ちる〔アクセス違反・0 除算・スタックあふれ・abort・panic〕・対話の相手）。process.rs の Windows のテスト（段階 1 の `cmd /c` のもの）をこれで書き直し、run.rs の `/bin/cat` のテスト（judges_cases_with_a_real_program）の Windows 版を足す。**S2 の直し（eeef85e）**：はじめは `target/debug/examples/` の exe を使ったが、絞り込みを付けた cargo test が作り直さず古いものが使われたので、テストの中で rustc で直接コンパイルし、ソースのハッシュの名前で `target/debug/test-child/` に置く形にした | 今の仮の実装で通るものだけを入れる。`cargo test` |
+| S3 | Job Object（9.1 の 1・追加 4・追加 9・追加 10） | win.rs の中身を差し替える。`process_group(0)` の代わりの仕組みで CREATE_SUSPENDED（と CREATE_NO_WINDOW）を付け、spawn の直後に `#[cfg(windows)]` の 1 行で Job に入れる（KILL_ON_JOB_CLOSE）。主スレッドは Toolhelp32 で探して再開する。spawn の直後の 1 行を足すのは process.rs の 3 か所・lsp.rs・debug.rs。kill_group は TerminateJobObject（終了コードは追加 10 の値）のあと、Job の動いているプロセスが 0 になるまで待つ（4.7）。Job に入れていない pid を kill_group・reap に渡したら debug_assert で知らせる。process.rs の関数の形は変えない。test_child の孫は `grandchild:印のファイル` で、印を排他で開いたまま最大 30 秒生きる（テストは pid ではなく印で、孫が生きている・終わったを見る） | 先にテストを書いて失敗を確かめる：時間の上限・止める操作で孫も止まる／子が自然に終わったあとで孫が残らない／Job を閉じると子が消える／止めたあと 2 秒のうちに exe を上書きできる（1 回目で書けるとは限らない。4.7）／Job に入れられなかったら子を止めてエラーにする |
+| S3b | 止めたあとのビルドの前に待つ（4.7） | Rust・C++・ランダムテストの example の出力の exe があれば、ビルドの前に、中身を変えずに書き込みで開けるようになるまで短く待つ（最大 2 秒。exe がなければ待たない）。開けなければ、ビルドの失敗の文に「前の実行が終わっていない可能性があります」の案内を足す | 単体テスト（開けない exe で待って案内を出す・ない exe では待たない）。画面で、止める→すぐビルドを繰り返す |
 | S4 | メモリ | current_rss は GetProcessMemoryInfo の WorkingSetSize、最大使用メモリは PeakWorkingSetSize（直接の子だけ。Unix と同じ）。interactive::tests_interactively_with_real_programs の ignore を外す | 先にテスト（実行中に上限で止まる・最大使用メモリが出る）を書いて失敗を確かめる。外したテストが通る（ほかの理由で落ちたら報告する） |
 | S5 | RE の表示（追加 10） | NTSTATUS の名前（0xC0000005・0xC00000FD・0xC0000094・0xC0000409・0xC0000135 など）と 16 進の表示、IDE が止めたときの値の表示。runLog.ts・TestResults.tsx・interactive.rs・random.rs。Unix の終了コードは 0〜255 で重ならないので OS では分けない（共通のコードの文字が変わるので報告に書く） | 子のプログラムで実際に落として、どの終了コードになるかを確かめる（どの値になるかは未確認） |
 | S6 | 改行（9.1 の 6 の a・b） | Windows だけ：exact の比較の前に CRLF を LF に直す／実際の出力を期待出力として保存するときに LF に直す | 先にテスト（CRLF の出力で exact が WA になる、保存した .out に CR が残る）を書いて失敗を確かめる |
@@ -625,6 +628,19 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 - 止めたあとすぐにビルドし直せる
 - 問題の取得（問題ページ・問題の一覧）
 - 深い再帰の解答が手元で落ちない（S9）
+
+S3 の画面の確かめ（2026-11-01。利用者が Windows 11 で確かめた。dev〔npm run tauri dev〕、S3 のコミットの前の作業ツリー。
+試しのフォルダは Rust のパッケージ t1 で、main.rs は `ping -n 300 127.0.0.1` を孫として起動してから回り続ける。見たのはタスクマネージャーの「詳細」）
+
+| 番号 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1 | 実行して、時間の上限（10 秒）で止まったとき・「停止」を押したとき | OK。どちらも t1.exe と PING.EXE が消えた。ping の窓は出なかった |
+| 2 | サンプルテストで TLE になったとき | OK。約 2.5 秒で TLE になり、t1.exe と PING.EXE が消えた |
+| 3 | 子が自然に終わったあとの孫 | OK。回り続けない版では、どちらもタスクマネージャーに出る前に消えた。ping を起動して 3 秒眠って終わる版で、3 秒後に t1.exe と PING.EXE が消えた |
+| 4 | 止めた直後にコメントを足してビルドし直す（5 回、できるだけ素早く） | OK。5 回ともエラーなくビルドできた（4.7） |
+| 5 | ping の出力が 2〜3 行出たところで、atcoder-studio.exe をタスクの終了で止める（IDE が異常に終わったときにあたる） | OK。15 秒後に見て、t1.exe も PING.EXE も残っていなかった。dev で npm と cargo の下で動いていても Job が働いた（4.6） |
+| 6 | 終わったあとに残っているもの | OK。PING.EXE・t1.exe・cargo.exe・rustc.exe は残っていなかった |
+| ほか | 実行ログの ping の出力 | 日本語の部分だけが文字化けした（英数字は正しい）。ping が CP932 で出し、IDE が UTF-8 として表示するため（4.4）。直すかどうかは S7 か S13 で案を出してから決める |
 
 ### 段階 3：ファイル・URL を開く処理、ログイン情報の保存
 

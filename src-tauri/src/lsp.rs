@@ -521,6 +521,9 @@ impl Server {
         let mut child = command
             .spawn()
             .map_err(|error| format!("{name} を起動できません：{error}"))?;
+        #[cfg(windows)]
+        crate::win::start_in_job(&child)
+            .map_err(|error| format!("{name} を起動できません：{error}"))?;
         let (outgoing, to_write) = mpsc::channel();
         spawn_writer(
             name,
