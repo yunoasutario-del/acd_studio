@@ -1263,17 +1263,32 @@ mod tests {
     }
 }
 
-// Windows の仮の実装（段階 1）のテスト。cmd.exe の組み込みのコマンドだけで動かす（子孫を作らないもの）。
-// 子孫を止めること・使用メモリは、段階 2 の Job Object で確かめる
+// テスト用の子のプログラム（examples/test_child.rs。Windows 移植の段階 2 S2）の場所。cargo test は examples もビルドするので、
+// テストの実行ファイル（target/debug/deps/…）の 2 つ上の examples にある。`cargo test --lib` などでビルドされていなければ止める
+#[cfg(all(test, windows))]
+pub(crate) fn test_child_path() -> std::path::PathBuf {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("examples/test_child.exe")))
+        .expect("テストの実行ファイルの場所が分かりません");
+    assert!(
+        path.is_file(),
+        "{} がありません。examples もビルドする cargo test で動かしてください",
+        path.display()
+    );
+    path
+}
+
+// Windows のテスト（段階 2）。上の Unix のテストの /bin/sh の代わりに、テスト用の子のプログラムを使う（手順の意味は
+// examples/test_child.rs の先頭）。子孫を止めること（S3）・使用メモリ（S4）・落ちたときの終了コード（S5）は後のコミットで足す。
+// setsid で抜けた子孫のテスト（returns_even_if_escaped_descendant_keeps_writing）にあたるものは、Job から抜けられないので作らない
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use std::os::windows::process::CommandExt;
 
-    // cmd /c に、引用の加工をせずにそのまま渡す
-    fn cmd(script: &str) -> Command {
-        let mut command = Command::new("cmd");
-        command.arg("/c").raw_arg(script);
+    fn child(steps: &[&str]) -> Command {
+        let mut command = Command::new(test_child_path());
+        command.args(steps);
         command
     }
 
@@ -1285,9 +1300,9 @@ mod windows_tests {
         }
     }
 
-    fn run_cmd(script: &str, limits: &Limits) -> RunResult {
+    fn run_child(steps: &[&str], limits: &Limits) -> RunResult {
         run(
-            cmd(script),
+            child(steps),
             None,
             limits,
             &Arc::new(AtomicBool::new(false)),
@@ -1298,13 +1313,11 @@ mod windows_tests {
 
     #[test]
     fn captures_output_and_exit_code() {
-        let result = run_cmd("echo out& 1>&2 echo err& exit /b 3", &limits(5000, 1024));
+        let result = run_child(&["out:out", "err:err", "exit:3"], &limits(5000, 1024));
         assert_eq!(result.outcome, Outcome::Exited(3));
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "out");
-        assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err");
+        assert_eq!(result.stdout, b"out\n");
+        assert_eq!(result.stderr, b"err\n");
         assert!(!result.output_left_open);
-        // 使用メモリは段階 1 では測らない
-        assert_eq!(result.max_rss_bytes, None);
     }
 
     #[test]
@@ -1312,10 +1325,8 @@ mod windows_tests {
         let path =
             std::env::temp_dir().join(format!("atcoder-studio-win-stdin-{}", std::process::id()));
         std::fs::write(&path, "1 2\n").unwrap();
-        let mut findstr = Command::new("findstr");
-        findstr.arg("^");
         let result = run(
-            findstr,
+            child(&["cat"]),
             Some(File::open(&path).unwrap()),
             &limits(5000, 1024),
             &Arc::new(AtomicBool::new(false)),
@@ -1323,14 +1334,35 @@ mod windows_tests {
         )
         .unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "1 2");
+        assert_eq!(result.stdout, b"1 2\n");
     }
 
     #[test]
     fn stops_at_time_limit() {
-        let result = run_cmd("for /l %i in () do @rem", &limits(300, 1024));
+        let result = run_child(&["spin"], &limits(300, 1024));
         assert_eq!(result.outcome, Outcome::TimedOut);
         assert!(result.elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn stops_at_output_limit() {
+        let result = run_child(&["yes"], &limits(5000, 1024 * 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
+        assert_eq!(result.stdout.len(), 1024 * 1024);
+        let result = run_child(&["yeserr"], &limits(5000, 1024 * 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stderr));
+    }
+
+    #[test]
+    fn reads_both_streams_without_blocking() {
+        // 標準エラーに大量に書いてから、標準出力に書く（片方だけを読むと詰まる）
+        let result = run_child(
+            &["errbytes:2000000", "out:done"],
+            &limits(5000, 4 * 1024 * 1024),
+        );
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert_eq!(result.stderr.len(), 2_000_000);
+        assert_eq!(result.stdout, b"done\n");
     }
 
     #[test]
@@ -1342,7 +1374,7 @@ mod windows_tests {
             flag.store(true, Ordering::SeqCst);
         });
         let result = run(
-            cmd("for /l %i in () do @rem"),
+            child(&["sleep:100000"]),
             None,
             &limits(5000, 1024),
             &cancel,
@@ -1354,68 +1386,186 @@ mod windows_tests {
     }
 
     #[test]
-    fn stops_at_output_limit() {
-        let result = run_cmd(
-            "for /l %i in () do @echo yyyyyyyyyyyyyyyy",
-            &limits(10000, 64 * 1024),
-        );
-        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
-        assert_eq!(result.stdout.len(), 64 * 1024);
-    }
-
-    #[test]
-    fn reads_both_streams_without_blocking() {
-        // 標準エラーに、パイプの容量より多く書いてから、標準出力に書く（片方だけを読むと詰まる）
-        let result = run_cmd(
-            "(for /l %i in (1,1,3000) do @(1>&2 echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx))& echo done",
-            &limits(20000, 4 * 1024 * 1024),
-        );
+    fn keeps_exact_limit_and_stops_one_byte_over() {
+        let result = run_child(&["bytes:1024"], &limits(5000, 1024));
         assert_eq!(result.outcome, Outcome::Exited(0));
-        assert!(result.stderr.len() > 100_000, "{}", result.stderr.len());
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "done");
+        assert_eq!(result.stdout.len(), 1024);
+        let result = run_child(&["bytes:1025"], &limits(5000, 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
     }
 
     #[test]
-    fn relays_between_two_processes() {
-        // 解答が 5 を出して終わる。ジャッジ（findstr）は届いた行を返し、EOF で終わる
-        let result = run_pair(
-            cmd("echo 5"),
-            {
-                let mut judge = Command::new("findstr");
-                judge.arg("^");
-                judge
-            },
-            &limits(5000, 1024),
+    fn reads_all_output_with_slow_callback() {
+        // 1 MiB 以上を書いてすぐ終わる。受け取り側が遅くても、末尾まで読む
+        let result = run(
+            child(&["bytes:3000000"]),
+            None,
+            &limits(10000, 4 * 1024 * 1024),
             &Arc::new(AtomicBool::new(false)),
+            |_, _| thread::sleep(Duration::from_millis(2)),
         )
         .unwrap();
-        assert_eq!(result.solution.outcome, Outcome::Exited(0));
-        assert_eq!(result.judge.outcome, Outcome::Exited(0));
-        assert!(!result.timed_out && !result.stopped);
-        let text: Vec<(Side, String)> = result
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert_eq!(result.stdout.len(), 3_000_000);
+    }
+
+    #[test]
+    fn passes_output_to_callback() {
+        let mut seen = Vec::new();
+        run(
+            child(&["out:a", "err:b"]),
+            None,
+            &limits(5000, 1024),
+            &Arc::new(AtomicBool::new(false)),
+            |stream, bytes| seen.push((stream, bytes.to_vec())),
+        )
+        .unwrap();
+        assert!(seen.contains(&(Stream::Stdout, b"a\n".to_vec())));
+        assert!(seen.contains(&(Stream::Stderr, b"b\n".to_vec())));
+    }
+
+    // ---- run_pair ----
+
+    fn pair(solution: &[&str], judge: &[&str], limits: &Limits) -> PairResult {
+        run_pair(
+            child(solution),
+            child(judge),
+            limits,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+    }
+
+    fn text(result: &PairResult) -> Vec<(Side, String)> {
+        result
             .transcript
             .iter()
-            .map(|(side, bytes)| (*side, String::from_utf8_lossy(bytes).trim().to_string()))
-            .collect();
+            .map(|(side, bytes)| (*side, String::from_utf8_lossy(bytes).into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn relays_between_two_processes_in_order() {
+        // 解答が 5 を出し、ジャッジが 2 倍を返し、解答が確かめる
+        let result = pair(&["out:5", "expect:10"], &["double"], &limits(5000, 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert_eq!(result.first_failure, None);
+        assert!(!result.timed_out && !result.stopped && result.output_limit.is_none());
+        assert!(!result.output_left_open);
         assert_eq!(
-            text,
+            text(&result),
             vec![
-                (Side::Solution, "5".to_string()),
-                (Side::Judge, "5".to_string())
+                (Side::Solution, "5\n".to_string()),
+                (Side::Judge, "10\n".to_string())
             ]
         );
     }
 
     #[test]
+    fn collects_stderr_of_each_side() {
+        let result = pair(
+            &["err:from-solution"],
+            &["err:from-judge"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.stderr, b"from-solution\n");
+        assert_eq!(result.judge.stderr, b"from-judge\n");
+    }
+
+    #[test]
+    fn finds_who_failed_first() {
+        // 解答が出力せずに 3 で終わる。ジャッジは EOF を読んで 2 で終わる → 解答が先
+        let result = pair(&["exit:3"], &["read-or-exit:2"], &limits(5000, 1024));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        assert_eq!(result.solution.outcome, Outcome::Exited(3));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        // ジャッジが先に 1 で終わる。解答は読み取りが EOF になって 0 で終わる → ジャッジが先
+        let result = pair(&["read", "exit:0"], &["exit:1"], &limits(5000, 1024));
+        assert_eq!(result.first_failure, Some(Side::Judge));
+        assert_eq!(result.judge.outcome, Outcome::Exited(1));
+        // 両方が 0 で終われば、失敗はない。解答が先に終わっても、ジャッジを待つ
+        let result = pair(
+            &["out:done"],
+            &["read", "sleep:300", "exit:0"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.first_failure, None);
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert!(result.elapsed >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn stops_the_other_side_after_a_grace_period() {
+        // 解答が 2 で終わり、ジャッジは何も読まず眠り続ける。猶予のあとで止める
+        // （止めたときの終了コードの値は S3 で決めた値にして確かめる。ここでは 0 でないことだけ）
+        let started = Instant::now();
+        let result = pair(&["exit:2"], &["sleep:30000"], &limits(10000, 1024));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        assert!(!result.timed_out);
+        assert!(
+            matches!(result.judge.outcome, Outcome::Exited(code) if code != 0),
+            "{:?}",
+            result.judge.outcome
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn times_out_and_stops_both() {
+        // 解答もジャッジも待ち続ける（出力のあとの flush 忘れなどで起きる）
+        let started = Instant::now();
+        let result = pair(&["sleep:30000"], &["sleep:30000"], &limits(300, 1024));
+        assert!(result.timed_out);
+        assert_eq!(result.first_failure, None);
+        assert!(result.elapsed < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stops_both_on_request() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
         let result = run_pair(
-            cmd("for /l %i in () do @rem"),
-            cmd("for /l %i in () do @rem"),
-            &limits(300, 1024),
-            &Arc::new(AtomicBool::new(false)),
+            child(&["sleep:30000"]),
+            child(&["sleep:30000"]),
+            &limits(20000, 1024),
+            &cancel,
         )
         .unwrap();
-        assert!(result.timed_out);
-        assert!(result.elapsed < Duration::from_secs(3));
+        assert!(result.stopped);
+        assert!(!result.timed_out);
+        assert_eq!(result.first_failure, None);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn limits_output_of_each_side() {
+        // 解答が出力し続ける。ジャッジは読み捨てる。上限（4 KiB）を超えたら両方を止める
+        let result = pair(&["yes"], &["discard"], &limits(10000, 4096));
+        assert_eq!(result.output_limit, Some(Side::Solution));
+        assert!(!result.timed_out);
+        assert!(result.elapsed < Duration::from_secs(5));
+        // 標準エラーは、上限を超えた分を捨てるだけで止めない
+        let result = pair(&["errbytes:100000"], &["exit:0"], &limits(10000, 4096));
+        assert_eq!(result.output_limit, None);
+        assert_eq!(result.solution.stderr.len(), 4096);
+    }
+
+    #[test]
+    fn keeps_a_long_exchange_in_order() {
+        // 1000 往復。順序と、往復の数が保たれる
+        let result = pair(&["ask:1000"], &["echo-lines"], &limits(20000, 1024 * 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        // 解答の出力と、ジャッジの返事が交互に並び、まとめられていない（往復ごとに側が変わる）
+        assert_eq!(result.transcript.len(), 2000);
+        assert_eq!(result.transcript[0], (Side::Solution, b"0\n".to_vec()));
+        assert_eq!(result.transcript[1], (Side::Judge, b"0\n".to_vec()));
+        assert_eq!(result.transcript[1998], (Side::Solution, b"999\n".to_vec()));
     }
 }

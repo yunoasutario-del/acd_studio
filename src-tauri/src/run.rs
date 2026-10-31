@@ -1803,6 +1803,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Windows 版（段階 2 S2）：テスト用の子のプログラムで 2 秒待つ。使用メモリの確認は S4 で足す
+    #[cfg(windows)]
+    #[test]
+    fn stops_a_case_at_the_time_limit() {
+        let dir = std::env::temp_dir().join(format!("atcoder-studio-tle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sample-1.in"), "").unwrap();
+        std::fs::write(dir.join("sample-1.out"), "1\n").unwrap();
+        let settings = TestSettings {
+            time_limit_ms: 200,
+            ..TestSettings::default()
+        };
+        let program = Program {
+            path: process::test_child_path(),
+            args: vec!["sleep:2000".into(), "out:1".into()],
+        };
+        let started = Instant::now();
+        let case = run_case(
+            &dir,
+            &program,
+            &dir.join("sample-1.in"),
+            &settings,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(matches!(case.verdict, Verdict::TimedOut));
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn decides_whether_an_output_can_be_saved_as_expected() {
         // 正常に終わり、全体を得られ、UTF-8 で、画面に出せる大きさ
@@ -1876,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)] // /bin/cat を使う。Windows で同じことを確かめるテストは段階 2 で足す
+    #[cfg(unix)] // /bin/cat を使う。Windows 版は下（段階 2 S2）
     fn judges_cases_with_a_real_program() {
         // cat は入力をそのまま出力する
         let dir = std::env::temp_dir().join(format!("atcoder-studio-judge-{}", std::process::id()));
@@ -1902,6 +1933,53 @@ mod tests {
         let case3 = run_case(
             &dir,
             &Program::native(PathBuf::from("/bin/cat")),
+            &dir.join("sample-3.in"),
+            &TestSettings::default(),
+            &cancel,
+        )
+        .unwrap();
+        // .out がなくても、置く場所は相対パスで示す。cat の出力は保存できる
+        assert_eq!(case3.out_file, "sample-3.out");
+        assert_eq!(case3.save_blocked, None);
+        assert_eq!(case3.actual, "5\n");
+        assert!(matches!(verdict(1), Verdict::Accepted));
+        assert!(matches!(verdict(2), Verdict::WrongAnswer));
+        // .out がなければ比較不可・目視確認
+        assert!(matches!(verdict(3), Verdict::Unjudged));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Windows 版（段階 2 S2）：/bin/cat の代わりに、テスト用の子のプログラムの cat（入力をそのまま出力する）
+    #[test]
+    #[cfg(windows)]
+    fn judges_cases_with_a_real_program() {
+        let dir = std::env::temp_dir().join(format!("atcoder-studio-judge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sample-1.in"), "1 2\n").unwrap();
+        std::fs::write(dir.join("sample-1.out"), "1  2\n").unwrap();
+        std::fs::write(dir.join("sample-2.in"), "3\n").unwrap();
+        std::fs::write(dir.join("sample-2.out"), "4\n").unwrap();
+        std::fs::write(dir.join("sample-3.in"), "5\n").unwrap();
+        let cat = Program {
+            path: process::test_child_path(),
+            args: vec!["cat".into()],
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let verdict = |n: u32| {
+            run_case(
+                &dir,
+                &cat,
+                &dir.join(format!("sample-{n}.in")),
+                &TestSettings::default(),
+                &cancel,
+            )
+            .unwrap()
+            .verdict
+        };
+        let case3 = run_case(
+            &dir,
+            &cat,
             &dir.join("sample-3.in"),
             &TestSettings::default(),
             &cancel,
