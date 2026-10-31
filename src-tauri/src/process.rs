@@ -1263,20 +1263,79 @@ mod tests {
     }
 }
 
-// テスト用の子のプログラム（examples/test_child.rs。Windows 移植の段階 2 S2）の場所。cargo test は examples もビルドするので、
-// テストの実行ファイル（target/debug/deps/…）の 2 つ上の examples にある。`cargo test --lib` などでビルドされていなければ止める
+// テスト用の子のプログラム（examples/test_child.rs。Windows 移植の段階 2 S2）の場所。
+// cargo test が examples を作り直すとは限らない（絞り込みを付けた cargo test で、古い target/debug/examples/test_child.exe が
+// 使われた）ので、テストの中で rustc で直接コンパイルする（test_child.rs は std だけを使う）。
+// - テストの実行ファイル 1 つにつき 1 回だけ作る（OnceLock）
+// - 名前にソースのハッシュを入れ、テストの実行ファイル（target/debug/deps/…）の 2 つ上の test-child に置く。同じソースなら作り直さない
+// - 一時的な名前で書いてから名前を変えるので、同時に作っても壊れない
+// - rustc を動かす場所とソースの場所は CARGO_MANIFEST_DIR から決める（今いるフォルダに頼らない。rust-toolchain.toml の版になる）
 #[cfg(all(test, windows))]
 pub(crate) fn test_child_path() -> std::path::PathBuf {
-    let path = std::env::current_exe()
+    static PATH: OnceLock<Result<std::path::PathBuf, String>> = OnceLock::new();
+    match PATH.get_or_init(build_test_child) {
+        Ok(path) => path.clone(),
+        Err(message) => panic!("テスト用の子のプログラムを作れません：{message}"),
+    }
+}
+
+#[cfg(all(test, windows))]
+fn build_test_child() -> Result<std::path::PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+    const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+    const SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/test_child.rs"
+    ));
+    let source = std::path::Path::new(MANIFEST_DIR).join("examples/test_child.rs");
+    // コンパイルするのはディスクの上のファイルなので、テストをビルドしたときの中身（ハッシュの元）と同じかを確かめる
+    let on_disk = std::fs::read_to_string(&source)
+        .map_err(|error| format!("{} を読めません：{error}", source.display()))?;
+    if on_disk != SOURCE {
+        return Err(format!(
+            "{} がテストのビルドのあとで変わりました。cargo test をやり直してください",
+            source.display()
+        ));
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    SOURCE.hash(&mut hasher);
+    let name = format!("test_child-{:016x}", hasher.finish());
+    let dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("examples/test_child.exe")))
-        .expect("テストの実行ファイルの場所が分かりません");
-    assert!(
-        path.is_file(),
-        "{} がありません。examples もビルドする cargo test で動かしてください",
-        path.display()
-    );
-    path
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("test-child")))
+        .ok_or("テストの実行ファイルの場所が分かりません")?;
+    let path = dir.join(format!("{name}.exe"));
+    if path.is_file() {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("{} を作れません：{error}", dir.display()))?;
+    let temporary = dir.join(format!("{name}-{}.tmp.exe", std::process::id()));
+    let output = Command::new("rustc")
+        .current_dir(MANIFEST_DIR)
+        .args(["--edition", "2024", "-o"])
+        .arg(&temporary)
+        .arg(&source)
+        .output()
+        .map_err(|error| format!("rustc を起動できません：{error}"))?;
+    // rustc が一時的な名前の隣に作るデバッグ情報は要らない
+    let _ = std::fs::remove_file(temporary.with_extension("pdb"));
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "rustc が失敗しました：{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    match std::fs::rename(&temporary, &path) {
+        Ok(()) => Ok(path),
+        // ほかのテストの実行ファイルが先に作った（そちらを使う）
+        Err(_) if path.is_file() => {
+            let _ = std::fs::remove_file(&temporary);
+            Ok(path)
+        }
+        Err(error) => Err(format!("{} を置けません：{error}", path.display())),
+    }
 }
 
 // Windows のテスト（段階 2）。上の Unix のテストの /bin/sh の代わりに、テスト用の子のプログラムを使う（手順の意味は

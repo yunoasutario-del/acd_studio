@@ -1,6 +1,8 @@
 // テスト用の子のプログラム（Windows 移植の段階 2 S2。docs/windows-port-plan.md 7 章・9.1 の追加 8）
 //
 // process.rs などのテストが起動する。/bin/sh などの OS のコマンドに頼らずに、同じ動きを Windows と Unix の両方で作るためのもの。
+// テストは、このファイルを rustc で直接コンパイルして使う（process.rs の test_child_path）ので、std だけを使う。
+// examples に置くのは、cargo clippy --all-targets の対象にするため
 // 引数を 1 つずつ順に実行する（`out:a err:b exit:3` なら、a を標準出力に、b を標準エラーに書いて 3 で終わる）。
 // 書いたものはすぐに flush する。改行は `\n` だけ（Rust は CRLF にしない）。書けなくなったら（相手が閉じた）121 で終わる
 //
