@@ -1824,7 +1824,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn builds_launch_configuration() {
         let init = initialize_arguments();
         assert_eq!(init["$__lldb_sourceInitFile"], false);
@@ -1909,7 +1912,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn reports_missing_adapter() {
         let error = find_adapter(Path::new("/nonexistent/xcrun")).unwrap_err();
         assert!(error.starts_with(ADAPTER_MISSING), "{error}");
@@ -2154,7 +2160,10 @@ fn main() {
 
     // 止まる → スタック → 変数 → ステップ → 式 → 続行して終わる
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn debugs_with_real_lldb_dap() {
         let (ws, pkg) = package("e2e");
         write(&pkg.join("test/input.txt"), "5\n3 1 4 1 5\n");
@@ -2415,7 +2424,10 @@ int main() {
 
     // 動いている間に止める・一時停止・panic
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn stops_pauses_and_catches_panics() {
         let (ws, pkg) = package("stop");
         write(&pkg.join("test/sample-1.in"), "1 7 spin\n");
@@ -2492,7 +2504,10 @@ int main() {
     // 初期化ファイルの出力は launch の答えより前なので画面に出さない（捨てる）。そこで、読んだらプログラムの
     // 環境変数に目印が付くようにして、プログラムの出力で確かめる
     #[test]
-    #[cfg_attr(windows, ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章")]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn ignores_lldbinit_and_does_not_wait_for_input() {
         let (ws, pkg) = package("init");
         let home = ws.0.join("home");

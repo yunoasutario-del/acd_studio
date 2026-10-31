@@ -119,7 +119,10 @@ fn display_inside(shown: &Path) -> String {
 fn display_above(path: &Path, home: Option<&Path>) -> String {
     let path = without_verbatim(path);
     let home = home.map(without_verbatim);
-    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
         Some(rest) => format!("~/{}", rest.to_string_lossy().replace('\\', "/")),
         None => path.to_string_lossy().into_owned(),
     }
@@ -313,9 +316,15 @@ mod tests {
         let home = without_verbatim(&dir.0);
         assert!(!home.to_string_lossy().starts_with(r"\\?\"), "{home:?}");
         let found = inspect(&root, Some(&home)).found;
-        assert!(found.contains(&"b/.cargo/config.toml".to_string()), "{found:?}");
+        assert!(
+            found.contains(&"b/.cargo/config.toml".to_string()),
+            "{found:?}"
+        );
         assert!(found.contains(&"~/rust-toolchain".to_string()), "{found:?}");
-        assert!(found.iter().all(|path| !path.contains(r"\\?\")), "{found:?}");
+        assert!(
+            found.iter().all(|path| !path.contains(r"\\?\")),
+            "{found:?}"
+        );
     }
 
     #[test]

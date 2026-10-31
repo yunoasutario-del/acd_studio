@@ -1718,8 +1718,7 @@ pub async fn import_vscode_snippets(
     app: AppHandle,
 ) -> Result<snippets::Imported, String> {
     let dir = app_dir(&app)?;
-    let home =
-        toolchain::home_dir().ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
+    let home = toolchain::home_dir().ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
     // Windows の VS Code の場所（%APPDATA%\Code\User\snippets）にするのは段階 3
     let source = home
         .join("Library/Application Support/Code/User/snippets")

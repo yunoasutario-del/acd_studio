@@ -343,7 +343,9 @@ fn windows_name_ok(name: &str) -> bool {
         return false;
     }
     // COM0〜COM9・LPT0〜LPT9 と、上付きの数字（¹²³）のもの
-    let device = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    let device = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
     !device.is_some_and(|rest| {
         let mut chars = rest.chars();
         matches!(
@@ -1194,7 +1196,10 @@ mod tests {
             ];
             for name in &escaping {
                 assert!(create_file(&root, "", name).is_err(), "{root:?} {name:?}");
-                assert!(create_file(&root, "src", name).is_err(), "{root:?} {name:?}");
+                assert!(
+                    create_file(&root, "src", name).is_err(),
+                    "{root:?} {name:?}"
+                );
             }
             assert!(!base.0.join("escape-file.txt").exists());
             assert!(!ws.join("escape-file.txt").exists());
@@ -1210,11 +1215,17 @@ mod tests {
             assert!(!outside.join("abs-dir").exists());
             // 予約名・代替データストリーム・末尾の `.`
             for name in ["NUL", "nul.txt", "main.rs:hidden", "x."] {
-                assert!(create_file(&root, "src", name).is_err(), "{root:?} {name:?}");
+                assert!(
+                    create_file(&root, "src", name).is_err(),
+                    "{root:?} {name:?}"
+                );
             }
         }
         // ふつうの名前は作れる（作業領域のルートは canonicalize したものだけを受け付けるので、`\\?\` の付いた形で試す）
-        assert_eq!(create_file(&ws, "src", "ok.rs"), Ok("src/ok.rs".to_string()));
+        assert_eq!(
+            create_file(&ws, "src", "ok.rs"),
+            Ok("src/ok.rs".to_string())
+        );
     }
 
     #[cfg(windows)]
@@ -1230,7 +1241,10 @@ mod tests {
                 "a.txt:stream".to_string(),
                 "moved.txt.".to_string(),
             ] {
-                assert!(rename_file(&root, "src/a.txt", &name).is_err(), "{root:?} {name:?}");
+                assert!(
+                    rename_file(&root, "src/a.txt", &name).is_err(),
+                    "{root:?} {name:?}"
+                );
             }
             assert!(ws.join("src/a.txt").exists());
             assert!(!ws.join("moved.txt").exists());
@@ -1249,7 +1263,10 @@ mod tests {
             for path in [
                 r"src/..\..\outside\secret.txt".to_string(),
                 r"..\outside\secret.txt".to_string(),
-                format!(r"src/{}", plain(&base.0.join("outside/secret.txt")).display()),
+                format!(
+                    r"src/{}",
+                    plain(&base.0.join("outside/secret.txt")).display()
+                ),
                 format!("{}", plain(&base.0.join("outside/secret.txt")).display()),
             ] {
                 assert!(entry_path(&root, &path).is_err(), "{root:?} {path:?}");

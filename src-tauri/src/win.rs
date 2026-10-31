@@ -93,7 +93,10 @@ pub fn terminate(pid: u32) {
 
 // 終わりに 0 の付いた UTF-16
 fn wide(path: &Path) -> Vec<u16> {
-    OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 // リンクはたどらずに、そのもの自体を開き、ボリュームのシリアル番号とファイルの番号を返す
@@ -163,7 +166,9 @@ const UNIX_EPOCH_IN_FILETIME: u64 = 116_444_736_000_000_000;
 // UNIX 時刻（ミリ秒）を、手元の時刻の（月, 日, 時, 分）にする。変えられなければ None。
 // 限界：手元のタイムゾーンの、今の規則で変える（過去の夏時間の扱いが localtime_r と同じかは未確認）
 pub fn local_month_day_time(ms: u64) -> Option<(u16, u16, u16, u16)> {
-    let ticks = ms.checked_mul(10_000)?.checked_add(UNIX_EPOCH_IN_FILETIME)?;
+    let ticks = ms
+        .checked_mul(10_000)?
+        .checked_add(UNIX_EPOCH_IN_FILETIME)?;
     let file_time = FILETIME {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,
