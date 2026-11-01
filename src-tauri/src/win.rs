@@ -473,15 +473,26 @@ pub fn same_entry(a: &Path, b: &Path) -> bool {
 // 名前の変更で置き換える（fs::rename）。Windows では、同じファイルをほかのスレッド・プロセスが同時に置き換えている・開いていると、
 // 「アクセスが拒否されました」（5）・「共有違反」（32）で失敗する（同時に保存するテストで確認済み）。その間だけ少し待って試し直す
 // （docs/windows-port-plan.md 3.3。待つのは合わせて最大で約 2 秒）
+// 諦めたときのエラーには、試し直した回数とかかった時間を書き足す（段階 2 S10c。同時の保存の失敗の原因を調べる）
 pub fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     const RETRIES: u32 = 100;
     const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+    let started = Instant::now();
     let mut tries = 0;
     loop {
         match std::fs::rename(from, to) {
             Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) && tries < RETRIES => {
                 tries += 1;
                 std::thread::sleep(WAIT);
+            }
+            Err(error) if tries > 0 => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}。{tries} 回試し直した（{} ms）",
+                        started.elapsed().as_millis()
+                    ),
+                ));
             }
             result => return result,
         }

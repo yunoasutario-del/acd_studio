@@ -488,30 +488,36 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.tmp-{}-{serial}", std::process::id()));
-    let result = (|| {
+    // 失敗したら、どの段階か（と OS のエラー）を返す（Windows 移植の段階 2 S10c。同時の保存の失敗の原因を調べる）
+    let result = (|| -> Result<(), (&str, std::io::Error)> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&tmp)?;
+            .open(&tmp)
+            .map_err(|error| ("一時ファイルを作る", error))?;
         // すでにあった一時ファイルの権限も 0600 にそろえる
         #[cfg(unix)]
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| ("一時ファイルの権限", error))?;
+        file.write_all(bytes)
+            .map_err(|error| ("一時ファイルに書く", error))?;
+        file.sync_all()
+            .map_err(|error| ("一時ファイルを確定する", error))?;
         // Windows では、同時に置き換えていると失敗するので、少し待って試し直す（win.rs。Windows 移植の段階 1 C7）
         #[cfg(windows)]
         drop(file);
         #[cfg(windows)]
-        return crate::win::rename_replacing(&tmp, path);
+        return crate::win::rename_replacing(&tmp, path)
+            .map_err(|error| ("名前を変えて置き換える", error));
         #[cfg(unix)]
-        return fs::rename(&tmp, path);
+        return fs::rename(&tmp, path).map_err(|error| ("名前を変えて置き換える", error));
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    result.map_err(|_| "設定を保存できません".to_string())
+    result.map_err(|(step, error)| format!("設定を保存できません（{step}：{error}）"))
 }
 
 // 退避したファイルを、種類ごとに残す数（新しいものから。Phase 10 作業 15。D-173）
