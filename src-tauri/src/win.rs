@@ -473,7 +473,9 @@ pub fn same_entry(a: &Path, b: &Path) -> bool {
 // 名前の変更で置き換える（fs::rename）。Windows では、同じファイルをほかのスレッド・プロセスが同時に置き換えている・開いていると、
 // 「アクセスが拒否されました」（5）・「共有違反」（32）で失敗する（同時に保存するテストで確認済み）。その間だけ少し待って試し直す
 // （docs/windows-port-plan.md 3.3。待つのは合わせて最大で約 2 秒）
-// 諦めたときのエラーには、試し直した回数とかかった時間を書き足す（段階 2 S10c。同時の保存の失敗の原因を調べる）
+// 諦めたときのエラーには、試し直した回数とかかった時間を書き足す（段階 2 S10c。同時の保存の失敗の原因を調べる）。
+// 5・32 の試し直しを使い切って諦めたときは、ほかのプログラムが使っている可能性も案内する（段階 2 S10d。IDE の中の
+// 同時の保存は storage::save_lock で 1 つずつにしているので、残るのは IDE の外のものが開いている場合と考える）
 pub fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     const RETRIES: u32 = 100;
     const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
@@ -486,11 +488,17 @@ pub fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
                 std::thread::sleep(WAIT);
             }
             Err(error) if tries > 0 => {
+                let gave_up = matches!(error.raw_os_error(), Some(5 | 32));
                 return Err(std::io::Error::new(
                     error.kind(),
                     format!(
-                        "{error}。{tries} 回試し直した（{} ms）",
-                        started.elapsed().as_millis()
+                        "{error}。{tries} 回試し直した（{} ms）{}",
+                        started.elapsed().as_millis(),
+                        if gave_up {
+                            "。ほかのプログラム（ウイルス対策など）が使っている可能性があります"
+                        } else {
+                            ""
+                        }
                     ),
                 ));
             }
