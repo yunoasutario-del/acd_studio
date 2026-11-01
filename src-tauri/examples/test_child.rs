@@ -17,6 +17,7 @@
 // - double … 1 行読み、数の 2 倍を書く
 // - echo-lines … EOF まで、読んだ行をそのまま書く
 // - ask:N … 0 から N-1 まで「書いて 1 行読む」を繰り返す
+// - close-stdout … 標準出力を閉じる（相手には EOF が届く。このあとは標準出力に書かない）
 // - sleep:ミリ秒・spin … 待つ／回り続ける
 // - hold:パス … パスのファイルを作って開いたままにする（Windows では、ほかから開けない・消せないように排他で開き、
 //   閉じたら消える指定にする）。終わるまで持つので、テストはそのファイルが消せるか・消えたかで、このプロセスが
@@ -91,6 +92,7 @@ fn main() {
                     read_line(&mut input);
                 }
             }
+            "close-stdout" => close_stdout(),
             "sleep" => std::thread::sleep(Duration::from_millis(number(value))),
             "spin" => loop {
                 std::hint::spin_loop();
@@ -171,6 +173,24 @@ fn write_forever(stream: &mut impl Write) -> ! {
     let chunk = b"y\n".repeat(2048);
     loop {
         write(stream, &chunk);
+    }
+}
+
+// 標準出力を閉じる。std だけで閉じるため、標準出力のハンドル（Unix ではファイル記述子 1）を File として受け取って捨てる
+fn close_stdout() {
+    let _ = std::io::stdout().flush();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        let handle = std::io::stdout().as_raw_handle();
+        // SAFETY: 標準出力のハンドルを 1 回だけ閉じる。このあと標準出力には書かない
+        drop(unsafe { std::fs::File::from_raw_handle(handle) });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        // SAFETY: ファイル記述子 1（標準出力）を 1 回だけ閉じる。このあと標準出力には書かない
+        drop(unsafe { std::fs::File::from_raw_fd(1) });
     }
 }
 

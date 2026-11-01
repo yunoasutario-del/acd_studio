@@ -498,6 +498,8 @@ enum PairEvent {
     Stderr(Side, Vec<u8>),
     // 読み取り（中継または標準エラー）が終わった
     Closed,
+    // その側の標準出力が閉じた（中継が EOF を読んだ）。相手の標準入力を閉じる前に送る（段階 2 S10b）
+    OutputClosed(Side),
     // 直接の子が終わった（回収はしていない）。終わった時刻つき
     Exited(Side, ExitKind, Instant),
 }
@@ -556,9 +558,14 @@ fn spawn_relay(
 ) {
     thread::spawn(move || {
         let mut buffer = vec![0u8; 64 * 1024];
+        // この側の標準出力が閉じた（EOF・読み取りの失敗）か。相手が閉じて中継をやめたときは false
+        let mut output_closed = false;
         loop {
             match source.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    output_closed = true;
+                    break;
+                }
                 Ok(n) => {
                     if events
                         .send(PairEvent::Chunk(side, buffer[..n].to_vec()))
@@ -576,6 +583,11 @@ fn spawn_relay(
                     }
                 }
             }
+        }
+        // 出力が閉じたことを、相手に EOF を伝える前に知らせる。相手がその EOF のせいで終わった知らせより、
+        // 必ず先に届く（先に失敗した側を、原因の順で決めるのに使う。段階 2 S10b）
+        if output_closed {
+            let _ = events.send(PairEvent::OutputClosed(side));
         }
         // 相手の標準入力を閉じて、EOF を伝える
         drop(sink);
@@ -726,6 +738,8 @@ pub fn run_pair(
     let mut killed_at: Option<Instant> = None;
     // 読み取りの数：中継 2 つと標準エラー 2 つ
     let mut open = 4;
+    // 標準出力が閉じた側（閉じた順）
+    let mut output_closed: Vec<Side> = Vec::new();
 
     let kill_both = || {
         for pid in pids {
@@ -755,6 +769,12 @@ pub fn run_pair(
             }
             PairEvent::Closed => {
                 *open -= 1;
+                None
+            }
+            PairEvent::OutputClosed(side) => {
+                if !output_closed.contains(&side) {
+                    output_closed.push(side);
+                }
                 None
             }
             PairEvent::Exited(side, kind, at) => {
@@ -852,6 +872,30 @@ pub fn run_pair(
             }
             Err(_) => break,
         }
+    }
+
+    // 両方が、こちらが止める前に異常に終わったときは、標準出力が先に閉じた側を、先に失敗した側とする（段階 2 S10b）。
+    // 終わりの知らせが届いた順は、2 つの終わりが重なると、原因（片方の終わり）と結果（それで EOF を読んだ相手の終わり）を
+    // 取り違えうる（Windows で、全部のテストと一緒に動かしたときに起きた。Unix も同じ作りで、Unix の動きも変わる）。
+    // 出力が閉じた知らせは、相手の標準入力を閉じる前に送るので、それが原因で相手が終わった知らせより必ず先に届く。
+    // 出力が閉じた知らせが、プロセスの終わりより遅れる場合（孫が標準出力を受け継いで持ち続けるなど）：
+    // - 遅れた側の相手には EOF が届かないので、相手は普通、こちらが猶予のあとに止めるまで終わらない。止めたあとの終わりは
+    //   数えないので、ここでは決め直さず、終わりの知らせが届いた順（上のループで決めたもの）のまま
+    // - 相手がそれでも自分で異常に終わったとき（両方が、こちらが止める前に異常に終わった）は、遅れた側の閉じた知らせは
+    //   回収の前に Job（グループ）ごと止めたあとの読み切りの間に届くので、先に閉じた相手を先とする。終わった順とは逆になり
+    //   うる（相手の失敗は EOF によるものではない）。どちらの側の出力も閉じた知らせがなければ（相手が先に閉じて中継を
+    //   やめたなど）、決め直さない
+    let failed_on_its_own = |side: Side| {
+        exits[side.index()].is_some_and(|(kind, at)| {
+            kind.is_abnormal() && killed_at.is_none_or(|killed| at < killed)
+        })
+    };
+    if first_failure.is_some()
+        && failed_on_its_own(Side::Solution)
+        && failed_on_its_own(Side::Judge)
+        && let Some(&side) = output_closed.first()
+    {
+        first_failure = Some(side);
     }
 
     let [solution_stderr, judge_stderr] = stderr;
@@ -1206,6 +1250,24 @@ mod tests {
         let result = pair("kill -SEGV $$", "read x; exit 1", &limits(5000, 1024));
         assert_eq!(result.first_failure, Some(Side::Solution));
         assert_eq!(result.solution.outcome, Outcome::Signaled(libc::SIGSEGV));
+    }
+
+    #[test]
+    fn blames_the_side_whose_output_closed_first() {
+        // 段階 2 S10b（Unix の動きも変わる）：解答は標準出力を閉じてから 0.2 秒待って 101 で終わり、ジャッジは EOF を
+        // 読んだらすぐ 2 で終わる。終わった順ではジャッジが先、原因の順（出力が閉じた順）では解答が先
+        let result = pair(
+            "exec >&-; sleep 0.2; exit 101",
+            "read q || exit 2",
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        // 逆：ジャッジが先に 1 で終わり（出力も先に閉じる）、解答は EOF を読んで 3 で終わる → ジャッジが先
+        let result = pair("read q || exit 3", "exit 1", &limits(5000, 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(3));
+        assert_eq!(result.first_failure, Some(Side::Judge));
     }
 
     #[test]
@@ -1866,6 +1928,24 @@ mod windows_tests {
         assert_eq!(result.first_failure, None);
         assert_eq!(result.judge.outcome, Outcome::Exited(0));
         assert!(result.elapsed >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn blames_the_side_whose_output_closed_first() {
+        // 取り違えを毎回起こす（段階 2 S10b）：解答は標準出力を閉じてから 200 ms 待って 101 で終わり、ジャッジは EOF を
+        // 読んだらすぐ 2 で終わる。終わった順ではジャッジが先、原因の順（出力が閉じた順）では解答が先
+        let result = pair(
+            &["close-stdout", "sleep:200", "exit:101"],
+            &["read-or-exit:2"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        // 逆：ジャッジが先に 1 で終わり（出力も先に閉じる）、解答は EOF を読んで 3 で終わる → ジャッジが先
+        let result = pair(&["read-or-exit:3"], &["exit:1"], &limits(5000, 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(3));
+        assert_eq!(result.first_failure, Some(Side::Judge));
     }
 
     #[test]
