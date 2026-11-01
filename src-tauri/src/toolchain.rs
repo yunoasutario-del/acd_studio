@@ -307,6 +307,35 @@ fn target_names(json: &str, dir: &Path, wanted: &str) -> Result<Vec<String>, Str
         .collect())
 }
 
+// ビルドしたものの場所（Windows 移植の段階 2 S3b）：`cargo metadata` の target_directory の下の
+// `<debug か release>/<bin>.exe` と、`<debug か release>/examples/<名前>.exe`。止めた直後のビルドの前に、
+// 書けるようになるまで待つのに使う（docs/windows-port-plan.md 4.7）。読めない JSON なら空（待たない）
+#[cfg(windows)]
+pub fn built_executables(
+    json: &str,
+    release: bool,
+    bin: &str,
+    examples: &[String],
+) -> Vec<PathBuf> {
+    #[derive(Deserialize)]
+    struct TargetDirectory {
+        target_directory: PathBuf,
+    }
+    let Ok(metadata) = serde_json::from_str::<TargetDirectory>(json) else {
+        return Vec::new();
+    };
+    let profile = metadata
+        .target_directory
+        .join(if release { "release" } else { "debug" });
+    std::iter::once(profile.join(exe_name(bin)))
+        .chain(
+            examples
+                .iter()
+                .map(|name| profile.join("examples").join(exe_name(name))),
+        )
+        .collect()
+}
+
 // テストケースのフォルダ（D-106）。dir はパッケージのディレクトリ（canonicalize 済み）
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestDir {
@@ -429,6 +458,31 @@ pub fn package_language(dir: &Path) -> Option<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn lists_built_executables_from_metadata() {
+        let json = serde_json::json!({
+            "packages": [],
+            "target_directory": "C:\\work\\abc\\target",
+        })
+        .to_string();
+        let examples = vec!["gen".to_string(), "naive-2".to_string()];
+        assert_eq!(
+            built_executables(&json, false, "abc_a", &examples),
+            vec![
+                PathBuf::from(r"C:\work\abc\target\debug\abc_a.exe"),
+                PathBuf::from(r"C:\work\abc\target\debug\examples\gen.exe"),
+                PathBuf::from(r"C:\work\abc\target\debug\examples\naive-2.exe"),
+            ]
+        );
+        assert_eq!(
+            built_executables(&json, true, "abc_a", &[]),
+            vec![PathBuf::from(r"C:\work\abc\target\release\abc_a.exe")]
+        );
+        // 読めない JSON なら、待つものはない
+        assert!(built_executables("{", false, "abc_a", &examples).is_empty());
+    }
 
     #[test]
     fn resolves_cpp_packages() {

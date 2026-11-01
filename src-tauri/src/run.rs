@@ -597,10 +597,12 @@ pub(crate) fn prepare<T>(
     }
 
     // バイナリの一覧（D-106 のテストのフォルダに使う）と example の一覧（ランダムテストの生成器・愚直解。D-143）
-    let (bins, examples) = match toolchain::metadata_json(&cargo, dir).and_then(|json| {
+    // metadata は、Windows でビルドの前に出力の exe の場所を求めるのにも使う（段階 2 S3b）
+    let metadata = toolchain::metadata_json(&cargo, dir);
+    let (bins, examples) = match metadata.as_ref().map_err(String::clone).and_then(|json| {
         Ok((
-            toolchain::bin_names(&json, dir)?,
-            toolchain::example_names(&json, dir)?,
+            toolchain::bin_names(json, dir)?,
+            toolchain::example_names(json, dir)?,
         ))
     }) {
         Ok(names) => names,
@@ -613,6 +615,15 @@ pub(crate) fn prepare<T>(
     }
 
     let (checked, wanted_examples) = before_build(&bins, &examples)?;
+
+    // Windows：止めた直後の前の実行が出力の exe を使っていれば、書けるようになるまで待つ（段階 2 S3b。4.7）
+    #[cfg(windows)]
+    let locked = metadata.as_deref().ok().and_then(|json| {
+        wait_for_outputs(
+            &toolchain::built_executables(json, release, &target.bin, &wanted_examples),
+            channel,
+        )
+    });
 
     // ビルド（D-089）。時間の上限は設けない（D-096）
     info(channel, "\nビルドしています…\n");
@@ -660,6 +671,8 @@ pub(crate) fn prepare<T>(
                 channel,
                 "ビルドに失敗しました。エラー一覧を見てください。\n",
             );
+            #[cfg(windows)]
+            note_locked(locked.as_deref(), channel);
             return Err(Finish::CompileError);
         }
         // コンパイルエラーではない失敗（ツールチェーンの解決、Cargo.toml の誤りなど）。
@@ -669,6 +682,8 @@ pub(crate) fn prepare<T>(
                 channel,
                 format!("ビルドに失敗しました。\n{TOOLCHAIN_HINT}\n"),
             );
+            #[cfg(windows)]
+            note_locked(locked.as_deref(), channel);
             return Err(Finish::Failed {
                 message: "ビルドに失敗しました（実行ログを見てください）".to_string(),
             });
@@ -747,7 +762,10 @@ fn prepare_cpp<T>(
     info(channel, "\nビルドしています…\n");
     let mut diagnostics = Vec::new();
     let executable = cpp::output_path(dir, release);
-    build_cpp(
+    // Windows：止めた直後の前の実行が出力の exe を使っていれば、書けるようになるまで待つ（段階 2 S3b。4.7）
+    #[cfg(windows)]
+    let locked = wait_for_outputs(&cpp_outputs(&executable, dir, &wanted_examples), channel);
+    let built = build_cpp(
         &compiler,
         dir,
         cpp::build_args(release, &executable, settings),
@@ -755,12 +773,17 @@ fn prepare_cpp<T>(
         &mut diagnostics,
         cancel,
         channel,
-    )?;
+    );
+    #[cfg(windows)]
+    if built.is_err() {
+        note_locked(locked.as_deref(), channel);
+    }
+    built?;
     let mut built_examples = Vec::new();
     for name in wanted_examples {
         let output = cpp::example_output_path(dir, &name);
         let source = format!("examples/{name}.cpp");
-        build_cpp(
+        let built = build_cpp(
             &compiler,
             dir,
             cpp::build_args_for(&source, &output, settings),
@@ -768,7 +791,12 @@ fn prepare_cpp<T>(
             &mut diagnostics,
             cancel,
             channel,
-        )?;
+        );
+        #[cfg(windows)]
+        if built.is_err() {
+            note_locked(locked.as_deref(), channel);
+        }
+        built?;
         built_examples.push((name, Program::native(output)));
     }
     Ok((
@@ -779,6 +807,78 @@ fn prepare_cpp<T>(
         },
         checked,
     ))
+}
+
+// 止めた直後のビルドの前に、出力の exe に書けるようになるまで待つ（Windows 移植の段階 2 S3b。docs/windows-port-plan.md 4.7）。
+// 前の実行が止まったあとも、10〜40 ms ほど exe に書けないことがある（原因は未確認）。待つのは全部で最大 win::WRITABLE_WAIT。
+// 待っても書けない exe があれば、案内を実行ログに出して返す（ビルドは続ける。失敗したら note_locked でもう一度出す）
+#[cfg(windows)]
+fn wait_for_outputs(paths: &[PathBuf], channel: &Channel<RunEvent>) -> Option<String> {
+    let until = Instant::now() + crate::win::WRITABLE_WAIT;
+    let locked: Vec<&Path> = paths
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|path| {
+            !crate::win::wait_until_writable(path, until.saturating_duration_since(Instant::now()))
+        })
+        .collect();
+    let notice = locked_notice(&locked)?;
+    info(channel, format!("{notice}\n"));
+    Some(notice)
+}
+
+// 待っても書けなかった exe の案内（4.7）。なければ None
+#[cfg(windows)]
+fn locked_notice(paths: &[&Path]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    Some(format!(
+        "前の実行が終わっていない可能性があります（{} を書き換えられません）",
+        names.join("・")
+    ))
+}
+
+// ビルドが失敗したとき、待っても書けなかった exe があれば、案内をもう一度出す
+#[cfg(windows)]
+fn note_locked(notice: Option<&str>, channel: &Channel<RunEvent>) {
+    if let Some(notice) = notice {
+        info(channel, format!("{notice}\n"));
+    }
+}
+
+// C++ の出力の exe（main と、要る example）。MinGW の g++ は `-o target/main` で target/main.exe を作るので、
+// `.exe` で終わっていなければ足す（S8 で output_path に `.exe` を付けたら、足さなくてよくなる）
+#[cfg(windows)]
+fn cpp_outputs(executable: &Path, dir: &Path, examples: &[String]) -> Vec<PathBuf> {
+    std::iter::once(executable.to_path_buf())
+        .chain(
+            examples
+                .iter()
+                .map(|name| cpp::example_output_path(dir, name)),
+        )
+        .map(|path| {
+            let is_exe = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+            if is_exe {
+                path
+            } else {
+                let mut name = path.into_os_string();
+                name.push(".exe");
+                PathBuf::from(name)
+            }
+        })
+        .collect()
 }
 
 // Python の準備（Phase 19 作業 1。D-220〜D-222）：処理系と版を示し、ジャッジと同じ版でなければ動かさない。
@@ -2008,6 +2108,45 @@ mod tests {
         assert_eq!(json["kind"], "ran");
         assert_eq!(json["elapsedMs"], 12);
         assert_eq!(json["outputLeftOpen"], false);
+    }
+
+    // 段階 2 S3b：待っても書けなかった exe の案内
+    #[cfg(windows)]
+    #[test]
+    fn tells_which_outputs_are_locked() {
+        assert_eq!(locked_notice(&[]), None);
+        let notice = locked_notice(&[
+            Path::new(r"C:\p\target\debug\abc_a.exe"),
+            Path::new(r"C:\p\target\debug\examples\gen.exe"),
+        ])
+        .unwrap();
+        assert!(
+            notice.contains("前の実行が終わっていない可能性があります"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("abc_a.exe") && notice.contains("gen.exe"),
+            "{notice}"
+        );
+    }
+
+    // 段階 2 S3b：C++ の出力の exe の場所
+    #[cfg(windows)]
+    #[test]
+    fn lists_cpp_outputs_with_exe() {
+        let dir = Path::new(r"C:\p\abc_a");
+        assert_eq!(
+            cpp_outputs(&cpp::output_path(dir, true), dir, &["gen".to_string()]),
+            vec![
+                PathBuf::from(r"C:\p\abc_a\target\main.exe"),
+                PathBuf::from(r"C:\p\abc_a\target\examples\gen.exe"),
+            ]
+        );
+        // すでに .exe で終わっていれば足さない
+        assert_eq!(
+            cpp_outputs(Path::new(r"C:\p\x\main.EXE"), dir, &[]),
+            vec![PathBuf::from(r"C:\p\x\main.EXE")]
+        );
     }
 
     #[test]

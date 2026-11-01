@@ -1579,7 +1579,8 @@ mod windows_tests {
     fn overwrites_the_program_right_after_stopping() {
         // 止めたあと 2 秒のうちに、動いていた exe（子と孫の両方が使う）を上書きできるようになる（4.7。ビルドし直しにあたる）。
         // Job が空になって直接の子の終わりを待ったあとでも、10〜40 ms ほど書けないことがある（4.7 で測った）ので、
-        // 1 回目で書けることまでは求めない。孫が残っていれば 30 秒書けないので、子孫を止めたことは確かめられる
+        // 止めてすぐの 1 回目は求めず、win::wait_until_writable で待ってから 1 回で書けることを見る。孫が残っていれば
+        // 30 秒書けないので、子孫を止めたことは確かめられる
         let dir = TempDir(
             std::env::temp_dir().join(format!("atcoder-studio-overwrite-{}", std::process::id())),
         );
@@ -1598,20 +1599,20 @@ mod windows_tests {
             "止める前に孫が生きているのを確かめられない"
         );
         assert_eq!(result.outcome, Outcome::Stopped);
+        // IDE がビルドの前に行うのと同じく、書けるようになるまで待ってから（段階 2 S3b）、1 回で書けることを確かめる
         let stopped = Instant::now();
-        let written = loop {
-            let written = std::fs::write(&program, b"replaced");
-            if written.is_ok() || stopped.elapsed() > Duration::from_secs(2) {
-                break written;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
+        let writable = crate::win::wait_until_writable(&program, crate::win::WRITABLE_WAIT);
         // かかった時間を記録する（cargo test -- --show-output で見える）
         eprintln!("止めてから書けるまで {} ms", stopped.elapsed().as_millis());
         assert!(
-            written.is_ok(),
-            "止めてから {} ms たっても書けない：{written:?}",
+            writable,
+            "止めてから {} ms たっても書けない",
             stopped.elapsed().as_millis()
+        );
+        let written = std::fs::write(&program, b"replaced");
+        assert!(
+            written.is_ok(),
+            "待ったあとの 1 回目で書けない：{written:?}"
         );
     }
 

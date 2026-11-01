@@ -333,6 +333,37 @@ pub(crate) fn close_job_without_terminating(pid: u32) {
     drop(entry);
 }
 
+// ---- 書けるようになるまで待つ（段階 2 S3b。docs/windows-port-plan.md 4.7） ----
+//
+// 止めた直後の前の実行の exe は、Job が空になり、直接の子の終わりを待ったあとでも、10〜40 ms ほど書けないことがある
+// （原因は未確認）。ビルドの前に、書き込みで開けるようになるまで待つ。開いてすぐ閉じるだけで、作らない・切り詰めない・
+// 書かないので、中身も更新日時も変わらない
+
+// ビルドの前に待つ時間の上限（全部の exe で合わせて）
+pub const WRITABLE_WAIT: Duration = Duration::from_secs(2);
+// 試し直す間隔
+const WRITABLE_POLL: Duration = Duration::from_millis(10);
+
+// path を書き込みで開けるようになるまで、最大 limit 待つ（少なくとも 1 回は試す）。
+// 開けた・ない・共有違反とアクセス拒否のほかのエラー（あとのビルドに任せる）なら true。
+// limit を過ぎても共有違反（32）かアクセス拒否（5）なら false
+pub fn wait_until_writable(path: &Path, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(_) => return true,
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(left.min(WRITABLE_POLL));
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
 // ---- ファイル ----
 
 // 終わりに 0 の付いた UTF-16
@@ -474,6 +505,91 @@ mod tests {
         std::fs::hard_link(dir.join("a.txt"), dir.join("hard.txt")).unwrap();
         assert!(same_entry(&dir.join("a.txt"), &dir.join("hard.txt")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // テスト用のフォルダ。捨てるときに消す
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!(
+                "atcoder-studio-writable-{}-{name}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn does_not_wait_for_a_missing_file() {
+        let dir = TempDir::new("missing");
+        let started = Instant::now();
+        assert!(wait_until_writable(
+            &dir.0.join("none.exe"),
+            Duration::from_secs(2)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn waits_while_another_handle_denies_writing() {
+        // 共有を許さずに開いている間は書けない。limit まで待って false。閉じればすぐ true
+        let dir = TempDir::new("held");
+        let path = dir.0.join("main.exe");
+        std::fs::write(&path, b"exe").unwrap();
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap()
+        };
+        let started = Instant::now();
+        let writable = wait_until_writable(&path, Duration::from_millis(300));
+        let waited = started.elapsed();
+        drop(held);
+        assert!(!writable, "開いている間に書けることになった");
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        let started = Instant::now();
+        assert!(wait_until_writable(&path, Duration::from_secs(2)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(std::fs::read(&path).unwrap(), b"exe");
+    }
+
+    #[test]
+    fn waits_while_the_program_runs_without_changing_it() {
+        // 動いている exe には書けない。止めれば 2 秒のうちに書けるようになる。確かめても中身と更新日時は変わらない
+        let dir = TempDir::new("running");
+        let path = dir.0.join("victim.exe");
+        std::fs::copy(crate::process::test_child_path(), &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut child = std::process::Command::new(&path)
+            .arg("sleep:30000")
+            .spawn()
+            .unwrap();
+        let while_running = wait_until_writable(&path, Duration::from_millis(300));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let started = Instant::now();
+        let after_stop = wait_until_writable(&path, WRITABLE_WAIT);
+        let waited = started.elapsed();
+        assert!(!while_running, "動いている間に書けることになった");
+        assert!(after_stop, "止めてから {waited:?} たっても書けない");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
     }
 
     #[test]
