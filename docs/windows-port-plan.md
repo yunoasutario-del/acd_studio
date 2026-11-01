@@ -156,7 +156,7 @@ session.rs の Keychain を使うテスト、storage.rs の 0o600・0o700 の検
 | storage.rs:13・441・466・469・820 | アプリのフォルダを 0o700、ファイルを 0o600 で作る | Windows では cfg で外す（`%APPDATA%` は利用者だけの ACL。推測）。必要なら ACL を明示する | 箇所：確認済み／代替案：未確認 |
 | storage.rs:814–828 | 単一起動のロック（`File::try_lock`） | Windows でも LockFileEx で動く（推測。2 つ起動して確かめる） | 箇所：確認済み／代替案：未確認 |
 | storage.rs:448–473 | 一時ファイルに書いて rename で置き換える | Windows の rename は置き換えに対応（MoveFileExW）。相手のファイルをほかのプロセス（エディタ・Defender）が開いていると失敗しうる（推測）→ 失敗したら少し待って再試行 | 箇所：確認済み／代替案：未確認 |
-| src/panels/logLinks.ts:11–13 | `src/main.rs:5:10` の形だけを場所として読む（`\` を含まない） | Windows の rustc の診断のパスは `examples\gen.rs` のように `\` 区切り（random.rs のテストで確認済み。段階 1 C7）→ `\` も区切りとして受け付ける。今のままだと `main.rs:5:10` だけに一致して、別のファイルへ移動しうる | 箇所：確認済み／代替案：未確認 |
+| src/panels/logLinks.ts:11–13 | `src/main.rs:5:10` の形だけを場所として読む（`\` を含まない） | Windows の rustc の診断のパスは `examples\gen.rs` のように `\` 区切り（random.rs のテストで確認済み。段階 1 C7）→ `\` も区切りとして受け付ける。今のままだと `main.rs:5:10` だけに一致して、別のファイルへ移動しうる。エラー一覧に出す診断の file は、段階 2 S10a で `/` に直した（実行ログの本文は `\` のままなので、logLinks.ts は S10 で直す） | 箇所：確認済み／診断の file：確認済み（S10a）／logLinks.ts：未確認 |
 | run.rs:1457–1466、workspace.rs:310–320 | 相対パスを `/` でつなぐ | Windows でも components を `/` でつないでいるので、そのままでよい（推測） | 箇所：確認済み／代替案：未確認 |
 
 ### 3.4 画面・メニュー・設定
@@ -493,7 +493,7 @@ Windows で飛ばしているテスト（`#[cfg_attr(windows, ignore = "…")]`�
 
 | 段階 | 件数 | テスト | 理由 |
 | --- | --- | --- | --- |
-| 2 | 3 | interactive::tests_interactively_with_real_programs、random::finds_differences_with_real_programs、scaffold::cargo_reads_created_packages_under_a_parent_workspace | 使用メモリを測らない（段階 2 S4 で測るようにしたあとも、rustc の診断のパスで落ちるので、S10a に回した）／rustc の診断のパスが `\` 区切り（S10a）／cargo の出力のパスと canonicalize の `\\?\` の違い（S10） |
+| 2 | 3 | interactive::tests_interactively_with_real_programs、random::finds_differences_with_real_programs、scaffold::cargo_reads_created_packages_under_a_parent_workspace | 使用メモリを測らない（段階 2 S4 で測るようにしたあとも、rustc の診断のパスで落ちるので、S10a に回した）／rustc の診断のパスが `\` 区切り（S10a）／cargo の出力のパスと canonicalize の `\\?\` の違い（S10）。random は段階 2 S10a で ignore を外した。interactive は、S10a で診断のパスは直ったが、先に失敗した側の取り違えが見つかったので、S10b に回した |
 | 3・5 | 13 | session の 4 件、problem::reads_with_the_session_only_after_a_404_when_logged_in、submit の 8 件 | /usr/bin/security（Keychain）と /usr/bin/curl |
 | 4 | 4 | sources の 3 件、lsp::overrides_initialize_and_answers_configuration | file: の URI・`\\?\`・パスの区切り |
 | 6 | 5 | debug の 5 件 | lldb-dap（デバッグは今回の移植に含めない） |
@@ -612,7 +612,8 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 | S3 | Job Object（9.1 の 1・追加 4・追加 9・追加 10） | win.rs の中身を差し替える。`process_group(0)` の代わりの仕組みで CREATE_SUSPENDED（と CREATE_NO_WINDOW）を付け、spawn の直後に `#[cfg(windows)]` の 1 行で Job に入れる（KILL_ON_JOB_CLOSE）。主スレッドは Toolhelp32 で探して再開する。spawn の直後の 1 行を足すのは process.rs の 3 か所・lsp.rs・debug.rs。kill_group は TerminateJobObject（終了コードは追加 10 の値）のあと、Job の動いているプロセスが 0 になるまで待つ（4.7）。Job に入れていない pid を kill_group・reap に渡したら debug_assert で知らせる。process.rs の関数の形は変えない。test_child の孫は `grandchild:印のファイル` で、印を排他で開いたまま最大 30 秒生きる（テストは pid ではなく印で、孫が生きている・終わったを見る） | 先にテストを書いて失敗を確かめる：時間の上限・止める操作で孫も止まる／子が自然に終わったあとで孫が残らない／Job を閉じると子が消える／止めたあと 2 秒のうちに exe を上書きできる（1 回目で書けるとは限らない。4.7）／Job に入れられなかったら子を止めてエラーにする |
 | S3b | 止めたあとのビルドの前に待つ（4.7・9.1 の追加 15） | win::wait_until_writable：書き込みで開けるようになるまで待つ（開いてすぐ閉じる。中身を変えない。exe がなければ待たない）。run.rs の Rust・C++ のビルドの前に、Windows だけで、Rust・C++・example の出力の exe を全部で最大 2 秒待つ。開けなければ実行ログに「前の実行が終わっていない可能性があります」を出してビルドは続け、失敗したらもう一度出す。Rust の exe の場所は toolchain::built_executables（`cargo metadata` の target_directory）、C++ は cpp::output_path に `.exe` を足す。Windows だけで使う関数には `#[cfg(windows)]` を付ける。process.rs の上書きのテストは、待ってから 1 回で書く形にする | 先にテストを書いて失敗を確かめる：開いている・動いている exe で待って false、閉じる・止めると true、中身と更新日時が変わらない、場所の求め方、案内の文。上書きのテストを process::windows_tests ごと 20 回。画面で、止める→すぐビルドと、exe を開いたままビルドして案内が出ること |
 | S4 | メモリ（9.1 の追加 16） | current_rss は WorkingSetSize、最大使用メモリは終わったあとの PeakWorkingSetSize（直接の子だけ。Unix と同じ）。どちらも、Job に入れるときに作ったプロセスのハンドルの写しで読む（pid で開き直さない）。test_child の `alloc:` が全部のページに書くようにする（最後のバイトにも書く）。interactive::tests_interactively_with_real_programs は ignore を外して動かし、1〜9 の確かめ（6 の MLE・OLE を含む）は通ったが、最後の 10 で rustc の診断のパスの `\` で落ちたので、ignore の理由を S10a に書き換えて残す | 先にテスト（実行中に上限で止まる・最大使用メモリが出る・対話の解答の最大使用メモリ・run.rs の memory_kib）を書いて失敗を確かめる。process::windows_tests を 20 回くり返す |
-| S10a | rustc の診断のパスの区切り（S4 のすぐあと。S5 の前） | Windows だけ：rustc の診断の file の `\` を `/` に直す（Unix では `\` もファイル名に使えるので直さない）。interactive::tests_interactively_with_real_programs・random::finds_differences_with_real_programs の ignore を外す | 先にテストを書いて失敗を確かめる。外したテストが通る |
+| S10a | rustc の診断のパスの区切り（S4 のすぐあと。S5 の前） | Windows だけ：run.rs の parse_build_output で、rustc の診断の file の `\` を `/` に直す（Unix では `\` もファイル名に使えるので直さない）。`\\?\` の付いたパスは、そのまま直すと `//?/C:/…` になるので、`\\?\` を外してから直す（`\\?\UNC\server\share\…` は `\\server\share\…` にしてから `//server/share/…`）。実行ログの診断の本文（rendered）は `\` のまま（S10 の logLinks.ts で扱う）。random::finds_differences_with_real_programs の ignore を外す。interactive::tests_interactively_with_real_programs は、診断のパスは直り 4 件だけでは通るが、全部のテストと一緒のとき 6 回中 1 回、解答の panic が WA になったので、ignore の理由を S10b に書き換えて残す | 先にテストを書いて失敗を確かめる（Windows：`\`・絶対パス・`\\?\`・`\\?\UNC\` の例。Unix：`\` がそのまま残る）。外したテストが通る |
+| S10b | 対話テストの、先に失敗した側の取り違え（S10a のすぐあと） | run_pair は、先に失敗した側を、終わりの知らせが IDE に届いた順で決めていた。両方が異常に終わったとき、2 つの終わりが数ミリ秒の間に重なると、原因（解答）と結果（ジャッジ）を取り違えうる（Windows で全部のテストと一緒に動かしたときに起きた。Unix にも同じ作りがある）。中継のスレッドが EOF を読んだら、相手の標準入力を閉じる前に「この側の出力が閉じた」と知らせ、両方が異常に終わったときは、出力が先に閉じた側を先に失敗した側とする。OS で分けない（**Unix の動きも変わる**）。interactive::tests_interactively_with_real_programs の ignore を外す | test_child で取り違えを毎回起こす：解答は標準出力を閉じてから 200 ms 待って 101 で終わり、ジャッジは EOF を読んだらすぐ異常に終わる（終わった順ではジャッジが先、原因の順では解答が先）。今の実装で毎回失敗することを確かめてから直す |
 | S5 | RE の表示（追加 10） | NTSTATUS の名前（0xC0000005・0xC00000FD・0xC0000094・0xC0000409・0xC0000135 など）と 16 進の表示、IDE が止めたときの値の表示。runLog.ts・TestResults.tsx・interactive.rs・random.rs。Unix の終了コードは 0〜255 で重ならないので OS では分けない（共通のコードの文字が変わるので報告に書く） | 子のプログラムで実際に落として、どの終了コードになるかを確かめる（どの値になるかは未確認） |
 | S6 | 改行（9.1 の 6 の a・b） | Windows だけ：exact の比較の前に CRLF を LF に直す／実際の出力を期待出力として保存するときに LF に直す | 先にテスト（CRLF の出力で exact が WA になる、保存した .out に CR が残る）を書いて失敗を確かめる |
 | S7 | Python（9.1 の 7・追加 11） | 探し方：settings → PEP 514 のレジストリ（HKCU → HKLM の 3.13 の ExecutablePath）→ PATH の python.exe（WindowsApps のエイリアスを除き、版を確かめる）。PyPy は settings → PATH（pypy3.11.exe・pypy3.exe）。Windows だけ `-X utf8` を付ける（実行・構文の検査・import の読み取り・ライブラリの場所の読み取り）。案内文を Windows 向けに。random の Python のテスト（finds_differences_with_python_programs）の Windows 版 | 単体テスト。この機械の CPython がレジストリから見つかる。PyPy を画面で試すには settings.json の python.pypy の指定が要る（リポジトリの外なので、変える前に聞く） |
@@ -621,7 +622,7 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 | S10 | パスの表記 | rustc の診断の file は S10a で済ませる。logLinks.ts は Windows だけ `\` も区切りとして読む。scaffold のテストは canonicalize したもの同士で比べる（本番のコードは両側を canonicalize して比べているので、テストだけの問題）。scaffold::cargo_reads_created_packages_under_a_parent_workspace の ignore を外す | 外したテストが通る。logLinks のテスト |
 | S11 | 問題の取得 | problem.rs の `/usr/bin/curl` を、Windows では `%SystemRoot%\System32\curl.exe` にする（PATH は探さない） | problem.rs のテスト。画面で問題ページ・問題の一覧を取る |
 | S12 | Defender の注意（9.1 の 8・追加 13） | Windows だけ：ビルドの直後の 1 ケース目が TLE のとき、実行ログに 1 行の注意を出す | 単体テスト |
-| S13 | まとめ | この文書に段階 2 の結果 | 全体の cargo test・cargo clippy --all-targets・npm run build |
+| S13 | まとめ | この文書に段階 2 の結果。後片付け：judges_cases_with_a_real_program の一時フォルダ、%TEMP% に前から残っている atcoder-studio-* のフォルダ | 全体の cargo test・cargo clippy --all-targets・npm run build |
 
 段階 2 で利用者が手で確かめること（各コミットのあとに手順を書いて頼む）
 - Rust・C++・CPython・PyPy のそれぞれで、AC・WA・RE（0 除算・範囲外・panic・アクセス違反）・TLE（無限ループ）・MLE（大きな配列）になる解答の判定と、時間・メモリ・RE の名前の表示
@@ -764,7 +765,8 @@ S3 の画面の確かめ（2026-11-01。利用者が Windows 11 で確かめた�
 | 追加 14（2026-10-31） | 子のプログラムを使う新しいテストは Windows だけで動かす。Unix の sh のテストはそのまま | 段階 2（S2〜S4） |
 | 追加 15（2026-11-01） | 止めた直後のビルドの前に、出力の exe が書けるようになるまで最大 2 秒待つ。待っても書けなければ、案内を出してビルドは続ける（ビルドせずに失敗にはしない）。S3 には入れず、すぐあとの S3b にする | 段階 2（S3b） |
 | 追加 16（2026-11-01） | 使用メモリは WorkingSet（触ったページ）で測り、直接の子だけを数える（Unix と同じ）。最大は終わったあとの PeakWorkingSetSize を、起動したときのハンドルの写しで読む（pid で開き直さない）。読めなければ実行中に見た最大で代わりにする案だったが、読めたので使わない | 段階 2（S4） |
-| 追加 17（2026-11-01） | rustc の診断のパスの `\` を `/` に直す部分だけを、S4 のすぐあと・S5 の前の S10a にする。直すのは Windows だけ。interactive と random のテストの ignore を S10a で外す。logLinks.ts と scaffold のテストは S10 に残す | 段階 2（S10a） |
+| 追加 17（2026-11-01） | rustc の診断のパスの `\` を `/` に直す部分だけを、S4 のすぐあと・S5 の前の S10a にする。直すのは Windows だけ。`\\?\` の付いたパスは、外してから直す。random のテストの ignore を S10a で外す。logLinks.ts と scaffold のテストは S10 に残す | 段階 2（S10a） |
+| 追加 18（2026-11-01） | 対話テストの、先に失敗した側の取り違えは、原因と結果の順（出力が先に閉じた側）で決める形に直す。両方の OS にある判定の不具合なので、OS で決め方を分けない（Unix の動きも変わる）。S10a とは別の S10b にし、interactive のテストの ignore は S10b で外す | 段階 2（S10b） |
 
 ---
 

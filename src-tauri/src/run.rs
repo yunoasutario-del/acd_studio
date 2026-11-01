@@ -426,7 +426,21 @@ pub(crate) fn find_executable(stdout: &str, name: &str, kind: &str) -> Option<Pa
     })
 }
 
-// cargo build の標準出力（1 行に 1 つの JSON）から、診断と実行ファイルの場所を取り出す
+// Windows：rustc の診断の場所の区切り `\` を `/` に直す（段階 2 S10a。Unix では `\` もファイル名に使えるので直さない）。
+// `\\?\` の付いたパスは、そのまま直すと `//?/C:/…` という読めない形になるので、`\\?\` を外してから直す
+// （`\\?\UNC\server\share\…` は `\\server\share\…` にしてから）
+#[cfg(windows)]
+fn slash_separated(file: &str) -> String {
+    let plain = if let Some(rest) = file.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        file.strip_prefix(r"\\?\").unwrap_or(file).to_string()
+    };
+    plain.replace('\\', "/")
+}
+
+// cargo build の標準出力（1 行に 1 つの JSON）から、診断と実行ファイルの場所を取り出す。
+// Windows では、診断の場所の区切りを `/` にする（slash_separated）
 fn parse_build_output(stdout: &str, bin: &str) -> (Vec<Diagnostic>, Option<PathBuf>) {
     let mut diagnostics = Vec::new();
     let mut executable = None;
@@ -459,6 +473,12 @@ fn parse_build_output(stdout: &str, bin: &str) -> (Vec<Diagnostic>, Option<PathB
                 }
             }
             _ => {}
+        }
+    }
+    #[cfg(windows)]
+    for item in &mut diagnostics {
+        if let Some(file) = &mut item.file {
+            *file = slash_separated(file);
         }
     }
     (diagnostics, executable)
@@ -1719,6 +1739,68 @@ mod tests {
         assert_eq!(executable, Some(PathBuf::from("/x/target/release/a")));
         // ほかのバイナリの実行ファイルは使わない
         assert_eq!(parse_build_output(&stdout, "b").1, None);
+    }
+
+    // cargo の JSON の、診断が 1 つの行（場所は file_name）
+    fn diagnostic_line(file_name: &str) -> String {
+        serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "mismatched types",
+                "rendered": "error[E0308]: mismatched types\n",
+                "spans": [{ "file_name": file_name, "line_start": 1, "is_primary": true }],
+            },
+        })
+        .to_string()
+    }
+
+    fn diagnostic_files(file_names: &[&str]) -> Vec<Option<String>> {
+        let stdout: Vec<String> = file_names
+            .iter()
+            .map(|name| diagnostic_line(name))
+            .collect();
+        parse_build_output(&stdout.join("\n"), "a")
+            .0
+            .into_iter()
+            .map(|item| item.file)
+            .collect()
+    }
+
+    // Windows（段階 2 S10a）：rustc の診断の場所の `\` を `/` に直す。`\\?\` の付いたパスは、外してから直す
+    // （そのまま直すと `//?/C:/…` という読めない形になる）
+    #[cfg(windows)]
+    #[test]
+    fn writes_diagnostic_files_with_slashes_on_windows() {
+        assert_eq!(
+            diagnostic_files(&[
+                r"examples\gen.rs",
+                "src/main.rs",
+                r"C:\p\src\main.rs",
+                r"\\?\C:\p\src\main.rs",
+                r"\\?\UNC\server\share\p\src\main.rs",
+            ]),
+            vec![
+                Some("examples/gen.rs".to_string()),
+                Some("src/main.rs".to_string()),
+                Some("C:/p/src/main.rs".to_string()),
+                Some("C:/p/src/main.rs".to_string()),
+                Some("//server/share/p/src/main.rs".to_string()),
+            ]
+        );
+    }
+
+    // Unix：`\` もファイル名に使えるので、診断の場所はそのまま（段階 2 S10a で Unix の動きを変えていないことを見る）
+    #[cfg(unix)]
+    #[test]
+    fn keeps_backslashes_in_diagnostic_files_on_unix() {
+        assert_eq!(
+            diagnostic_files(&[r"examples\gen.rs", r"\\?\C:\p\src\main.rs"]),
+            vec![
+                Some(r"examples\gen.rs".to_string()),
+                Some(r"\\?\C:\p\src\main.rs".to_string()),
+            ]
+        );
     }
 
     #[test]

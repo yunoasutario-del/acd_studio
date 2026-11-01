@@ -861,12 +861,12 @@ fn main() {
     }
 
     // ビルドから判定・停止まで、実際のプログラムで確かめる。cargo が要る
-    // Windows：段階 2 S4 で ignore を外して動かし、1〜9 の確かめ（6 の MLE・OLE を含む）は通った。最後の 10 で、
-    // 診断の file が `examples\judge.rs` になって落ちる
+    // Windows：段階 2 S10a で診断のパスは直り、4 件だけで動かすと通る。全部のテストと一緒に動かしたとき 6 回中 1 回、
+    // 4（解答の panic）が RE ではなく WA になった（先に失敗した側を、終わりの知らせが届いた順で決めているため）
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "Windows：段階 2 S10a（rustc の診断のパスの区切りが \\ になる）で直す。docs/windows-port-plan.md 7 章"
+        ignore = "Windows：段階 2 S10b（対話テストの、先に失敗した側の取り違え）で直す。docs/windows-port-plan.md 7 章"
     )]
     fn tests_interactively_with_real_programs() {
         let ws = workspace("e2e");
