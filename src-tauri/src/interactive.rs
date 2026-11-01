@@ -861,10 +861,12 @@ fn main() {
     }
 
     // ビルドから判定・停止まで、実際のプログラムで確かめる。cargo が要る
+    // Windows：段階 2 S4 で ignore を外して動かし、1〜9 の確かめ（6 の MLE・OLE を含む）は通った。最後の 10 で、
+    // 診断の file が `examples\judge.rs` になって落ちる
     #[test]
     #[cfg_attr(
         windows,
-        ignore = "Windows：段階 2（使用メモリの計測。Job Object）で直す。docs/windows-port-plan.md 7 章"
+        ignore = "Windows：段階 2 S10a（rustc の診断のパスの区切りが \\ になる）で直す。docs/windows-port-plan.md 7 章"
     )]
     fn tests_interactively_with_real_programs() {
         let ws = workspace("e2e");

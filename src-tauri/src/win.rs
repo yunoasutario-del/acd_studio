@@ -2,11 +2,10 @@
 //
 // - プロセス：pid でプロセスを開き、終わるのを待つ・終わったかを確かめる・止める。標準ライブラリの Child がハンドルを
 //   持っている間は、pid は別のプロセスに再利用されない（推測。未確認）
-// - Job：子を Job に入れ、止めるときは子孫ごと止める（段階 2 S3。下の「Job」の節）
-// - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる
+// - Job：子を Job に入れ、止めるときは子孫ごと止める（段階 2 S3。下の「Job」の節）。使用メモリを読む（S4）
+// - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる。
+//   止めた直後のビルドの前に、exe が書けるようになるまで待つ（S3b）
 // - 時刻：UNIX 時刻（ミリ秒）を手元の時刻の月・日・時・分にする（Unix の localtime_r にあたる）
-//
-// 限界：使用メモリは測らない（段階 2 S4）
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -18,7 +17,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, SYSTEMTIME,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
@@ -34,10 +34,12 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenProcess, OpenThread, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread,
-    THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess, OpenThread,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, PROCESS_VM_READ, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
@@ -113,17 +115,20 @@ pub fn terminate(pid: u32) {
 // （止めた直後に exe を上書きできるように。4.7）。Unix の作り（回収する前に必ずグループを止める）と同じく、kill_job は
 // 子を回収する前に必ず呼ばれる（run・run_pair・lsp の stop・debug の shutdown）。子が自然に終わっていても、残った孫は
 // ここで止まる。2 回目からは何もしない。覚えた pid は release_job（process.rs の reap）で忘れる。lsp・debug は reap を
-// 通らないので、閉じた印だけが残る（同じ pid が再利用されたら上書きする）
+// 通らないので、閉じた印だけが残る（同じ pid が再利用されたら上書きする）。
+// 記録には、起動したときのプロセスのハンドルの写しも持ち、使用メモリ（今の WorkingSet と、終わったあとの最大）はそれで読む
+// （pid で開き直すと、pid が使い回されたときに別のプロセスを読むおそれがあるため。段階 2 S4）
 
 // IDE が止めたときの終了コード（9.1 の追加 10）。上位の E は「エラー」と「利用者が定める値」の印で、NTSTATUS と重ならない
 pub const KILLED_EXIT_CODE: u32 = 0xE0AC_0001;
 // 止めたあと、Job の中のプロセスがすべて終わるのを待つ時間の上限
 const JOB_EMPTY_WAIT: Duration = Duration::from_secs(5);
 
-enum Job {
-    Open(Handle),
-    // kill_job で止めて閉じた
-    Closed,
+struct Job {
+    // Job のハンドル。kill_job で止めて閉じたら None
+    job: Option<Handle>,
+    // 起動したときのプロセスのハンドルの写し（使用メモリを読む）
+    process: Handle,
 }
 
 // SAFETY: ハンドルはプロセスの中のどのスレッドからでも使え、閉じられる
@@ -170,12 +175,60 @@ pub(crate) fn start_in_job_with(
         // job はこのあと（子を止めたあと）閉じる
         return stop(message);
     }
-    jobs().insert(child.id(), Job::Open(job));
+    let copy = match duplicate_process(process) {
+        Ok(copy) => copy,
+        Err(message) => return stop(message),
+    };
+    jobs().insert(
+        child.id(),
+        Job {
+            job: Some(job),
+            process: copy,
+        },
+    );
     Ok(())
 }
 
 fn last_error(what: &str) -> String {
     format!("{what}（{}）", std::io::Error::last_os_error())
+}
+
+// Child が持つプロセスのハンドルの写しを作る（使用メモリを読む権限だけ）。Child のハンドルとは別に閉じる
+fn duplicate_process(process: HANDLE) -> Result<Handle, String> {
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: 自分のプロセスの中で、Child が持つ開いているハンドルの写しを作る。書き込み先を渡す
+    let copied = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            process,
+            GetCurrentProcess(),
+            &mut copy,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            0,
+            0,
+        )
+    };
+    if copied == 0 {
+        return Err(last_error("プロセスのハンドルを写せません"));
+    }
+    Ok(Handle(copy))
+}
+
+// プロセスの使用メモリの数（PROCESS_MEMORY_COUNTERS）。読めなければ None
+fn memory_counters(process: &Handle) -> Option<PROCESS_MEMORY_COUNTERS> {
+    // SAFETY: PROCESS_MEMORY_COUNTERS はゼロで初期化してよい C の構造体。cb に大きさを入れてから渡す
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: 開いているプロセスのハンドルと、書き込み先とその大きさを渡す
+    (unsafe { K32GetProcessMemoryInfo(process.0, &mut counters, counters.cb) } != 0)
+        .then_some(counters)
+}
+
+// 動いている子の今の使用メモリ（WorkingSetSize。バイト）。起動したときのハンドルの写しで読む（段階 2 S4）。
+// Job に入れていない・読めないなら None
+pub fn working_set(pid: u32) -> Option<u64> {
+    let jobs = jobs();
+    memory_counters(&jobs.get(&pid)?.process).map(|counters| counters.WorkingSetSize as u64)
 }
 
 // KILL_ON_JOB_CLOSE を付けた Job を作る
@@ -271,9 +324,9 @@ pub fn kill_job(pid: u32) {
     let job = {
         let mut jobs = jobs();
         match jobs.get_mut(&pid) {
-            Some(entry) => match std::mem::replace(entry, Job::Closed) {
-                Job::Open(job) => job,
-                Job::Closed => return,
+            Some(entry) => match entry.job.take() {
+                Some(job) => job,
+                None => return,
             },
             None => {
                 drop(jobs);
@@ -316,14 +369,16 @@ fn wait_until_empty(job: &Handle) {
     }
 }
 
-// 回収した子の pid を忘れる。kill_job を呼ばずに回収した（作りの誤り）なら、debug では止め、release では Job を閉じる
-// （KILL_ON_JOB_CLOSE で残りが止まる）
-pub fn release_job(pid: u32) {
+// 回収した子の記録を忘れ、最大使用メモリ（PeakWorkingSetSize。バイト）を返す。終わったあとに、起動したときのハンドルの
+// 写しで読む（段階 2 S4）。読めなければ None。kill_job を呼ばずに回収した（作りの誤り）なら、debug では止め、release では
+// Job を閉じる（KILL_ON_JOB_CLOSE で残りが止まる）
+pub fn release_job(pid: u32) -> Option<u64> {
     let entry = jobs().remove(&pid);
     debug_assert!(
-        matches!(entry, Some(Job::Closed)),
+        entry.as_ref().is_some_and(|entry| entry.job.is_none()),
         "kill_job を呼ばずに回収した、または Job に入れていないプロセス（pid {pid}）"
     );
+    memory_counters(&entry?.process).map(|counters| counters.PeakWorkingSetSize as u64)
 }
 
 // テスト用：止めずに Job のハンドルを閉じる（IDE が異常に終わったときにあたる）

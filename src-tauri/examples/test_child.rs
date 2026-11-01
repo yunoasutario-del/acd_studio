@@ -120,9 +120,13 @@ fn main() {
             }
             "alloc" => {
                 let mut block = vec![0u8; number::<usize>(value) * MIB];
-                // 確保しただけではページが割り当てられないので、ページごとに書き込む
+                // 確保しただけではページが割り当てられない（WorkingSet・RSS に入らない）ので、ページごとに書き込む。
+                // 先頭がページの区切りからずれていると、4096 バイトおきでは最後のページに届かないことがあるので、最後のバイトにも書く
                 for i in (0..block.len()).step_by(4096) {
                     block[i] = 1;
+                }
+                if let Some(last) = block.last_mut() {
+                    *last = 1;
                 }
                 kept.push(std::hint::black_box(block));
             }

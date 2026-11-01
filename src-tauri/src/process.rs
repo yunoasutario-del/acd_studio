@@ -16,7 +16,7 @@
 // Windows（移植の段階 1 C3・段階 2 S3。docs/windows-port-plan.md 7 章）：Unix の関数と同じ名前・同じ形の関数を
 // `#[cfg(windows)]` で置き、中身は win.rs に任せる。プロセスグループの代わりに Job Object を使う：process_group(0) で
 // CREATE_SUSPENDED を付けて起動し、spawn の直後に win::start_in_job で Job に入れてから動かす。kill_group は Job の中を
-// すべて止める（TerminateJobObject）。限界：使用メモリは測らない（段階 2 S4）。Unix の経路のコードは変えない
+// すべて止める（TerminateJobObject）。使用メモリは WorkingSet で測る（段階 2 S4）。Unix の経路のコードは変えない
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -134,10 +134,11 @@ fn current_rss(pid: libc::pid_t) -> Option<u64> {
     (result == 0).then_some(info.ri_resident_size)
 }
 
-// Windows：段階 1 では測らない（メモリの上限で止めない。段階 2）
+// Windows：今の WorkingSetSize（実際に使っているページ。Unix の RSS にあたる）。起動したときのハンドルの写しで読む
+// （win::working_set。段階 2 S4）。Windows の WorkingSet には共有の DLL のページも入るので、macOS より大きく出る（推測）
 #[cfg(windows)]
-fn current_rss(_pid: Pid) -> Option<u64> {
-    None
+fn current_rss(pid: Pid) -> Option<u64> {
+    crate::win::working_set(pid as u32)
 }
 
 pub struct RunResult {
@@ -243,14 +244,14 @@ fn reap(pid: libc::pid_t) -> Result<(std::process::ExitStatus, Option<u64>), Str
 }
 
 // Windows：終わるのを待って終了コードを受け取り、Job の記録を忘れる（Job は kill_group で閉じてある）。
-// 最大使用メモリは測らない（None。段階 2 S4）
+// 最大使用メモリは、終わったあとの PeakWorkingSetSize（直接の子だけ。起動したときのハンドルの写しで読む。段階 2 S4）
 #[cfg(windows)]
 fn reap(pid: Pid) -> Result<(std::process::ExitStatus, Option<u64>), String> {
     use std::os::windows::process::ExitStatusExt;
     let code = crate::win::wait_for_exit(pid as u32);
-    crate::win::release_job(pid as u32);
+    let max_rss = crate::win::release_job(pid as u32);
     let code = code.ok_or_else(|| "終了を確かめられません".to_string())?;
-    Ok((std::process::ExitStatus::from_raw(code), None))
+    Ok((std::process::ExitStatus::from_raw(code), max_rss))
 }
 
 // グループ全体に SIGKILL を送る。直接の子を回収する前にだけ呼ぶ
@@ -1643,6 +1644,45 @@ mod windows_tests {
     }
 
     #[test]
+    fn reports_max_memory_of_the_child() {
+        // 50 MiB を確保して全部のページに書くと、最大使用メモリ（PeakWorkingSetSize）が増える（段階 2 S4）
+        let small = run_child(&["exit:0"], &limits(5000, 1024));
+        let large = run_child(&["alloc:50", "exit:0"], &limits(10000, 1024));
+        let small = small.max_rss_bytes.expect("最大使用メモリが取れない");
+        let large = large.max_rss_bytes.expect("最大使用メモリが取れない");
+        assert!(small > 0);
+        assert!(large > 40 * 1024 * 1024, "{large}");
+        assert!(large > small);
+    }
+
+    #[test]
+    fn stops_a_program_over_the_memory_limit_while_running() {
+        // 10 MiB ずつ、最大 400 MiB まで使ってから 3 秒眠る。上限 50 MiB なら、使っている途中で止まる（D-175。段階 2 S4）
+        let mut steps = vec!["alloc:10"; 40];
+        steps.push("sleep:3000");
+        let mut limits = limits(5000, 1024);
+        limits.memory = Some(50 * 1024 * 1024);
+        let started = Instant::now();
+        let result = run_child(&steps, &limits);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.outcome, Outcome::Exited(KILLED));
+        assert!(
+            result
+                .max_rss_bytes
+                .is_some_and(|bytes| bytes > 50 * 1024 * 1024),
+            "{:?}",
+            result.max_rss_bytes
+        );
+        // 上限より少なければ止めない（1 MiB だけ使い、そのまま終わる）
+        let quiet = run_child(&["alloc:1", "exit:0"], &limits);
+        assert_eq!(quiet.outcome, Outcome::Exited(0));
+    }
+
+    #[test]
     fn captures_output_and_exit_code() {
         let result = run_child(&["out:out", "err:err", "exit:3"], &limits(5000, 1024));
         assert_eq!(result.outcome, Outcome::Exited(3));
@@ -1791,6 +1831,8 @@ mod windows_tests {
                 (Side::Judge, "10\n".to_string())
             ]
         );
+        // 最大使用メモリが取れる（段階 2 S4）
+        assert!(result.solution.max_rss_bytes.is_some());
     }
 
     #[test]

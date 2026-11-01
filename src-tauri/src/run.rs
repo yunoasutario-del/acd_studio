@@ -1903,13 +1903,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Windows 版（段階 2 S2）：テスト用の子のプログラムで 2 秒待つ。使用メモリの確認は S4 で足す
+    // Windows 版（段階 2 S2）：テスト用の子のプログラムで 2 秒待つ。使用メモリが取れること（S4）も見る
     #[cfg(windows)]
     #[test]
     fn stops_a_case_at_the_time_limit() {
-        let dir = std::env::temp_dir().join(format!("atcoder-studio-tle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // テストのフォルダ。失敗しても残さないように、捨てるときに消す
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = TempDir(
+            std::env::temp_dir().join(format!("atcoder-studio-tle-{}", std::process::id())),
+        );
+        let dir = &temp.0;
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("sample-1.in"), "").unwrap();
         std::fs::write(dir.join("sample-1.out"), "1\n").unwrap();
         let settings = TestSettings {
@@ -1922,7 +1932,7 @@ mod tests {
         };
         let started = Instant::now();
         let case = run_case(
-            &dir,
+            dir,
             &program,
             &dir.join("sample-1.in"),
             &settings,
@@ -1931,7 +1941,8 @@ mod tests {
         .unwrap();
         assert!(matches!(case.verdict, Verdict::TimedOut));
         assert!(started.elapsed() < Duration::from_millis(1500));
-        let _ = std::fs::remove_dir_all(&dir);
+        // 使用メモリは受け取れる（S4）
+        assert!(case.memory_kib.is_some_and(|kib| kib > 0));
     }
 
     #[test]
