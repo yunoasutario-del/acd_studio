@@ -487,6 +487,14 @@ impl Side {
             Side::Judge => 1,
         }
     }
+
+    // 相手の側
+    fn other(self) -> Side {
+        match self {
+            Side::Solution => Side::Judge,
+            Side::Judge => Side::Solution,
+        }
+    }
 }
 
 // 片方が異常に終わった後、もう片方に終わるのを待つ時間（その間にジャッジの標準エラーなどを集める）。過ぎたら止める
@@ -738,8 +746,8 @@ pub fn run_pair(
     let mut killed_at: Option<Instant> = None;
     // 読み取りの数：中継 2 つと標準エラー 2 つ
     let mut open = 4;
-    // 標準出力が閉じた側（閉じた順）
-    let mut output_closed: Vec<Side> = Vec::new();
+    // 標準出力が閉じた側（閉じた知らせが届いた順）と、そのとき相手の終わりの知らせがまだ届いていなかったか
+    let mut output_closed: Vec<(Side, bool)> = Vec::new();
 
     let kill_both = || {
         for pid in pids {
@@ -772,8 +780,8 @@ pub fn run_pair(
                 None
             }
             PairEvent::OutputClosed(side) => {
-                if !output_closed.contains(&side) {
-                    output_closed.push(side);
+                if !output_closed.iter().any(|(closed, _)| *closed == side) {
+                    output_closed.push((side, exits[side.other().index()].is_none()));
                 }
                 None
             }
@@ -878,13 +886,15 @@ pub fn run_pair(
     // 終わりの知らせが届いた順は、2 つの終わりが重なると、原因（片方の終わり）と結果（それで EOF を読んだ相手の終わり）を
     // 取り違えうる（Windows で、全部のテストと一緒に動かしたときに起きた。Unix も同じ作りで、Unix の動きも変わる）。
     // 出力が閉じた知らせは、相手の標準入力を閉じる前に送るので、それが原因で相手が終わった知らせより必ず先に届く。
+    // そのため、決め直すのは、先に閉じた側の閉じた知らせが、相手の終わりの知らせより先に届いていたときだけにする
+    // （そうでなければ、相手の終わりはこちらの EOF によるものではありえない）。
     // 出力が閉じた知らせが、プロセスの終わりより遅れる場合（孫が標準出力を受け継いで持ち続けるなど）：
     // - 遅れた側の相手には EOF が届かないので、相手は普通、こちらが猶予のあとに止めるまで終わらない。止めたあとの終わりは
-    //   数えないので、ここでは決め直さず、終わりの知らせが届いた順（上のループで決めたもの）のまま
-    // - 相手がそれでも自分で異常に終わったとき（両方が、こちらが止める前に異常に終わった）は、遅れた側の閉じた知らせは
-    //   回収の前に Job（グループ）ごと止めたあとの読み切りの間に届くので、先に閉じた相手を先とする。終わった順とは逆になり
-    //   うる（相手の失敗は EOF によるものではない）。どちらの側の出力も閉じた知らせがなければ（相手が先に閉じて中継を
-    //   やめたなど）、決め直さない
+    //   数えないので、決め直さず、終わりの知らせが届いた順（上のループで決めたもの）のまま
+    // - 相手がそれでも自分で異常に終わったときは、先に閉じるのは相手の出力だが、その知らせは遅れた側の終わりの知らせより
+    //   あとに届くので、決め直さず、終わりの知らせが届いた順のまま（段階 2 S10b の直し。それまでは、終わった順と逆の
+    //   相手を先としていた）
+    // どちらの側の出力も閉じた知らせがなければ（相手が先に閉じて中継をやめたなど）、決め直さない
     let failed_on_its_own = |side: Side| {
         exits[side.index()].is_some_and(|(kind, at)| {
             kind.is_abnormal() && killed_at.is_none_or(|killed| at < killed)
@@ -893,7 +903,8 @@ pub fn run_pair(
     if first_failure.is_some()
         && failed_on_its_own(Side::Solution)
         && failed_on_its_own(Side::Judge)
-        && let Some(&side) = output_closed.first()
+        && let Some(&(side, before_other_exit)) = output_closed.first()
+        && before_other_exit
     {
         first_failure = Some(side);
     }
@@ -1252,13 +1263,32 @@ mod tests {
         assert_eq!(result.solution.outcome, Outcome::Signaled(libc::SIGSEGV));
     }
 
+    // 印のファイル（場所はテストごとに変える）。テストが失敗しても残さないように、捨てるときに消す
+    struct Marker(std::path::PathBuf);
+
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn marker(name: &str) -> Marker {
+        let path =
+            std::env::temp_dir().join(format!("atcoder-studio-mark-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Marker(path)
+    }
+
     #[test]
     fn blames_the_side_whose_output_closed_first() {
-        // 段階 2 S10b（Unix の動きも変わる）：解答は標準出力を閉じてから 0.2 秒待って 101 で終わり、ジャッジは EOF を
-        // 読んだらすぐ 2 で終わる。終わった順ではジャッジが先、原因の順（出力が閉じた順）では解答が先
+        // 段階 2 S10b（Unix の動きも変わる）：解答は標準出力を閉じ、ジャッジが印のファイルを作るまで待ってから、0.05 秒して
+        // 101 で終わる。ジャッジは EOF を読んだら印を作って 2 で終わる。終わった順ではジャッジが先、原因の順
+        // （出力が閉じた順）では解答が先。順番は時間ではなく印のファイルで作る
+        let mark = marker("blame");
+        let m = mark.0.display();
         let result = pair(
-            "exec >&-; sleep 0.2; exit 101",
-            "read q || exit 2",
+            &format!("exec >&-; while [ ! -e '{m}' ]; do sleep 0.01; done; sleep 0.05; exit 101"),
+            &format!("read q; : > '{m}'; exit 2"),
             &limits(5000, 1024),
         );
         assert_eq!(result.solution.outcome, Outcome::Exited(101));
@@ -1268,6 +1298,23 @@ mod tests {
         let result = pair("read q || exit 3", "exit 1", &limits(5000, 1024));
         assert_eq!(result.solution.outcome, Outcome::Exited(3));
         assert_eq!(result.first_failure, Some(Side::Judge));
+    }
+
+    #[test]
+    fn keeps_the_exit_order_when_output_closes_late() {
+        // 段階 2 S10b の直し（Unix の動きも変わる）：解答は、標準出力を受け継ぐ sleep を残して、印を作ってすぐ 101 で終わる
+        // （解答の出力は sleep が持つので、閉じた知らせは IDE がグループごと止めるまで来ない）。ジャッジは EOF を待たずに、
+        // 印を見てから 0.1 秒待って 2 で終わる。終わった順のとおり解答が先
+        let mark = marker("late");
+        let m = mark.0.display();
+        let result = pair(
+            &format!("sleep 30 & : > '{m}'; exit 101"),
+            &format!("while [ ! -e '{m}' ]; do sleep 0.01; done; sleep 0.1; exit 2"),
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
     }
 
     #[test]
@@ -1932,11 +1979,15 @@ mod windows_tests {
 
     #[test]
     fn blames_the_side_whose_output_closed_first() {
-        // 取り違えを毎回起こす（段階 2 S10b）：解答は標準出力を閉じてから 200 ms 待って 101 で終わり、ジャッジは EOF を
-        // 読んだらすぐ 2 で終わる。終わった順ではジャッジが先、原因の順（出力が閉じた順）では解答が先
+        // 取り違えを毎回起こす（段階 2 S10b）：解答は標準出力を閉じ、ジャッジが印のファイルを作るまで待ってから、50 ms して
+        // 101 で終わる。ジャッジは EOF を読んだら印を作って 2 で終わる。終わった順ではジャッジが先、原因の順
+        // （出力が閉じた順）では解答が先。順番は時間ではなく印のファイルで作る（混んでいても、解答は猶予の中で終わる）
+        let mark = marker("blame");
+        let wait = format!("wait-file:{}", mark.display());
+        let touch = format!("touch:{}", mark.display());
         let result = pair(
-            &["close-stdout", "sleep:200", "exit:101"],
-            &["read-or-exit:2"],
+            &["close-stdout", &wait, "sleep:50", "exit:101"],
+            &["read", &touch, "exit:2"],
             &limits(5000, 1024),
         );
         assert_eq!(result.solution.outcome, Outcome::Exited(101));
@@ -1946,6 +1997,25 @@ mod windows_tests {
         let result = pair(&["read-or-exit:3"], &["exit:1"], &limits(5000, 1024));
         assert_eq!(result.solution.outcome, Outcome::Exited(3));
         assert_eq!(result.first_failure, Some(Side::Judge));
+    }
+
+    #[test]
+    fn keeps_the_exit_order_when_output_closes_late() {
+        // 段階 2 S10b の直し：解答は、標準出力を受け継ぐ孫を作ってすぐ 101 で終わる（解答の出力は孫が持つので、閉じた知らせは
+        // IDE が止めるまで来ない）。ジャッジは EOF を待たずに、孫ができた（印のファイルがある）のを見てから 100 ms 待って
+        // 2 で終わる（ジャッジの出力はそこで閉じる）。ジャッジの失敗は解答の EOF によるものではないので、終わった順のとおり
+        // 解答が先。出力が先に閉じたのはジャッジだが、その知らせは解答の終わりの知らせよりあとに届くので、決め直さない
+        let mark = marker("late");
+        let wait = format!("wait-file:{}", mark.display());
+        let result = pair(
+            &[&grandchild_step(&mark), "exit:101"],
+            &[&wait, "sleep:100", "exit:2"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        assert!(released(&mark), "孫が残っている");
     }
 
     #[test]

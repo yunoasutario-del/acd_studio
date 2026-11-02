@@ -18,6 +18,8 @@
 // - echo-lines … EOF まで、読んだ行をそのまま書く
 // - ask:N … 0 から N-1 まで「書いて 1 行読む」を繰り返す
 // - close-stdout … 標準出力を閉じる（相手には EOF が届く。このあとは標準出力に書かない）
+// - touch:パス … パスに空のファイルを作る（ほかのプロセスに順番を知らせる印。テストが片付ける）
+// - wait-file:パス … パスのファイルができるまで待つ（最大 5 秒。できなければ 120 で終わる）
 // - sleep:ミリ秒・spin … 待つ／回り続ける
 // - hold:パス … パスのファイルを作って開いたままにする（Windows では、ほかから開けない・消せないように排他で開き、
 //   閉じたら消える指定にする）。終わるまで持つので、テストはそのファイルが消せるか・消えたかで、このプロセスが
@@ -93,6 +95,15 @@ fn main() {
                 }
             }
             "close-stdout" => close_stdout(),
+            "touch" => {
+                std::fs::write(value, b"")
+                    .unwrap_or_else(|error| fail(&format!("{value} を作れません：{error}")));
+            }
+            "wait-file" => {
+                if !wait_for_file(std::path::Path::new(value)) {
+                    fail(&format!("{value} ができません"));
+                }
+            }
             "sleep" => std::thread::sleep(Duration::from_millis(number(value))),
             "spin" => loop {
                 std::hint::spin_loop();
@@ -109,14 +120,7 @@ fn main() {
                     .stderr(Stdio::null())
                     .spawn()
                     .unwrap_or_else(|error| fail(&error.to_string()));
-                let path = std::path::Path::new(value);
-                if !(0..500).any(|_| {
-                    let made = path.exists();
-                    if !made {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    made
-                }) {
+                if !wait_for_file(std::path::Path::new(value)) {
                     fail(&format!("孫が {value} を作りません"));
                 }
             }
@@ -174,6 +178,17 @@ fn write_forever(stream: &mut impl Write) -> ! {
     loop {
         write(stream, &chunk);
     }
+}
+
+// パスのファイルができるまで待つ（10 ms おきに見て、最大 5 秒）。できたら true
+fn wait_for_file(path: &std::path::Path) -> bool {
+    (0..500).any(|_| {
+        let made = path.exists();
+        if !made {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        made
+    })
 }
 
 // 標準出力を閉じる。std だけで閉じるため、標準出力のハンドル（Unix ではファイル記述子 1）を File として受け取って捨てる
