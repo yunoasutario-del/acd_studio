@@ -550,7 +550,8 @@ impl<'a> Display<'a> {
 // - i32 で負の値は、Windows の例外のコード（NTSTATUS など。u32 を i32 として読んだもの）なので、16 進と名前で表す。
 //   名前の表にない値は 16 進だけ。Unix の終了コードは 0〜255 なので、負にはならない
 // - 負でない値は、256 以上も（Windows では exit(1000) などがありうる）今と同じ 10 進のまま
-// - 終了コード 3 は、Windows では C++ の abort・assert でもなる（MinGW。推測）ので、Windows だけ添え書きする
+// （S5 では終了コード 3 に C++ の abort・assert の添え書きをしていたが、この機械の g++〔MinGW-Builds・UCRT〕では
+// 0xC0000409 で終わったので、段階 2 S5b でやめた）
 pub(crate) fn exit_code_text(code: i32) -> String {
     if code < 0 {
         let hex = format!("0x{:08X}", code as u32);
@@ -559,20 +560,18 @@ pub(crate) fn exit_code_text(code: i32) -> String {
             None => format!("終了コード {hex}"),
         };
     }
-    if code == 3 && cfg!(windows) {
-        return "終了コード 3（Windows では、C++ の abort・assert でも 3 になります）".to_string();
-    }
     format!("終了コード {code}")
 }
 
 // Windows の例外のコードの名前。test_child で確かめたもの（S5）と、確かめていないもの（推測）がある
 fn exception_name(code: u32) -> Option<&'static str> {
     Some(match code {
-        // test_child で確かめた（段階 2 S5 の reports_exit_codes_of_crashes）
+        // test_child で確かめた（段階 2 S5 の reports_exit_codes_of_crashes）。0xC0000409 は、C++ の abort・assert・
+        // 捕まえない例外でもなることを、この機械の g++ で確かめた（段階 2 S5b）
         0xC000_0005 => "アクセス違反：範囲外・null の読み書きなど",
         0xC000_0094 => "整数の 0 除算",
         0xC000_00FD => "スタックあふれ：深い再帰など",
-        0xC000_0409 => "異常終了：Rust の abort、セキュリティ検査など",
+        0xC000_0409 => "異常終了：C++ の abort・assert・捕まえない例外、Rust の abort など",
         // 確かめていない（推測）
         0xC000_0135 => "DLL が見つからない：C++ の実行時のライブラリなど",
         0xC000_001D => "不正な命令",
@@ -2077,6 +2076,52 @@ mod tests {
         assert!(case.memory_kib.is_some_and(|kib| kib > 0));
     }
 
+    // Windows 版（段階 2 S5b）：既定の時間の制限（2500 ms）のサンプルテストで、アクセス違反で落ちる解答は、TLE ではなく
+    // RE になる（Windows のエラー報告が約 4 秒持ったままにしていたので、TLE になっていた）。上限を 1 秒にしなかった理由は、
+    // process.rs の crashes_are_runtime_errors_within_a_short_time_limit と同じ
+    #[cfg(windows)]
+    #[test]
+    fn judges_a_crash_as_runtime_error_within_the_time_limit() {
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = TempDir(
+            std::env::temp_dir().join(format!("atcoder-studio-crash-{}", std::process::id())),
+        );
+        let dir = &temp.0;
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("sample-1.in"), "").unwrap();
+        std::fs::write(dir.join("sample-1.out"), "1\n").unwrap();
+        let settings = TestSettings::default();
+        assert_eq!(settings.time_limit_ms, 2500);
+        let program = Program {
+            path: process::test_child_path(),
+            args: vec!["crash:access-violation".into()],
+        };
+        let case = run_case(
+            dir,
+            &program,
+            &dir.join("sample-1.in"),
+            &settings,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &case.verdict,
+                Verdict::RuntimeError {
+                    outcome: RunOutcome::Exited { code, .. }
+                } if *code == 0xC000_0005_u32 as i32
+            ),
+            "{:?}",
+            case.verdict
+        );
+    }
+
     #[test]
     fn decides_whether_an_output_can_be_saved_as_expected() {
         // 正常に終わり、全体を得られ、UTF-8 で、画面に出せる大きさ
@@ -2303,7 +2348,11 @@ mod tests {
             (0xC000_0005, "0xC0000005", "アクセス違反"),
             (0xC000_0094, "0xC0000094", "整数の 0 除算"),
             (0xC000_00FD, "0xC00000FD", "スタックあふれ"),
-            (0xC000_0409, "0xC0000409", "異常終了"),
+            (
+                0xC000_0409,
+                "0xC0000409",
+                "異常終了：C++ の abort・assert・捕まえない例外、Rust の abort など",
+            ),
             (0xC000_0135, "0xC0000135", "DLL が見つからない"),
             (0xC000_001D, "0xC000001D", "不正な命令"),
             (0xC000_0374, "0xC0000374", "ヒープの破損"),
@@ -2334,18 +2383,11 @@ mod tests {
         }
     }
 
-    // 段階 2 S5：終了コード 3 は、Windows では C++ の abort・assert でもなる（MinGW。推測）ので添え書きする。Unix では今のまま
+    // 段階 2 S5b：この機械の g++（MinGW-Builds・UCRT）では、C++ の abort・assert・捕まえない例外は 3 ではなく
+    // 0xC0000409 で終わった（測定）ので、3 には添え書きをしない（どの OS でも今のまま）
     #[test]
-    fn notes_exit_code_3_only_on_windows() {
-        let shown = exit_code_text(3);
-        if cfg!(windows) {
-            assert!(
-                shown.starts_with("終了コード 3（") && shown.contains("abort"),
-                "{shown}"
-            );
-        } else {
-            assert_eq!(shown, "終了コード 3");
-        }
+    fn keeps_exit_code_3_plain() {
+        assert_eq!(exit_code_text(3), "終了コード 3");
     }
 
     #[test]

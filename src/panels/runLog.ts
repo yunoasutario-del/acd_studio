@@ -100,7 +100,12 @@ export function describeFinish(finish: Finish): string {
           if (outcome.code === 101) {
             return `終了コード 101 で終了しました。Rust の panic で終わったときの値です（${time}）`;
           }
-          return `${exitLabel(outcome)} で終了しました（${time}）`;
+          {
+            // 名前が付く（「…）」で終わる）ときは空白を入れない。数字だけのときは今までどおり（段階 2 S5b）
+            const label = exitLabel(outcome);
+            const space = label.endsWith("）") ? "" : " ";
+            return `${label}${space}で終了しました（${time}）`;
+          }
         case "signaled": {
           const name = SIGNAL_NAMES[outcome.signal];
           return `シグナル ${outcome.signal}${name ? `（${name}）` : ""} で終了しました（${time}）`;

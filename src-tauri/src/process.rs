@@ -1792,6 +1792,25 @@ mod windows_tests {
     }
 
     #[test]
+    fn crashes_are_runtime_errors_within_a_short_time_limit() {
+        // 段階 2 S5b：扱われない例外で落ちると、Windows のエラー報告（WER）が約 4 秒（測って 3.2〜4.8 秒）プロセスを
+        // 持ったままにする。Job の DIE_ON_UNHANDLED_EXCEPTION で、すぐ終わるようにする。サンプルテストの既定の上限
+        // （2500 ms）で、TLE ではなく例外のコードで終わる。上限を 1 秒にしなかったのは、全部のテストを同時に動かすと、
+        // 一斉の起動の混み合いで、子を Job に入れて再開するまでに約 2 秒かかることがあるため（測定。文書の S5b・S13）
+        for (kind, code) in [
+            ("access-violation", 0xC000_0005_u32 as i32),
+            ("divide-by-zero", 0xC000_0094_u32 as i32),
+            ("stack-overflow", 0xC000_00FD_u32 as i32),
+        ] {
+            let result = run_child(
+                &[&format!("crash:{kind}")],
+                &limits(crate::compare::DEFAULT_TIME_LIMIT_MS, 1024 * 1024),
+            );
+            assert_eq!(result.outcome, Outcome::Exited(code), "{kind}");
+        }
+    }
+
+    #[test]
     fn reports_exit_codes_of_crashes() {
         // 段階 2 S5：test_child で本当に落として、Windows の終了コードを確かめる（RE の名前の表のもと）
         for (kind, code) in [

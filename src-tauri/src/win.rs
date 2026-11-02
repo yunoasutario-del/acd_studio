@@ -29,10 +29,11 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
@@ -231,7 +232,11 @@ pub fn working_set(pid: u32) -> Option<u64> {
     memory_counters(&jobs.get(&pid)?.process).map(|counters| counters.WorkingSetSize as u64)
 }
 
-// KILL_ON_JOB_CLOSE を付けた Job を作る
+// KILL_ON_JOB_CLOSE と DIE_ON_UNHANDLED_EXCEPTION を付けた Job を作る。
+// DIE_ON_UNHANDLED_EXCEPTION（段階 2 S5b）：扱われない例外（アクセス違反・0 除算・スタックあふれなど）で落ちたとき、
+// Windows のエラー報告（WER）がプロセスを約 4 秒持ったままにして、サンプルテストで RE ではなく TLE と判定されていた。
+// これを付けると、すぐ（約 0.1 秒）終わる。終了コードは例外のコードのまま（測定で確認）。
+// __fastfail で終わるもの（0xC0000409。C++ の abort・assert・捕まえない例外、Rust の abort）には効かない（測定で確認）
 fn create_job(fail: &impl Fn(JobStep) -> bool) -> Result<Handle, String> {
     // SAFETY: 名前もセキュリティ属性もない Job を作る。失敗すれば null が返る
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -244,7 +249,8 @@ fn create_job(fail: &impl Fn(JobStep) -> bool) -> Result<Handle, String> {
     }
     // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION はゼロで初期化してよい C の構造体
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
     // SAFETY: 作った Job と、読む構造体とその大きさを渡す
     let set = unsafe {
         SetInformationJobObject(
