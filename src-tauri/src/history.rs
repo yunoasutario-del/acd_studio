@@ -233,7 +233,10 @@ mod tests {
 
     fn ran(elapsed_ms: u64) -> Finish {
         Finish::Ran {
-            outcome: RunOutcome::Exited { code: 0 },
+            outcome: RunOutcome::Exited {
+                code: 0,
+                label: "終了コード 0".to_string(),
+            },
             elapsed_ms,
             output_left_open: false,
         }

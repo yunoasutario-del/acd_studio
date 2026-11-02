@@ -153,7 +153,7 @@ fn helper_of(
         Outcome::Stopped => return Helper::Stopped,
         Outcome::Exited(0) if !result.output_left_open => return Helper::Done(result.stdout),
         Outcome::Exited(0) => "出力の全体を得られませんでした".to_string(),
-        Outcome::Exited(code) => format!("終了コード {code}"),
+        Outcome::Exited(code) => crate::run::exit_code_text(code),
         Outcome::Signaled(signal) => format!("シグナル {signal}"),
         Outcome::TimedOut => format!("{} 秒の上限を超えました", RUN_TIME_LIMIT.as_secs()),
         Outcome::OutputLimit(_) => format!(

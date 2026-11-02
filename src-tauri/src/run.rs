@@ -246,10 +246,20 @@ pub struct RandomFailure {
     tag = "kind"
 )]
 pub enum RunOutcome {
-    Exited { code: i32 },
-    Signaled { signal: i32 },
+    // label は画面に出す文字（exit_code_text。Windows の例外の名前など。段階 2 S5）。
+    // 前の版の実行履歴（history.json）にはないので、読むときは空にする（画面は空なら code から作る）
+    Exited {
+        code: i32,
+        #[serde(default)]
+        label: String,
+    },
+    Signaled {
+        signal: i32,
+    },
     TimedOut,
-    OutputLimit { stream: LogKind },
+    OutputLimit {
+        stream: LogKind,
+    },
     Stopped,
 }
 
@@ -536,9 +546,49 @@ impl<'a> Display<'a> {
     }
 }
 
+// 終了コードを画面に出す文字にする（Windows 移植の段階 2 S5）。
+// - i32 で負の値は、Windows の例外のコード（NTSTATUS など。u32 を i32 として読んだもの）なので、16 進と名前で表す。
+//   名前の表にない値は 16 進だけ。Unix の終了コードは 0〜255 なので、負にはならない
+// - 負でない値は、256 以上も（Windows では exit(1000) などがありうる）今と同じ 10 進のまま
+// - 終了コード 3 は、Windows では C++ の abort・assert でもなる（MinGW。推測）ので、Windows だけ添え書きする
+pub(crate) fn exit_code_text(code: i32) -> String {
+    if code < 0 {
+        let hex = format!("0x{:08X}", code as u32);
+        return match exception_name(code as u32) {
+            Some(name) => format!("終了コード {hex}（{name}）"),
+            None => format!("終了コード {hex}"),
+        };
+    }
+    if code == 3 && cfg!(windows) {
+        return "終了コード 3（Windows では、C++ の abort・assert でも 3 になります）".to_string();
+    }
+    format!("終了コード {code}")
+}
+
+// Windows の例外のコードの名前。test_child で確かめたもの（S5）と、確かめていないもの（推測）がある
+fn exception_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        // test_child で確かめた（段階 2 S5 の reports_exit_codes_of_crashes）
+        0xC000_0005 => "アクセス違反：範囲外・null の読み書きなど",
+        0xC000_0094 => "整数の 0 除算",
+        0xC000_00FD => "スタックあふれ：深い再帰など",
+        0xC000_0409 => "異常終了：Rust の abort、セキュリティ検査など",
+        // 確かめていない（推測）
+        0xC000_0135 => "DLL が見つからない：C++ の実行時のライブラリなど",
+        0xC000_001D => "不正な命令",
+        0xC000_0374 => "ヒープの破損",
+        // IDE が止めたときの値（9.1 の追加 10）
+        0xE0AC_0001 => "IDE が止めました",
+        _ => return None,
+    })
+}
+
 pub(crate) fn outcome_of(outcome: Outcome) -> RunOutcome {
     match outcome {
-        Outcome::Exited(code) => RunOutcome::Exited { code },
+        Outcome::Exited(code) => RunOutcome::Exited {
+            code,
+            label: exit_code_text(code),
+        },
         Outcome::Signaled(signal) => RunOutcome::Signaled { signal },
         Outcome::TimedOut => RunOutcome::TimedOut,
         Outcome::OutputLimit(Stream::Stdout) => RunOutcome::OutputLimit {
@@ -2193,7 +2243,7 @@ mod tests {
     #[test]
     fn sends_field_names_in_camel_case() {
         let finish = Finish::Ran {
-            outcome: RunOutcome::Exited { code: 0 },
+            outcome: outcome_of(Outcome::Exited(0)),
             elapsed_ms: 12,
             output_left_open: false,
         };
@@ -2201,6 +2251,8 @@ mod tests {
         assert_eq!(json["kind"], "ran");
         assert_eq!(json["elapsedMs"], 12);
         assert_eq!(json["outputLeftOpen"], false);
+        // 画面に出す文字も送る（段階 2 S5）
+        assert_eq!(json["outcome"]["label"], "終了コード 0");
     }
 
     // 段階 2 S3b：待っても書けなかった exe の案内
@@ -2240,6 +2292,60 @@ mod tests {
             cpp_outputs(Path::new(r"C:\p\x\main.EXE"), dir, &[]),
             vec![PathBuf::from(r"C:\p\x\main.EXE")]
         );
+    }
+
+    // 段階 2 S5：Windows の例外の終了コード（i32 で負の値）は 16 進と名前で表す。表にない負の値は 16 進だけ。
+    // 値だけを扱うので、どの OS でも動かす
+    #[test]
+    fn names_windows_exception_codes() {
+        let text = |code: u32| exit_code_text(code as i32);
+        for (code, hex, name) in [
+            (0xC000_0005, "0xC0000005", "アクセス違反"),
+            (0xC000_0094, "0xC0000094", "整数の 0 除算"),
+            (0xC000_00FD, "0xC00000FD", "スタックあふれ"),
+            (0xC000_0409, "0xC0000409", "異常終了"),
+            (0xC000_0135, "0xC0000135", "DLL が見つからない"),
+            (0xC000_001D, "0xC000001D", "不正な命令"),
+            (0xC000_0374, "0xC0000374", "ヒープの破損"),
+            (0xE0AC_0001, "0xE0AC0001", "IDE が止めました"),
+        ] {
+            let shown = text(code);
+            assert!(
+                shown.starts_with(&format!("終了コード {hex}（")) && shown.contains(name),
+                "{shown}"
+            );
+        }
+        // 表にない負の値は 16 進だけ
+        assert_eq!(text(0xC000_0017), "終了コード 0xC0000017");
+        // 画面に送る文字にも入る
+        let json =
+            serde_json::to_value(outcome_of(Outcome::Exited(0xC000_0005_u32 as i32))).unwrap();
+        assert!(
+            json["label"].as_str().unwrap().contains("アクセス違反"),
+            "{json}"
+        );
+    }
+
+    // 段階 2 S5：負でない値は、256 以上も（Windows では exit(1000) などがありうる）今と同じ 10 進のまま
+    #[test]
+    fn keeps_non_negative_exit_codes_in_decimal() {
+        for code in [0, 1, 2, 101, 255, 256, 1000, i32::MAX] {
+            assert_eq!(exit_code_text(code), format!("終了コード {code}"));
+        }
+    }
+
+    // 段階 2 S5：終了コード 3 は、Windows では C++ の abort・assert でもなる（MinGW。推測）ので添え書きする。Unix では今のまま
+    #[test]
+    fn notes_exit_code_3_only_on_windows() {
+        let shown = exit_code_text(3);
+        if cfg!(windows) {
+            assert!(
+                shown.starts_with("終了コード 3（") && shown.contains("abort"),
+                "{shown}"
+            );
+        } else {
+            assert_eq!(shown, "終了コード 3");
+        }
     }
 
     #[test]

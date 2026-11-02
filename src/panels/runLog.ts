@@ -1,5 +1,5 @@
 // 実行ログの中身と、終わり方の説明（Phase 2 作業 4）
-import type { Finish, LogKind } from "../ipc/run";
+import { exitLabel, type Finish, type LogKind } from "../ipc/run";
 
 // lsp は rust-analyzer の状態・失敗の理由・標準エラー（画面で足す行。Phase 3b-2 作業 3。D-130）
 export type LogEntryKind = LogKind | "lsp";
@@ -100,7 +100,7 @@ export function describeFinish(finish: Finish): string {
           if (outcome.code === 101) {
             return `終了コード 101 で終了しました。Rust の panic で終わったときの値です（${time}）`;
           }
-          return `終了コード ${outcome.code} で終了しました（${time}）`;
+          return `${exitLabel(outcome)} で終了しました（${time}）`;
         case "signaled": {
           const name = SIGNAL_NAMES[outcome.signal];
           return `シグナル ${outcome.signal}${name ? `（${name}）` : ""} で終了しました（${time}）`;

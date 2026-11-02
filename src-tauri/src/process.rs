@@ -1792,6 +1792,21 @@ mod windows_tests {
     }
 
     #[test]
+    fn reports_exit_codes_of_crashes() {
+        // 段階 2 S5：test_child で本当に落として、Windows の終了コードを確かめる（RE の名前の表のもと）
+        for (kind, code) in [
+            ("access-violation", 0xC000_0005_u32 as i32),
+            ("divide-by-zero", 0xC000_0094_u32 as i32),
+            ("stack-overflow", 0xC000_00FD_u32 as i32),
+            ("abort", 0xC000_0409_u32 as i32),
+            ("panic", 101),
+        ] {
+            let result = run_child(&[&format!("crash:{kind}")], &limits(10000, 1024 * 1024));
+            assert_eq!(result.outcome, Outcome::Exited(code), "{kind}");
+        }
+    }
+
+    #[test]
     fn captures_output_and_exit_code() {
         let result = run_child(&["out:out", "err:err", "exit:3"], &limits(5000, 1024));
         assert_eq!(result.outcome, Outcome::Exited(3));

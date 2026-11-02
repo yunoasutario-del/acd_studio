@@ -139,7 +139,7 @@ pub(crate) fn pair_verdict(result: &PairResult, settings: &TestSettings) -> Verd
 
 fn exit_text(outcome: Outcome) -> String {
     match outcome {
-        Outcome::Exited(code) => format!("終了コード {code}"),
+        Outcome::Exited(code) => crate::run::exit_code_text(code),
         Outcome::Signaled(signal) => format!("シグナル {signal}"),
         Outcome::TimedOut => "時間切れ".to_string(),
         Outcome::OutputLimit(_) => "出力の上限".to_string(),
@@ -604,7 +604,7 @@ mod tests {
         assert!(matches!(
             pair_verdict(&re, &settings),
             Verdict::RuntimeError {
-                outcome: crate::run::RunOutcome::Exited { code: 101 }
+                outcome: crate::run::RunOutcome::Exited { code: 101, .. }
             }
         ));
         let wa = result(

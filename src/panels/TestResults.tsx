@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { CaseResult, Interaction, Verdict } from "../ipc/run";
+import { exitLabel, type CaseResult, type Interaction, type Verdict } from "../ipc/run";
 import { failedNames } from "./testCases";
 import { isDebuggableCase } from "./debugView";
 
@@ -37,7 +37,7 @@ function verdictView(verdict: Verdict): VerdictView {
         outcome.kind === "exited"
           ? outcome.code === 101
             ? "終了コード 101（panic）"
-            : `終了コード ${outcome.code}`
+            : exitLabel(outcome)
           : outcome.kind === "signaled"
             ? `シグナル ${outcome.signal}`
             : "";
