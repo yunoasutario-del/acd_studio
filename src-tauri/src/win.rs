@@ -13,7 +13,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process::Child;
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -26,7 +26,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
@@ -37,7 +38,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess, OpenThread,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, OpenThread,
     PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     PROCESS_TERMINATE, PROCESS_VM_READ, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
     WaitForSingleObject,
@@ -394,6 +395,187 @@ pub(crate) fn close_job_without_terminating(pid: u32) {
     drop(entry);
 }
 
+// ---- 落ちた子のエラー報告を止める（段階 2 S5c。docs/windows-port-plan.md の S5c の行） ----
+//
+// __fastfail（0xC0000409。Rust の abort、C++ の abort・assert・捕まえない例外）で落ちると、Job の
+// DIE_ON_UNHANDLED_EXCEPTION は効かず、Windows のエラー報告（WER）の WerFault.exe が、落ちた子を約 4 秒
+// 持ったままにする（サンプルテストで TLE になっていた）。その WerFault.exe は、落ちた子が親で、Job の外にある（測定）。
+// 子の終わりを待っている間に、親が直接の子の WerFault.exe を探して止めると、子はすぐ 0xC0000409 のまま終わる（測定で
+// 131〜160 ms）。WER のサービス（WerSvc）が起動した WerFault.exe は、親が違うので止めない。
+// 子が終わる前に探すので、子の pid はほかのプロセスに使い回されていない。それでも、前に同じ pid を使っていたプロセスの
+// 子を止めないように、子より前に作られたものは止めない。
+//
+// 見張りは IDE 全体で 1 つのスレッド（S5c の直し）。子ごとに一覧を取ると、テストのように子が同時に多いとき、一覧を取る処理
+// どうしやプロセスを作る処理が待ち合わせになって遅れた（作り直しありで cargo test 全体を 5 回ずつ：子ごとに探すと 1 回、
+// 探さないと 0 回落ちた）。見張る子は CrashReporterWatch で登録・解除する。見張りのスレッドは、最初の登録のときに作られ、
+// 登録がある間だけ CRASH_REPORTER_POLL ごとに一覧を 1 回取る。登録がなくなったら、次の登録まで Condvar で眠る
+// （スレッドは終わらせない。眠っている間は CPU を使わない）
+
+// 一覧を取る間隔。プロセスの一覧を取るのに中央値 約 8 ms かかる（測定）ので、毎回は探さない
+const CRASH_REPORTER_POLL: Duration = Duration::from_millis(100);
+// 子が始まって（登録して）からこの時間は探さない。WerFault.exe は早くても約 120 ms で起動する（測定）ので、すぐ終わる子は
+// 一度も一覧を取らずに済む
+const CRASH_REPORTER_DELAY: Duration = Duration::from_millis(100);
+
+// プロセスの一覧の 1 行
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessEntry {
+    pub pid: u32,
+    pub parent: u32,
+    pub name: String,
+    // 作られた時刻（FILETIME の 100 ナノ秒の数）。読めなければ 0
+    pub created: u64,
+}
+
+// entries のうち、止めてよい WerFault.exe の pid：親が child で、child より前に作られていないもの
+pub(crate) fn crash_reporters_of(
+    entries: &[ProcessEntry],
+    child: u32,
+    child_created: u64,
+) -> Vec<u32> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.parent == child
+                && entry.name.eq_ignore_ascii_case("WerFault.exe")
+                && entry.created >= child_created
+        })
+        .map(|entry| entry.pid)
+        .collect()
+}
+
+// プロセスの作られた時刻（FILETIME の 100 ナノ秒の数）。読めなければ None
+fn created_time(process: HANDLE) -> Option<u64> {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: 開いているプロセスのハンドルと、書き込み先を渡す
+    let read =
+        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    (read != 0)
+        .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+// 今のプロセスの一覧のうち、名前が WerFault.exe のもの（作られた時刻つき）
+fn crash_reporter_entries() -> Vec<ProcessEntry> {
+    let mut entries = Vec::new();
+    // SAFETY: 引数は値だけ。失敗すれば INVALID_HANDLE_VALUE が返る
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return entries;
+    }
+    let snapshot = Handle(snapshot);
+    // SAFETY: PROCESSENTRY32W はゼロで初期化してよい C の構造体。dwSize に大きさを入れてから渡す
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: 取った一覧と、書き込み先を渡す
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+        let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        if name.eq_ignore_ascii_case("WerFault.exe") {
+            let created = open_process(entry.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION)
+                .and_then(|process| created_time(process.0))
+                .unwrap_or(0);
+            entries.push(ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent: entry.th32ParentProcessID,
+                name,
+                created,
+            });
+        }
+        // SAFETY: 取った一覧と、書き込み先を渡す
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+    entries
+}
+
+// 見張る子：pid → (登録した時刻, 子の作られた時刻)
+type Watched = HashMap<u32, (Instant, u64)>;
+
+// 見張る子の一覧と、登録を見張りのスレッドに知らせる Condvar
+static WATCHED: LazyLock<(Mutex<Watched>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+// 見張りのスレッドを作るのは 1 回だけ
+static WATCHER: Once = Once::new();
+
+fn watched() -> MutexGuard<'static, Watched> {
+    WATCHED.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// 見張りのスレッド。登録がなければ眠り、登録がある間は CRASH_REPORTER_POLL ごとに、登録から CRASH_REPORTER_DELAY
+// たった子について、プロセスの一覧を 1 回だけ取って、親がその子の WerFault.exe を止める
+fn watch_crash_reporters() {
+    loop {
+        {
+            let mut children = watched();
+            while children.is_empty() {
+                children = WATCHED
+                    .1
+                    .wait(children)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        std::thread::sleep(CRASH_REPORTER_POLL);
+        let due: Vec<(u32, u64)> = watched()
+            .iter()
+            .filter(|(_, (since, _))| since.elapsed() >= CRASH_REPORTER_DELAY)
+            .map(|(pid, (_, created))| (*pid, *created))
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        let entries = crash_reporter_entries();
+        for (pid, created) in due {
+            for reporter in crash_reporters_of(&entries, pid, created) {
+                if let Some(process) = open_process(reporter, PROCESS_TERMINATE) {
+                    // SAFETY: 開いたハンドルを渡す。すでに終わっていれば失敗するだけ
+                    unsafe {
+                        TerminateProcess(process.0, 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 子を見張る間だけ持つもの（process.rs の run・run_pair。時間の上限がある実行〔解答・ジャッジ・生成器・愚直解〕だけ。
+// ビルドや構文の確かめは、長く動くうえ IDE が判定するものではないので、見張らない）。作ると登録し、捨てると解除する。
+// 子の作られた時刻は、Job の記録のハンドルの写しで読む（Job に入れていない子なら登録しない）
+pub struct CrashReporterWatch {
+    pid: Option<u32>,
+}
+
+impl CrashReporterWatch {
+    pub fn new(pid: u32) -> Self {
+        let created = {
+            let jobs = jobs();
+            jobs.get(&pid).and_then(|job| created_time(job.process.0))
+        };
+        let Some(created) = created else {
+            return CrashReporterWatch { pid: None };
+        };
+        WATCHER.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("crash-reporter-watch".to_string())
+                .spawn(watch_crash_reporters);
+        });
+        watched().insert(pid, (Instant::now(), created));
+        WATCHED.1.notify_one();
+        CrashReporterWatch { pid: Some(pid) }
+    }
+}
+
+impl Drop for CrashReporterWatch {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            watched().remove(&pid);
+        }
+    }
+}
+
 // ---- 書けるようになるまで待つ（段階 2 S3b。docs/windows-port-plan.md 4.7） ----
 //
 // 止めた直後の前の実行の exe は、Job が空になり、直接の子の終わりを待ったあとでも、10〜40 ms ほど書けないことがある
@@ -606,6 +788,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // 段階 2 S5c：止めるのは、親が落ちた子で、子よりあとに作られた WerFault.exe だけ（名前は大文字・小文字を区別しない）
+    #[test]
+    fn picks_only_crash_reporters_started_by_the_child() {
+        let entry = |pid: u32, parent: u32, name: &str, created: u64| ProcessEntry {
+            pid,
+            parent,
+            name: name.to_string(),
+            created,
+        };
+        let entries = [
+            entry(1, 100, "WerFault.exe", 1_500),
+            // サービス（WerSvc）が起動したものは止めない
+            entry(2, 200, "WerFault.exe", 1_500),
+            // 名前が違う
+            entry(3, 100, "notepad.exe", 1_500),
+            entry(4, 100, "werfault.EXE", 1_600),
+            // 子より前に作られた（同じ pid を前に使っていたプロセスの子）
+            entry(5, 100, "WerFault.exe", 900),
+        ];
+        assert_eq!(crash_reporters_of(&entries, 100, 1_000), vec![1, 4]);
     }
 
     #[test]

@@ -383,6 +383,14 @@ pub fn run(
 
     // メモリの上限で止めたか（止めるのは 1 回だけ）
     let mut memory_killed = false;
+    // Windows：落ちた子のエラー報告（WerFault.exe）を止める（段階 2 S5c）。時間の上限がある実行
+    // （解答・ジャッジ・生成器・愚直解）だけ。ビルドや構文の確かめには上限がないので、見張らない。
+    // 子を見張りに登録し、直接の子が終わったら（下の loop を出たら）解除する
+    #[cfg(windows)]
+    let crash_reporters = limits
+        .time
+        .is_some()
+        .then(|| crate::win::CrashReporterWatch::new(pid as u32));
     // 直接の子が終わるか、止めるまで待つ
     let exit_at = loop {
         match events.recv_timeout(POLL_INTERVAL) {
@@ -419,6 +427,8 @@ pub fn run(
             break *at;
         }
     };
+    #[cfg(windows)]
+    drop(crash_reporters);
 
     // 回収する前に、グループの残り（直接の子が残した子孫）を止める
     kill_group(pid);
@@ -792,6 +802,15 @@ pub fn run_pair(
         }
     };
 
+    // Windows：落ちた子（解答・ジャッジ）のエラー報告（WerFault.exe）を止める（段階 2 S5c）。時間の上限がある実行だけ
+    // （run と同じ。対話テストには上限がある）。両方を見張りに登録し、それぞれ終わったら解除する
+    #[cfg(windows)]
+    let mut crash_reporters: [Option<crate::win::CrashReporterWatch>; 2] = pids.map(|pid| {
+        limits
+            .time
+            .is_some()
+            .then(|| crate::win::CrashReporterWatch::new(pid as u32))
+    });
     loop {
         let event = events.recv_timeout(POLL_INTERVAL);
         match event {
@@ -819,6 +838,12 @@ pub fn run_pair(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        #[cfg(windows)]
+        for (watch, exit) in crash_reporters.iter_mut().zip(&exits) {
+            if exit.is_some() {
+                *watch = None;
+            }
+        }
         if exits.iter().all(Option::is_some) {
             break;
         }
@@ -841,6 +866,8 @@ pub fn run_pair(
             }
         }
     }
+    #[cfg(windows)]
+    drop(crash_reporters);
 
     // 両方が終わった。時間の上限は、終わった時刻で判定する
     let finished_at = killed_at.unwrap_or_else(|| {
@@ -1808,6 +1835,18 @@ mod windows_tests {
             );
             assert_eq!(result.outcome, Outcome::Exited(code), "{kind}");
         }
+    }
+
+    #[test]
+    fn fast_fail_crashes_are_runtime_errors_within_the_time_limit() {
+        // 段階 2 S5c：__fastfail（0xC0000409。Rust の abort、C++ の abort・assert・捕まえない例外）は DIE では速くならず、
+        // 落ちた子が親の WerFault.exe が約 4 秒持ったままにする。IDE がその WerFault.exe を止めるので、既定の上限
+        // （2500 ms）で TLE ではなく 0xC0000409 で終わる
+        let result = run_child(
+            &["crash:abort"],
+            &limits(crate::compare::DEFAULT_TIME_LIMIT_MS, 1024 * 1024),
+        );
+        assert_eq!(result.outcome, Outcome::Exited(0xC000_0409_u32 as i32));
     }
 
     #[test]
