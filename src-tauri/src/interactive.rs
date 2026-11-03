@@ -1188,8 +1188,13 @@ int main() {
         let cases = run.cases();
         assert_eq!(cases[0]["verdict"]["kind"], "accepted");
         assert_eq!(cases[1]["verdict"]["kind"], "wrongAnswer");
+        // Windows の MinGW の exe は \r\n を出す。やり取りの記録は \r を残したまま（段階 2 S6・S8。既知の問題）
+        #[cfg(not(windows))]
         assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\n");
-        assert!(pkg.join("target/examples/judge").is_file());
+        #[cfg(windows)]
+        assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\r\n");
+        // Windows は target/examples/judge.exe（段階 2 S8）
+        assert!(crate::cpp::example_output_path(&pkg, "judge").is_file());
         let log: String = run
             .events
             .lock()

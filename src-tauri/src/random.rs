@@ -1169,10 +1169,15 @@ fn main() {
         assert_eq!(*done, 2);
         assert_eq!((failure.seed, failure.verdict.as_str()), (101, "WA"));
         assert_eq!(failure.case.as_deref(), Some("random-1"));
+        // Windows の MinGW の生成器は \r\n を出し、random-N.in にはそのまま保存する（段階 2 S6）
+        #[cfg(not(windows))]
         assert_eq!(fs::read(pkg.join("test/random-1.in")).unwrap(), b"101\n");
+        #[cfg(windows)]
+        assert_eq!(fs::read(pkg.join("test/random-1.in")).unwrap(), b"101\r\n");
         assert_eq!(fs::read(pkg.join("test/random-1.out")).unwrap(), b"202\n");
-        assert!(pkg.join("target/examples/gen").is_file());
-        assert!(pkg.join("target/examples/naive").is_file());
+        // Windows は target/examples/gen.exe・naive.exe（段階 2 S8）
+        assert!(crate::cpp::example_output_path(&pkg, "gen").is_file());
+        assert!(crate::cpp::example_output_path(&pkg, "naive").is_file());
         let text = logs(&events);
         assert!(
             text.contains("生成器 examples/gen.cpp、愚直解 examples/naive.cpp"),

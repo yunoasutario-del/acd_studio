@@ -623,6 +623,9 @@ pub fn program(interpreter: &Path, script: &str) -> Program {
         .iter()
         .map(OsString::from)
         .collect(),
+        // Python の処理系は DLL の場所を足さない（段階 2 S8 の dll_dir は C++ だけ）
+        #[cfg(windows)]
+        dll_dir: None,
     }
 }
 

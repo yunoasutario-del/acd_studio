@@ -905,7 +905,11 @@ mod tests {
         use std::io::Write;
         child.stdin.take().unwrap().write_all(b"2\n3 4\n").unwrap();
         let out = child.wait_with_output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // MinGW の g++ で作った exe は \r\n を出す（段階 2 S6・S8）
+        #[cfg(windows)]
+        let stdout = stdout.replace("\r\n", "\n");
+        assert_eq!(stdout, "7\n");
     }
 
     #[test]

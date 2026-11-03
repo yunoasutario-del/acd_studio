@@ -2340,6 +2340,10 @@ int main() {
 
     // 止まる → 変数（vector・string）→ ステップ → 式 → 続行。例外・範囲外の読み書きで止まる
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn debugs_cpp_with_real_lldb_dap() {
         if crate::cpp::find_compiler(&crate::cpp::CppSettings::default()).is_err() {
             eprintln!("g++-15 がないので飛ばします");

@@ -837,7 +837,7 @@ fn prepare_cpp<T>(
     let built = build_cpp(
         &compiler,
         dir,
-        cpp::build_args(release, &executable, settings),
+        cpp::build_args(release, &gcc_output(&executable, dir), settings),
         &executable,
         &mut diagnostics,
         cancel,
@@ -855,7 +855,7 @@ fn prepare_cpp<T>(
         let built = build_cpp(
             &compiler,
             dir,
-            cpp::build_args_for(&source, &output, settings),
+            cpp::build_args_for(&source, &gcc_output(&output, dir), settings),
             &output,
             &mut diagnostics,
             cancel,
@@ -866,11 +866,11 @@ fn prepare_cpp<T>(
             note_locked(locked.as_deref(), channel);
         }
         built?;
-        built_examples.push((name, Program::native(output)));
+        built_examples.push((name, Program::built_with(output, &compiler)));
     }
     Ok((
         Prepared {
-            executable: Program::native(executable),
+            executable: Program::built_with(executable, &compiler),
             bins,
             examples: built_examples,
         },
@@ -925,8 +925,7 @@ fn note_locked(notice: Option<&str>, channel: &Channel<RunEvent>) {
     }
 }
 
-// C++ の出力の exe（main と、要る example）。MinGW の g++ は `-o target/main` で target/main.exe を作るので、
-// `.exe` で終わっていなければ足す（S8 で output_path に `.exe` を付けたら、足さなくてよくなる）
+// C++ の出力の exe（main と、要る example）。S8 から、output_path・example_output_path が `.exe` を付ける
 #[cfg(windows)]
 fn cpp_outputs(executable: &Path, dir: &Path, examples: &[String]) -> Vec<PathBuf> {
     std::iter::once(executable.to_path_buf())
@@ -935,18 +934,6 @@ fn cpp_outputs(executable: &Path, dir: &Path, examples: &[String]) -> Vec<PathBu
                 .iter()
                 .map(|name| cpp::example_output_path(dir, name)),
         )
-        .map(|path| {
-            let is_exe = path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
-            if is_exe {
-                path
-            } else {
-                let mut name = path.into_os_string();
-                name.push(".exe");
-                PathBuf::from(name)
-            }
-        })
         .collect()
 }
 
@@ -1069,6 +1056,22 @@ fn check_python(
     }
 }
 
+// g++ の -o に渡す出力の場所。Unix は絶対パスのまま
+#[cfg(not(windows))]
+fn gcc_output(output: &Path, _dir: &Path) -> PathBuf {
+    output.to_path_buf()
+}
+
+// Windows（段階 2 S8）：g++ の -o には、パッケージのフォルダ（g++ の current_dir）からの相対パスを渡す。
+// 作業領域は canonicalize した \\?\ の形で、g++（ld）は、すでにある出力を \\?\ の形の -o では開き直せない
+// （2 回目のビルドが「cannot open output file \\main.exe」で落ちた）。dir の外なら（ない見込み）、そのまま渡す
+#[cfg(windows)]
+fn gcc_output(output: &Path, dir: &Path) -> PathBuf {
+    output
+        .strip_prefix(dir)
+        .map_or_else(|_| output.to_path_buf(), Path::to_path_buf)
+}
+
 // g++ で 1 つビルドする（パッケージのディレクトリで動かす）。診断は diagnostics に足してエラー一覧に送る
 fn build_cpp(
     compiler: &Path,
@@ -1147,6 +1150,10 @@ fn build_cpp(
 pub(crate) struct Program {
     pub path: PathBuf,
     pub args: Vec<OsString>,
+    // Windows（段階 2 S8。9.1 の追加 12）：動かすときに、子の PATH の先頭に足すフォルダ（MinGW の g++ で作った exe が
+    // 使う DLL〔libstdc++-6.dll など〕のある、コンパイラの bin）。足さないと、PATH にない機械では 0xC0000135 で落ちる
+    #[cfg(windows)]
+    pub dll_dir: Option<PathBuf>,
 }
 
 impl Program {
@@ -1155,12 +1162,37 @@ impl Program {
         Program {
             path,
             args: Vec::new(),
+            #[cfg(windows)]
+            dll_dir: None,
+        }
+    }
+
+    // C++ でビルドした実行ファイル。Unix では native と同じ
+    #[cfg(not(windows))]
+    pub(crate) fn built_with(path: PathBuf, _compiler: &Path) -> Self {
+        Program::native(path)
+    }
+
+    // Windows（段階 2 S8）：C++ でビルドした実行ファイル。コンパイラの bin を DLL の場所にする
+    #[cfg(windows)]
+    pub(crate) fn built_with(path: PathBuf, compiler: &Path) -> Self {
+        Program {
+            dll_dir: compiler.parent().map(Path::to_path_buf),
+            ..Program::native(path)
         }
     }
 
     pub(crate) fn command(&self) -> Command {
         let mut command = crate::process::command(&self.path);
         command.args(&self.args);
+        #[cfg(windows)]
+        if let Some(dir) = &self.dll_dir {
+            let inherited = std::env::var_os("PATH").unwrap_or_default();
+            let paths = std::iter::once(dir.clone()).chain(std::env::split_paths(&inherited));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                command.env("PATH", joined);
+            }
+        }
         command
     }
 }
@@ -2058,8 +2090,8 @@ mod tests {
             ..TestSettings::default()
         };
         let program = Program {
-            path: process::test_child_path(),
             args: vec!["sleep:2000".into(), "out:1".into()],
+            ..Program::native(process::test_child_path())
         };
         let started = Instant::now();
         let case = run_case(
@@ -2099,8 +2131,8 @@ mod tests {
         let settings = TestSettings::default();
         assert_eq!(settings.time_limit_ms, 2500);
         let program = Program {
-            path: process::test_child_path(),
             args: vec!["crash:access-violation".into()],
+            ..Program::native(process::test_child_path())
         };
         let case = run_case(
             dir,
@@ -2250,8 +2282,8 @@ mod tests {
         std::fs::write(dir.join("sample-2.out"), "4\n").unwrap();
         std::fs::write(dir.join("sample-3.in"), "5\n").unwrap();
         let cat = Program {
-            path: process::test_child_path(),
             args: vec!["cat".into()],
+            ..Program::native(process::test_child_path())
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let verdict = |n: u32| {
@@ -2320,6 +2352,95 @@ mod tests {
         );
     }
 
+    // 段階 2 S8（9.1 の追加 12）：C++ でビルドした exe を動かすときだけ、子の PATH の先頭にコンパイラの bin を足す。
+    // ほかのもの（Python の処理系・Rust の exe・test_child）は PATH を変えない
+    #[cfg(windows)]
+    #[test]
+    fn puts_compiler_dlls_first_on_the_path() {
+        let path_of = |program: &Program| {
+            program
+                .command()
+                .get_envs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        };
+        let compiler = Path::new(r"C:\gcc\bin\g++.exe");
+        let built = Program::built_with(PathBuf::from(r"C:\p\target\main.exe"), compiler);
+        let path = path_of(&built).expect("PATH を設定していない");
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(dirs.first(), Some(&PathBuf::from(r"C:\gcc\bin")));
+        // 今の PATH は、そのあとに続く
+        let inherited: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        assert_eq!(dirs[1..], inherited[..]);
+        assert_eq!(
+            path_of(&Program::native(PathBuf::from(r"C:\p\a.exe"))),
+            None
+        );
+        assert_eq!(
+            path_of(&crate::python::program(
+                Path::new(r"C:\py\python.exe"),
+                "main.py"
+            )),
+            None
+        );
+    }
+
+    // 段階 2 S8：パッケージのフォルダが \\?\ の形（Windows の canonicalize の結果。作業領域はこの形）でも、同じパッケージの
+    // C++ を続けてビルドできる（main と example、提出用とデバッグ用）。g++（ld）は、すでにある出力を \\?\ の形の -o では
+    // 開き直せず、2 回目が「cannot open output file \\main.exe」で落ちていた。g++ は \\?\ の形のフォルダ（current_dir）
+    // で動かし、作った exe も \\?\ の形の場所のまま動かす。g++ がなければ飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn builds_cpp_twice_in_a_verbatim_folder() {
+        if crate::cpp::local_gpp_for_test().is_none() {
+            eprintln!("g++.exe がないので飛ばします");
+            return;
+        }
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = TempDir(
+            std::env::temp_dir().join(format!("atcoder-studio-verbatim-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&temp.0);
+        std::fs::create_dir_all(temp.0.join("pkg/examples")).unwrap();
+        let dir = temp.0.join("pkg").canonicalize().unwrap();
+        assert!(dir.to_string_lossy().starts_with(r"\\?\"), "{dir:?}");
+        let source = "#include <cstdio>\nint main(){std::puts(\"1\");}\n";
+        std::fs::write(dir.join("main.cpp"), source).unwrap();
+        std::fs::write(dir.join("examples/gen.cpp"), source).unwrap();
+        let settings = CppSettings::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for release in [true, false] {
+            for round in 1..=2 {
+                let channel = Channel::new(|_| Ok(()));
+                let (prepared, ()) = prepare_cpp(
+                    &dir,
+                    release,
+                    &settings,
+                    &cancel,
+                    &channel,
+                    |_, examples| Ok(((), examples.to_vec())),
+                )
+                .unwrap_or_else(|finish| {
+                    panic!("release {release} の {round} 回目のビルドが失敗した：{finish:?}")
+                });
+                assert_eq!(prepared.examples.len(), 1);
+                for program in std::iter::once(&prepared.executable)
+                    .chain(prepared.examples.iter().map(|(_, program)| program))
+                {
+                    assert!(program.path.to_string_lossy().starts_with(r"\\?\"));
+                    let output = program.command().output().unwrap();
+                    assert_eq!(output.stdout, b"1\r\n", "{:?}", program.path);
+                }
+            }
+        }
+    }
+
     // 段階 2 S3b：C++ の出力の exe の場所
     #[cfg(windows)]
     #[test]
@@ -2332,7 +2453,7 @@ mod tests {
                 PathBuf::from(r"C:\p\abc_a\target\examples\gen.exe"),
             ]
         );
-        // すでに .exe で終わっていれば足さない
+        // 渡した場所はそのまま（.exe は output_path・example_output_path が付ける。S8）
         assert_eq!(
             cpp_outputs(Path::new(r"C:\p\x\main.EXE"), dir, &[]),
             vec![PathBuf::from(r"C:\p\x\main.EXE")]
