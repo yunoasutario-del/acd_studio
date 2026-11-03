@@ -8,8 +8,8 @@
 // - 時刻：UNIX 時刻（ミリ秒）を手元の時刻の月・日・時・分にする（Unix の localtime_r にあたる）
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process::Child;
@@ -17,8 +17,8 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, SYSTEMTIME,
-    WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
@@ -37,6 +37,9 @@ use windows_sys::Win32::System::JobObjects::{
     TerminateJobObject,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, OpenThread,
     PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -652,6 +655,67 @@ pub fn wait_until_writable(path: &Path, limit: Duration) -> bool {
             Err(_) => return true,
         }
     }
+}
+
+// ---- レジストリ（段階 2 S7。読むだけで、書かない） ----
+
+// 読むキーの根
+#[derive(Debug, Clone, Copy)]
+pub enum RegistryRoot {
+    CurrentUser,
+    LocalMachine,
+}
+
+// root の subkey の value（None なら既定の値）の文字列（REG_SZ）を、64 ビットの見え方で読む。
+// キー・値がない、文字列でない、読めないときは None
+pub fn registry_string(root: RegistryRoot, subkey: &str, value: Option<&str>) -> Option<OsString> {
+    let root = match root {
+        RegistryRoot::CurrentUser => HKEY_CURRENT_USER,
+        RegistryRoot::LocalMachine => HKEY_LOCAL_MACHINE,
+    };
+    let subkey = wide(Path::new(subkey));
+    let value = value.map(|value| wide(Path::new(value)));
+    let value_ptr = value
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    let flags = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY;
+    let mut size: u32 = 0;
+    // SAFETY: 終わりに 0 の付いた UTF-16 の名前（値の名前は null でもよい）と、大きさの書き込み先を渡す。データは受け取らない
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            subkey.as_ptr(),
+            value_ptr,
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS || size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    // SAFETY: 上と同じ名前と、size バイトの書き込み先とその大きさを渡す
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            subkey.as_ptr(),
+            value_ptr,
+            flags,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    Some(OsString::from_wide(&buffer[..length]))
 }
 
 // ---- ファイル ----

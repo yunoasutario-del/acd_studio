@@ -1284,7 +1284,11 @@ while True:
             let cases = run.cases();
             assert_eq!(cases[0]["verdict"]["kind"], "accepted");
             assert_eq!(cases[1]["verdict"]["kind"], "wrongAnswer");
+            // Windows の Python は \r\n を出す。やり取りの記録は \r を残したまま（段階 2 S6・S7。既知の問題）
+            #[cfg(not(windows))]
             assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\n");
+            #[cfg(windows)]
+            assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\r\n");
             let log: String = run
                 .events
                 .lock()

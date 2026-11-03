@@ -1314,4 +1314,90 @@ fn main() {
             "{finish:?}"
         );
     }
+
+    // 上の Windows 版（段階 2 S7）。手元の CPython 3.13 を、設定なしで（PEP 514 のレジストリから）見つけて動かす。
+    // レジストリにない機械では飛ばす。生成器の出力（\r\n）は random-N.in にそのまま、愚直解の出力は \n に直して
+    // random-N.out に保存する（S6）。ジャッジと違う版を断ることは、ほかの版が手元にないので確かめない
+    #[cfg(windows)]
+    #[test]
+    fn finds_differences_with_python_programs_on_windows() {
+        if crate::python::registry_cpython_for_test().is_none() {
+            eprintln!("レジストリに CPython 3.13 がないので飛ばします");
+            return;
+        }
+        let ws = workspace("python-windows");
+        let langs = LangSettings::default();
+        let pkg = ws.0.join("pkg");
+        write(
+            &pkg.join("main.py"),
+            "n = int(input())\nprint(n * 2 + 1 if n % 7 == 3 else n * 2)\n",
+        );
+        write(
+            &pkg.join("examples/naive.py"),
+            "n = int(input())\nprint(n * 2)\n",
+        );
+        write(
+            &pkg.join("examples/gen.py"),
+            "import sys\nprint(int(sys.argv[1]))\n",
+        );
+        let target = Target {
+            package: "pkg".to_string(),
+            bin: crate::python::BIN.to_string(),
+            language: crate::language::Language::Python,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run = |langs: &LangSettings| {
+            let (channel, events) = collecting_channel(|_| {});
+            let finish = random_target(&pkg, &ws.0, &target, langs, 100, &cancel, &channel);
+            (finish, events)
+        };
+
+        // seed 101 で WA になり、random-1 に保存する
+        let (finish, events) = run(&langs);
+        let Finish::RandomTested {
+            done,
+            failure: Some(failure),
+            ..
+        } = &finish
+        else {
+            panic!("{finish:?}\n{}", logs(&events));
+        };
+        assert_eq!(*done, 2);
+        assert_eq!((failure.seed, failure.verdict.as_str()), (101, "WA"));
+        assert_eq!(fs::read(pkg.join("test/random-1.in")).unwrap(), b"101\r\n");
+        assert_eq!(fs::read(pkg.join("test/random-1.out")).unwrap(), b"202\n");
+        let text = logs(&events);
+        assert!(text.contains("ローカル：Python 3.13."), "{text}");
+        assert!(
+            text.contains("生成器 examples/gen.py、愚直解 examples/naive.py"),
+            "{text}"
+        );
+        // __pycache__ を作らない（-B・compile だけの確かめ）
+        assert!(!pkg.join("__pycache__").exists());
+        assert!(!pkg.join("examples/__pycache__").exists());
+
+        // 愚直解がない：Python の名前で案内する
+        fs::rename(pkg.join("examples/naive.py"), pkg.join("naive.bak")).unwrap();
+        let (finish, _) = run(&langs);
+        assert!(
+            matches!(&finish, Finish::Failed { message } if message.contains("examples/main_naive.py") && message.contains("examples/naive.py")),
+            "{finish:?}"
+        );
+        fs::rename(pkg.join("naive.bak"), pkg.join("examples/naive.py")).unwrap();
+
+        // 生成器に構文の誤り：CE。エラー一覧に、生成器のファイルの場所と行が出る
+        write(
+            &pkg.join("examples/gen.py"),
+            "import sys\nif True\n    print(1)\n",
+        );
+        let (finish, events) = run(&langs);
+        assert!(matches!(finish, Finish::CompileError), "{finish:?}");
+        let events = events.lock().unwrap();
+        let diagnostics = events
+            .iter()
+            .rfind(|event| event["type"] == "diagnostics")
+            .unwrap();
+        assert_eq!(diagnostics["items"][0]["file"], "examples/gen.py");
+        assert_eq!(diagnostics["items"][0]["line"], 2);
+    }
 }
