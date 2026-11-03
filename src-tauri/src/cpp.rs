@@ -251,6 +251,10 @@ fn build_args_with(
     ac_library: Option<&Path>,
 ) -> Vec<String> {
     let mut args = flags_with(release, sdk, ac_library);
+    // Windows（段階 2 S9）：主スレッドのスタックを 1 GiB にする。ビルドの命令だけに付け、flags_with（clangd の解析の命令と
+    // 共通）には入れない
+    #[cfg(windows)]
+    args.push(format!("-Wl,--stack,{}", crate::toolchain::STACK_SIZE));
     args.extend([
         "-o".into(),
         output.to_string_lossy().into_owned(),
@@ -700,6 +704,42 @@ mod tests {
             find_compiler_on_windows(Some(&path_var), &fixed),
             Some(path_dir.join("g++.exe"))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sets_the_stack_size_only_for_builds_on_windows() {
+        // 段階 2 S9：スタックの大きさ（-Wl,--stack,1073741824）は、ビルドの命令（提出用・デバッグ用・example）だけに付け、
+        // clangd に渡す解析の命令と compile_flags.txt には付けない（リンクの引数なので）
+        let stack = "-Wl,--stack,1073741824";
+        let output = Path::new(r"C:\p\target\main.exe");
+        let settings = CppSettings::default();
+        assert!(
+            build_args(true, output, &settings)
+                .iter()
+                .any(|arg| arg == stack)
+        );
+        assert!(
+            build_args(false, output, &settings)
+                .iter()
+                .any(|arg| arg == stack)
+        );
+        assert!(
+            build_args_for("examples/gen.cpp", output, &settings)
+                .iter()
+                .any(|arg| arg == stack)
+        );
+        let analysis = analysis_command_with(
+            Path::new(r"C:\gcc\bin\g++.exe"),
+            Path::new(r"C:\p\main.cpp"),
+            None,
+            None,
+        );
+        assert!(
+            !analysis.iter().any(|arg| arg.contains("--stack")),
+            "{analysis:?}"
+        );
+        assert!(!compile_flags(None).contains("--stack"));
     }
 
     #[cfg(windows)]

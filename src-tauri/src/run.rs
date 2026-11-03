@@ -664,6 +664,26 @@ pub(crate) fn prepare<T>(
     {
         info(channel, "ローカルの rustc の版がジャッジと異なります。\n");
     }
+    // Windows：スタックの大きさ（段階 2 S9）。rustc のホストに合わせてリンクの引数を決める。分からなければ付けない
+    #[cfg(windows)]
+    let link_arg = {
+        let host = toolchain::rustc_host(&cargo, dir);
+        let link_arg = host.as_deref().and_then(toolchain::rust_stack_link_arg);
+        match (&link_arg, &host) {
+            (Some(_), _) => info(channel, format!("{}\n", toolchain::stack_note())),
+            (None, Some(host)) => info(
+                channel,
+                format!(
+                    "このツールチェーン（{host}）では、スタックの大きさを変えていません（既定のまま）\n"
+                ),
+            ),
+            (None, None) => info(
+                channel,
+                "rustc のホストが分からないので、スタックの大きさを変えていません（既定のまま）\n",
+            ),
+        }
+        link_arg
+    };
 
     // バイナリの一覧（D-106 のテストのフォルダに使う）と example の一覧（ランダムテストの生成器・愚直解。D-143）
     // metadata は、Windows でビルドの前に出力の exe の場所を求めるのにも使う（段階 2 S3b）
@@ -696,73 +716,90 @@ pub(crate) fn prepare<T>(
 
     // ビルド（D-089）。時間の上限は設けない（D-096）
     info(channel, "\nビルドしています…\n");
-    let mut build = toolchain::cargo_command(&cargo, dir);
-    build.arg("build");
-    if release {
-        build.arg("--release");
-    }
-    build.args(["--bin", &target.bin, "--message-format=json"]);
-    for name in &wanted_examples {
-        build.args(["--example", name]);
-    }
-    let mut build_log = Display::new(channel, LogKind::Build, "ビルドの出力");
-    let built = process::run(
-        build,
-        None,
-        &Limits {
-            time: None,
-            output: OUTPUT_LIMIT,
-            memory: None,
-        },
-        cancel,
-        |stream, bytes| {
-            if stream == Stream::Stderr {
-                build_log.output(bytes);
-            }
-        },
+    #[cfg(not(windows))]
+    let builds = cargo_builds(&cargo, dir, release, &target.bin, &wanted_examples);
+    #[cfg(windows)]
+    let builds = cargo_rustc_builds(
+        &cargo,
+        dir,
+        release,
+        &target.bin,
+        &wanted_examples,
+        link_arg.as_deref(),
     );
-    let built = match built {
-        Ok(built) => built,
-        Err(message) => return Err(Finish::Failed { message }),
-    };
-    let build_stdout = String::from_utf8_lossy(&built.stdout).into_owned();
-    let (diagnostics, executable) = parse_build_output(&build_stdout, &target.bin);
-    let has_errors = diagnostics.iter().any(|item| item.level == "error");
-    send(channel, RunEvent::Diagnostics { items: diagnostics });
-    match built.outcome {
-        Outcome::Exited(0) => {}
-        Outcome::Stopped => {
-            info(channel, format!("ビルドを止めました。{NOT_CHECKED}\n"));
-            return Err(Finish::BuildStopped);
+    let mut build_log = Display::new(channel, LogKind::Build, "ビルドの出力");
+    // 命令の標準出力をつないだもの（1 行に 1 つの JSON）
+    let mut build_stdout = String::new();
+    for build in builds {
+        let built = process::run(
+            build,
+            None,
+            &Limits {
+                time: None,
+                output: OUTPUT_LIMIT,
+                memory: None,
+            },
+            cancel,
+            |stream, bytes| {
+                if stream == Stream::Stderr {
+                    build_log.output(bytes);
+                }
+            },
+        );
+        let built = match built {
+            Ok(built) => built,
+            Err(message) => return Err(Finish::Failed { message }),
+        };
+        let stdout = String::from_utf8_lossy(&built.stdout);
+        #[cfg(not(windows))]
+        build_stdout.push_str(&stdout);
+        #[cfg(windows)]
+        append_new_messages(&mut build_stdout, &stdout);
+        if built.outcome == Outcome::Exited(0) {
+            continue;
         }
-        Outcome::Exited(_) if has_errors => {
-            info(
-                channel,
-                "ビルドに失敗しました。エラー一覧を見てください。\n",
-            );
-            #[cfg(windows)]
-            note_locked(locked.as_deref(), channel);
-            return Err(Finish::CompileError);
-        }
-        // コンパイルエラーではない失敗（ツールチェーンの解決、Cargo.toml の誤りなど）。
-        // cargo の出力は実行ログに出ている
-        Outcome::Exited(_) => {
-            info(
-                channel,
-                format!("ビルドに失敗しました。\n{TOOLCHAIN_HINT}\n"),
-            );
-            #[cfg(windows)]
-            note_locked(locked.as_deref(), channel);
-            return Err(Finish::Failed {
-                message: "ビルドに失敗しました（実行ログを見てください）".to_string(),
-            });
-        }
-        other => {
-            return Err(Finish::Failed {
-                message: format!("ビルドが異常に終わりました（{other:?}）"),
-            });
+        // 失敗した（止めた）：それまでの診断を 1 回だけ送る（通ったときは、全部の命令のあとで送る。段階 2 S9）
+        let (diagnostics, _) = parse_build_output(&build_stdout, &target.bin);
+        let has_errors = diagnostics.iter().any(|item| item.level == "error");
+        send(channel, RunEvent::Diagnostics { items: diagnostics });
+        match built.outcome {
+            Outcome::Exited(0) => {}
+            Outcome::Stopped => {
+                info(channel, format!("ビルドを止めました。{NOT_CHECKED}\n"));
+                return Err(Finish::BuildStopped);
+            }
+            Outcome::Exited(_) if has_errors => {
+                info(
+                    channel,
+                    "ビルドに失敗しました。エラー一覧を見てください。\n",
+                );
+                #[cfg(windows)]
+                note_locked(locked.as_deref(), channel);
+                return Err(Finish::CompileError);
+            }
+            // コンパイルエラーではない失敗（ツールチェーンの解決、Cargo.toml の誤りなど）。
+            // cargo の出力は実行ログに出ている
+            Outcome::Exited(_) => {
+                info(
+                    channel,
+                    format!("ビルドに失敗しました。\n{TOOLCHAIN_HINT}\n"),
+                );
+                #[cfg(windows)]
+                note_locked(locked.as_deref(), channel);
+                return Err(Finish::Failed {
+                    message: "ビルドに失敗しました（実行ログを見てください）".to_string(),
+                });
+            }
+            other => {
+                return Err(Finish::Failed {
+                    message: format!("ビルドが異常に終わりました（{other:?}）"),
+                });
+            }
         }
     }
+    // 全部の命令が通った：診断（警告）を 1 回だけ送る
+    let (diagnostics, executable) = parse_build_output(&build_stdout, &target.bin);
+    send(channel, RunEvent::Diagnostics { items: diagnostics });
     let Some(executable) = executable else {
         return Err(Finish::Failed {
             message: "ビルドした実行ファイルの場所が分かりません".to_string(),
@@ -788,6 +825,74 @@ pub(crate) fn prepare<T>(
     ))
 }
 
+// Rust のビルドの命令の並び：`cargo build [--release] --bin <名前> --message-format=json --example <名前>…` の 1 つ
+#[cfg(not(windows))]
+fn cargo_builds(
+    cargo: &Path,
+    dir: &Path,
+    release: bool,
+    bin: &str,
+    examples: &[String],
+) -> Vec<Command> {
+    let mut build = toolchain::cargo_command(cargo, dir);
+    build.arg("build");
+    if release {
+        build.arg("--release");
+    }
+    build.args(["--bin", bin, "--message-format=json"]);
+    for name in examples {
+        build.args(["--example", name]);
+    }
+    vec![build]
+}
+
+// Windows（段階 2 S9。9.1 の追加 7）：Rust のビルドの命令の並び。bin と example を 1 つずつ
+// `cargo rustc [--release] --bin|--example <名前> --message-format=json -- -C link-arg=<スタック>` でビルドする
+// （`--` の後ろの引数は 1 つの対象にしか渡せないため。5.3）。リンクの引数は、その対象だけに付き、依存には付かない
+#[cfg(windows)]
+fn cargo_rustc_builds(
+    cargo: &Path,
+    dir: &Path,
+    release: bool,
+    bin: &str,
+    examples: &[String],
+    link_arg: Option<&str>,
+) -> Vec<Command> {
+    std::iter::once(("--bin", bin))
+        .chain(examples.iter().map(|name| ("--example", name.as_str())))
+        .map(|(kind, name)| {
+            let mut build = toolchain::cargo_command(cargo, dir);
+            build.arg("rustc");
+            if release {
+                build.arg("--release");
+            }
+            build.args([kind, name, "--message-format=json"]);
+            if let Some(arg) = link_arg {
+                build.args(["--", "-C", &format!("link-arg={arg}")]);
+            }
+            build
+        })
+        .collect()
+}
+
+// Windows（段階 2 S9）：cargo rustc の標準出力を、それまでのものにつなぐ。同じ診断の行（compiler-message）がすでに
+// あれば足さない（bin と example が同じライブラリを使うと、cargo はそのライブラリの警告を、命令ごとに出し直すため。
+// 除かないと、エラー一覧に同じ警告が 2 回出ることをテストで確かめた）
+#[cfg(windows)]
+fn append_new_messages(all: &mut String, stdout: &str) {
+    let mut added = String::new();
+    for line in stdout.lines() {
+        let is_message = serde_json::from_str::<CargoMessage>(line)
+            .is_ok_and(|message| message.reason == "compiler-message");
+        if is_message && all.lines().any(|seen| seen == line) {
+            continue;
+        }
+        added.push_str(line);
+        added.push('\n');
+    }
+    all.push_str(&added);
+}
+
 // C++ の準備（Phase 16 作業 1。D-205）：コンパイラと版を示し、g++ でビルドする。
 // バイナリの一覧は main だけ。example は examples/*.cpp（ランダムテスト・対話テスト。Phase 17 作業 7。D-212）
 fn prepare_cpp<T>(
@@ -810,6 +915,9 @@ fn prepare_cpp<T>(
         info(channel, "ローカルの GCC の版がジャッジと異なります。\n");
     }
     info(channel, format!("{}\n", cpp::NOT_LIKE_JUDGE));
+    // Windows：スタックの大きさ（段階 2 S9）
+    #[cfg(windows)]
+    info(channel, format!("{}\n", toolchain::stack_note()));
     // AC Library（D-206）
     match &settings.ac_library {
         Some(dir) => info(channel, format!("AC Library：{}\n", dir.display())),
@@ -2439,6 +2547,362 @@ mod tests {
                 }
             }
         }
+    }
+
+    // 段階 2 S9：exe の PE ヘッダー（PE32+）の SizeOfStackReserve（主スレッドのスタックの予約の大きさ）
+    #[cfg(windows)]
+    fn stack_reserve(path: &Path) -> u64 {
+        let bytes = std::fs::read(path).unwrap();
+        let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[pe..pe + 4], b"PE\0\0", "{path:?}");
+        let optional = pe + 4 + 20;
+        assert_eq!(
+            u16::from_le_bytes(bytes[optional..optional + 2].try_into().unwrap()),
+            0x20b,
+            "PE32+ ではない：{path:?}"
+        );
+        u64::from_le_bytes(bytes[optional + 72..optional + 80].try_into().unwrap())
+    }
+
+    // 段階 2 S9：テスト用の一時フォルダ（捨てるときに消す）と、そのパッケージのフォルダ（canonicalize した \\?\ の形）
+    #[cfg(windows)]
+    struct StackDir(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for StackDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn stack_dir(name: &str) -> (StackDir, PathBuf) {
+        let temp = StackDir(std::env::temp_dir().join(format!(
+            "atcoder-studio-stack-{name}-{}",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_dir_all(&temp.0);
+        std::fs::create_dir_all(temp.0.join("pkg")).unwrap();
+        let dir = temp.0.join("pkg").canonicalize().unwrap();
+        (temp, dir)
+    }
+
+    // 段階 2 S9：C++ でビルドした exe（main・example、提出用・デバッグ用）のスタックは 1 GiB。約 100 MB の深い再帰
+    // （1 KiB ずつ 10 万段）が、既定（2 MiB）では 0xC00000FD で落ち、1 GiB なら通る。g++ がなければ飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn cpp_programs_get_a_large_stack_on_windows() {
+        if crate::cpp::local_gpp_for_test().is_none() {
+            eprintln!("g++.exe がないので飛ばします");
+            return;
+        }
+        let (_temp, dir) = stack_dir("cpp");
+        let source = "#include <bits/stdc++.h>\nint f(int n) {\n    volatile char buf[1024];\n    buf[0] = (char)n;\n    return n == 0 ? 0 : f(n - 1) + (buf[0] & 1);\n}\nint main() {\n    std::cout << f(100000) << std::endl;\n}\n";
+        std::fs::create_dir_all(dir.join("examples")).unwrap();
+        std::fs::write(dir.join("main.cpp"), source).unwrap();
+        std::fs::write(dir.join("examples/gen.cpp"), source).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for release in [true, false] {
+            let channel = Channel::new(|_| Ok(()));
+            let (prepared, ()) = prepare_cpp(
+                &dir,
+                release,
+                &CppSettings::default(),
+                &cancel,
+                &channel,
+                |_, examples| Ok(((), examples.to_vec())),
+            )
+            .unwrap_or_else(|finish| panic!("release {release}：{finish:?}"));
+            for program in std::iter::once(&prepared.executable)
+                .chain(prepared.examples.iter().map(|(_, program)| program))
+            {
+                // Job に入れて動かす（process::run。落ちても WER のダンプを残さず、すぐ終わる。S5b・S5c）
+                let result = process::run(
+                    program.command(),
+                    None,
+                    &Limits {
+                        time: Some(Duration::from_secs(20)),
+                        output: 1 << 20,
+                        memory: None,
+                    },
+                    &Arc::new(AtomicBool::new(false)),
+                    |_, _| {},
+                )
+                .unwrap();
+                assert_eq!(
+                    result.outcome,
+                    Outcome::Exited(0),
+                    "release {release}：{:?}",
+                    program.path
+                );
+                assert_eq!(
+                    stack_reserve(&program.path),
+                    1 << 30,
+                    "release {release}：{:?}",
+                    program.path
+                );
+            }
+        }
+    }
+
+    // 段階 2 S9：Rust でビルドした exe（bin・example、提出用・デバッグ用）のスタックは 1 GiB（この機械の rustc は
+    // x86_64-pc-windows-msvc で、/STACK を付ける）。約 100 MB の深い再帰が、既定（1 MiB）では 0xC00000FD で落ち、
+    // 1 GiB なら通る。cargo がなければ飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn rust_programs_get_a_large_stack_on_windows() {
+        if toolchain::find_cargo().is_none() {
+            eprintln!("cargo がないので飛ばします");
+            return;
+        }
+        let (_temp, dir) = stack_dir("rust");
+        let source = "fn f(n: u32) -> u64 {\n    let buf = std::hint::black_box([n as u8; 1024]);\n    if n == 0 { 0 } else { f(n - 1) + (buf[0] & 1) as u64 }\n}\nfn main() {\n    println!(\"{}\", f(100000));\n}\n";
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("examples")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"deep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/main.rs"), source).unwrap();
+        std::fs::write(dir.join("examples/gen.rs"), source).unwrap();
+        let target = Target {
+            package: "pkg".to_string(),
+            bin: "deep".to_string(),
+            language: Language::Rust,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        for release in [true, false] {
+            let channel = Channel::new(|_| Ok(()));
+            let (prepared, ()) = prepare(
+                &dir,
+                &target,
+                release,
+                &LangSettings::default(),
+                &cancel,
+                &channel,
+                |_, _| Ok(((), vec!["gen".to_string()])),
+            )
+            .unwrap_or_else(|finish| panic!("release {release}：{finish:?}"));
+            assert_eq!(prepared.examples.len(), 1);
+            for program in std::iter::once(&prepared.executable)
+                .chain(prepared.examples.iter().map(|(_, program)| program))
+            {
+                // Job に入れて動かす（process::run。落ちても WER のダンプを残さず、すぐ終わる。S5b・S5c）
+                let result = process::run(
+                    program.command(),
+                    None,
+                    &Limits {
+                        time: Some(Duration::from_secs(20)),
+                        output: 1 << 20,
+                        memory: None,
+                    },
+                    &Arc::new(AtomicBool::new(false)),
+                    |_, _| {},
+                )
+                .unwrap();
+                assert_eq!(
+                    result.outcome,
+                    Outcome::Exited(0),
+                    "release {release}：{:?}",
+                    program.path
+                );
+                assert_eq!(
+                    stack_reserve(&program.path),
+                    1 << 30,
+                    "release {release}：{:?}",
+                    program.path
+                );
+            }
+        }
+    }
+
+    // 段階 2 S9（9.1 の追加 7）：bin と example を 1 つずつ cargo rustc でビルドしても、
+    // (1) 依存（パスで指定したライブラリ）は、IDE のビルドと利用者の `cargo build` を交互にしても作り直さない
+    // (2) bin と example が同じライブラリを使うとき、そのライブラリの警告は、エラー一覧に 1 回だけ出る
+    // cargo がなければ飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn keeps_dependencies_and_reports_warnings_once_on_windows() {
+        let Some(cargo) = toolchain::find_cargo() else {
+            eprintln!("cargo がないので飛ばします");
+            return;
+        };
+        let (temp, dir) = stack_dir("deps");
+        let helper = temp.0.join("helper");
+        std::fs::create_dir_all(helper.join("src")).unwrap();
+        std::fs::write(
+            helper.join("Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(helper.join("src/lib.rs"), "pub fn two() -> u32 { 2 }\n").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("examples")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"deep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\n\n[workspace]\n",
+        )
+        .unwrap();
+        // パッケージのライブラリに、警告（使っていない変数）を 1 つ置く
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn value() -> u32 { let unused = 1; helper::two() }\n",
+        )
+        .unwrap();
+        let main = "fn main() { println!(\"{}\", deep::value()); }\n";
+        std::fs::write(dir.join("src/main.rs"), main).unwrap();
+        std::fs::write(dir.join("examples/gen.rs"), main).unwrap();
+        let target = Target {
+            package: "pkg".to_string(),
+            bin: "deep".to_string(),
+            language: Language::Rust,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let build_in_ide = || {
+            let events = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let sink = events.clone();
+            let channel = Channel::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    sink.lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&text).unwrap());
+                }
+                Ok(())
+            });
+            prepare(
+                &dir,
+                &target,
+                true,
+                &LangSettings::default(),
+                &cancel,
+                &channel,
+                |_, _| Ok(((), vec!["gen".to_string()])),
+            )
+            .unwrap_or_else(|finish| panic!("{finish:?}"));
+            let events = events.lock().unwrap();
+            let diagnostics: Vec<&serde_json::Value> = events
+                .iter()
+                .filter(|event| event["type"] == "diagnostics")
+                .collect();
+            // 診断の知らせは、命令がいくつあっても 1 回だけ
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            diagnostics[0]["items"].clone()
+        };
+        let helper_rlibs = || {
+            let mut found: Vec<(PathBuf, std::time::SystemTime)> =
+                std::fs::read_dir(dir.join("target/release/deps"))
+                    .unwrap()
+                    .flatten()
+                    .filter(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        name.starts_with("libhelper-") && name.ends_with(".rlib")
+                    })
+                    .map(|entry| (entry.path(), entry.metadata().unwrap().modified().unwrap()))
+                    .collect();
+            found.sort();
+            found
+        };
+
+        // 1 回目の IDE のビルド：ライブラリの警告は 1 回だけ
+        let items = build_in_ide();
+        let unused = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                item["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unused")
+            })
+            .count();
+        assert_eq!(unused, 1, "{items:#}");
+        let before = helper_rlibs();
+        assert_eq!(before.len(), 1, "{before:?}");
+
+        // 利用者がターミナルで cargo build を動かしたことにあたる：依存は作り直さない（fresh）
+        let output = toolchain::cargo_command(&cargo, &dir)
+            .args([
+                "build",
+                "--release",
+                "--bin",
+                "deep",
+                "--message-format=json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let helper_fresh = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|message| {
+                message["reason"] == "compiler-artifact" && message["target"]["name"] == "helper"
+            })
+            .map(|message| message["fresh"].clone());
+        assert_eq!(helper_fresh, Some(serde_json::Value::Bool(true)));
+
+        // 2 回目の IDE のビルド：依存の .rlib は書き換わらない
+        build_in_ide();
+        assert_eq!(helper_rlibs(), before);
+    }
+
+    // 段階 2 S9：bin のビルドは通り、example にコンパイルエラーがあるとき、CE になり、診断の知らせは 1 回だけで、
+    // その 1 つ目が example の場所（命令ごとに送ると、1 回目は bin が通った時点の空の一覧になる）。cargo がなければ飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn sends_diagnostics_once_when_an_example_fails_on_windows() {
+        if toolchain::find_cargo().is_none() {
+            eprintln!("cargo がないので飛ばします");
+            return;
+        }
+        let (_temp, dir) = stack_dir("diagnostics");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("examples")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"deep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.join("examples/gen.rs"),
+            "fn main() { let x: i32 = \"a\"; }\n",
+        )
+        .unwrap();
+        let target = Target {
+            package: "pkg".to_string(),
+            bin: "deep".to_string(),
+            language: Language::Rust,
+        };
+        let events = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = events.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            Ok(())
+        });
+        let finish = prepare(
+            &dir,
+            &target,
+            true,
+            &LangSettings::default(),
+            &Arc::new(AtomicBool::new(false)),
+            &channel,
+            |_, _| Ok(((), vec!["gen".to_string()])),
+        )
+        .err();
+        assert!(matches!(finish, Some(Finish::CompileError)), "{finish:?}");
+        let events = events.lock().unwrap();
+        let diagnostics: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "diagnostics")
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0]["items"][0]["file"], "examples/gen.rs");
     }
 
     // 段階 2 S3b：C++ の出力の exe の場所
