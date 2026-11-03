@@ -210,6 +210,12 @@ pub(crate) fn save_case(
     if input.len() as u64 > MAX_FILE_SIZE || expected.len() as u64 > MAX_FILE_SIZE {
         return Err("入力か期待出力が 1 MB を超えるので保存できません".to_string());
     }
+    // Windows だけ（段階 2 S6）：期待出力（愚直解の出力）は、\r のすぐあとに \n が来る組だけを \n に直して保存する
+    // （\r だけのものは残す）。入力（生成器の出力）は、解答に渡したそのままを残す（同じ失敗を起こし直せるように）
+    #[cfg(windows)]
+    let normalized = crate::compare::crlf_to_lf(expected);
+    #[cfg(windows)]
+    let expected = normalized.as_slice();
     ensure_inside(root, folder)?;
     fs::create_dir_all(folder).map_err(|error| format!("テストのフォルダを作れません：{error}"))?;
     ensure_inside(root, folder)?;
@@ -706,6 +712,27 @@ mod tests {
         assert!(save_case(&ws.0, &folder, &big, b"1").is_err());
         assert!(save_case(&ws.0, &folder, b"1", &big).is_err());
         assert!(!folder.join("random-11.in").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saves_expected_output_of_failed_cases_with_lf_on_windows() {
+        // 段階 2 S6：Windows では、愚直解の出力（random-N.out）の \r\n を \n に直して保存する（\r だけのものは残す）。
+        // 生成器の出力（random-N.in）は、解答に渡したそのままを残す（同じ失敗を起こし直せるように）
+        let ws = workspace("save-crlf");
+        let folder = ws.0.join("pkg/test");
+        assert_eq!(
+            save_case(&ws.0, &folder, b"5\r\n", b"1\r2\r\n10\r\n"),
+            Ok(Saved {
+                name: "random-1".to_string(),
+                existing: false
+            })
+        );
+        assert_eq!(fs::read(folder.join("random-1.in")).unwrap(), b"5\r\n");
+        assert_eq!(
+            fs::read(folder.join("random-1.out")).unwrap(),
+            b"1\r2\n10\n"
+        );
     }
 
     #[cfg(unix)]
