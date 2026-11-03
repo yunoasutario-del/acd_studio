@@ -150,8 +150,9 @@ pub(crate) enum JobStep {
     Resume,
 }
 
-// CREATE_SUSPENDED で起動した子を Job に入れ、主スレッドを再開する。失敗したら子を止めて（止まったまま残さない）エラーにする
-pub fn start_in_job(child: &Child) -> Result<(), String> {
+// CREATE_SUSPENDED で起動した子を Job に入れ、主スレッドを再開する。再開し終わった時刻を返す（実行時間はここから数える。
+// 段階 2 S5d）。失敗したら子を止めて（止まったまま残さない）エラーにする
+pub fn start_in_job(child: &Child) -> Result<Instant, String> {
     start_in_job_with(child, |_| false)
 }
 
@@ -159,36 +160,67 @@ pub fn start_in_job(child: &Child) -> Result<(), String> {
 pub(crate) fn start_in_job_with(
     child: &Child,
     fail: impl Fn(JobStep) -> bool,
-) -> Result<(), String> {
-    let process = child.as_raw_handle() as HANDLE;
-    // 失敗したら子を止める。Job を閉じる前に止める（先に Job を閉じると KILL_ON_JOB_CLOSE で止まり、終了コードが 0 になる）
-    let stop = |message: String| {
-        // SAFETY: Child が持つ、まだ開いているプロセスのハンドルを渡す
-        unsafe {
-            TerminateProcess(process, KILLED_EXIT_CODE);
+) -> Result<Instant, String> {
+    start_all_in_jobs_with(&[child], |_, step| fail(step)).map_err(|(_, message)| message)
+}
+
+// CREATE_SUSPENDED で起動した子をいくつか（run_pair の解答とジャッジ）、それぞれの Job に入れてから、スレッドの一覧を 1 回だけ
+// 取って続けて再開する（段階 2 S5d）。再開し終わった時刻を返す。どれか 1 つでも、Job を作る・入れる・再開するのに失敗したら、
+// すべての子を止めて、失敗した子の番号とエラーを返す（再開したあとの子も止める。止まったまま残さない）
+pub fn start_all_in_jobs(children: &[&Child]) -> Result<Instant, (usize, String)> {
+    start_all_in_jobs_with(children, |_, _| false)
+}
+
+// fail が true を返した子の番号と段階で失敗したことにする（テスト用。本番は常に false）
+pub(crate) fn start_all_in_jobs_with(
+    children: &[&Child],
+    fail: impl Fn(usize, JobStep) -> bool,
+) -> Result<Instant, (usize, String)> {
+    // 作った Job のハンドル。作ったらすぐここに入れ、失敗したときは子を止めたあとで閉じる（途中の失敗で先に閉じると、
+    // Job に入れたあとの子が KILL_ON_JOB_CLOSE で止まり、終了コードが 0 になる。S5d のテストで見つけた）
+    let mut made: Vec<Handle> = Vec::with_capacity(children.len());
+    // それぞれの子のプロセスのハンドルの写し
+    let mut copies: Vec<Handle> = Vec::with_capacity(children.len());
+    let mut start = || {
+        for (index, child) in children.iter().enumerate() {
+            let process = child.as_raw_handle() as HANDLE;
+            made.push(create_job(&|step| fail(index, step)).map_err(|message| (index, message))?);
+            enter_job(&made[index], process, &|step| fail(index, step))
+                .map_err(|message| (index, message))?;
+            copies.push(duplicate_process(process).map_err(|message| (index, message))?);
         }
-        Err(message)
+        let pids: Vec<u32> = children.iter().map(|child| child.id()).collect();
+        resume_threads(&pids, &fail)?;
+        Ok(Instant::now())
     };
-    let job = match create_job(&fail) {
-        Ok(job) => job,
-        Err(message) => return stop(message),
-    };
-    if let Err(message) = enter_job(&job, process, child.id(), &fail) {
-        // job はこのあと（子を止めたあと）閉じる
-        return stop(message);
+    match start() {
+        Ok(at) => {
+            let mut jobs = jobs();
+            for (child, (job, copy)) in children.iter().zip(made.into_iter().zip(copies)) {
+                jobs.insert(
+                    child.id(),
+                    Job {
+                        job: Some(job),
+                        process: copy,
+                    },
+                );
+            }
+            Ok(at)
+        }
+        Err(error) => {
+            // すべての子を止める。Job を閉じる前に止める（先に Job を閉じると KILL_ON_JOB_CLOSE で止まり、終了コードが 0 に
+            // なる）。Job は、このあと made を捨てるときに閉じる（再開したあとに子が作った孫は、そこで止まる）
+            for child in children {
+                // SAFETY: Child が持つ、まだ開いているプロセスのハンドルを渡す
+                unsafe {
+                    TerminateProcess(child.as_raw_handle() as HANDLE, KILLED_EXIT_CODE);
+                }
+            }
+            drop(copies);
+            drop(made);
+            Err(error)
+        }
     }
-    let copy = match duplicate_process(process) {
-        Ok(copy) => copy,
-        Err(message) => return stop(message),
-    };
-    jobs().insert(
-        child.id(),
-        Job {
-            job: Some(job),
-            process: copy,
-        },
-    );
-    Ok(())
 }
 
 fn last_error(what: &str) -> String {
@@ -267,13 +299,8 @@ fn create_job(fail: &impl Fn(JobStep) -> bool) -> Result<Handle, String> {
     Ok(job)
 }
 
-// 子を Job に入れ、主スレッドを再開する
-fn enter_job(
-    job: &Handle,
-    process: HANDLE,
-    pid: u32,
-    fail: &impl Fn(JobStep) -> bool,
-) -> Result<(), String> {
+// 子を Job に入れる（再開はしない）
+fn enter_job(job: &Handle, process: HANDLE, fail: &impl Fn(JobStep) -> bool) -> Result<(), String> {
     // SAFETY: 作った Job と、Child が持つプロセスのハンドルを渡す
     if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
         return Err(last_error("Job に入れられません"));
@@ -281,46 +308,66 @@ fn enter_job(
     if fail(JobStep::Assign) {
         return Err("Job に入れられません（テスト）".to_string());
     }
-    if fail(JobStep::Resume) {
-        return Err("主スレッドを再開できません（テスト）".to_string());
-    }
-    resume_threads(pid)
+    #[cfg(test)]
+    std::thread::sleep(RESUME_DELAY.get());
+    Ok(())
 }
 
-// pid のプロセスのスレッドを再開する。CREATE_SUSPENDED で起動したばかりなので、スレッドは主スレッドの 1 つだけ（推測）。
-// 標準ライブラリは起動したあと主スレッドのハンドルを閉じるので、スレッドの一覧から探す
-fn resume_threads(pid: u32) -> Result<(), String> {
+// テスト用（段階 2 S5d）：Job に入れてから再開するまでに、このスレッドで、この時間だけ待つ（Job に入れるのが遅いときにあたる）。
+// スレッドごとの値なので、同時に動くほかのテストには効かない。テストのときだけコンパイルする
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RESUME_DELAY: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+// pids のプロセスのスレッドを、pids の順に再開する。スレッドの一覧は 1 回だけ取る（約 47 ms かかる。S13 の測定）。
+// CREATE_SUSPENDED で起動したばかりなので、スレッドはそれぞれ主スレッドの 1 つだけ（推測）。
+// 標準ライブラリは起動したあと主スレッドのハンドルを閉じるので、スレッドの一覧から探す。
+// 失敗したら、その子の番号とエラーを返す（それより前の子は再開したまま。止めるのは呼ぶ側）
+fn resume_threads(
+    pids: &[u32],
+    fail: &impl Fn(usize, JobStep) -> bool,
+) -> Result<(), (usize, String)> {
     // SAFETY: 引数は値だけ。失敗すれば INVALID_HANDLE_VALUE が返る
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return Err(last_error("スレッドの一覧を取れません"));
+        return Err((0, last_error("スレッドの一覧を取れません")));
     }
     let snapshot = Handle(snapshot);
+    // それぞれの子のスレッドの id
+    let mut threads: Vec<Vec<u32>> = vec![Vec::new(); pids.len()];
     // SAFETY: THREADENTRY32 はゼロで初期化してよい C の構造体。dwSize に大きさを入れてから渡す
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-    let mut resumed = 0;
     // SAFETY: 取った一覧と、書き込み先を渡す
     let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
     while more {
-        if entry.th32OwnerProcessID == pid {
-            // SAFETY: 引数は値だけ。失敗すれば null が返る
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                return Err(last_error("主スレッドを開けません"));
-            }
-            let thread = Handle(thread);
-            // SAFETY: 開いたスレッドのハンドルを渡す。失敗すれば u32::MAX が返る
-            if unsafe { ResumeThread(thread.0) } == u32::MAX {
-                return Err(last_error("主スレッドを再開できません"));
-            }
-            resumed += 1;
+        if let Some(index) = pids.iter().position(|pid| *pid == entry.th32OwnerProcessID) {
+            threads[index].push(entry.th32ThreadID);
         }
         // SAFETY: 取った一覧と、書き込み先を渡す
         more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
     }
-    if resumed == 0 {
-        return Err("主スレッドが見つかりません".to_string());
+    for (index, ids) in threads.iter().enumerate() {
+        if fail(index, JobStep::Resume) {
+            return Err((index, "主スレッドを再開できません（テスト）".to_string()));
+        }
+        if ids.is_empty() {
+            return Err((index, "主スレッドが見つかりません".to_string()));
+        }
+        for id in ids {
+            // SAFETY: 引数は値だけ。失敗すれば null が返る
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, *id) };
+            if thread.is_null() {
+                return Err((index, last_error("主スレッドを開けません")));
+            }
+            let thread = Handle(thread);
+            // SAFETY: 開いたスレッドのハンドルを渡す。失敗すれば u32::MAX が返る
+            if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                return Err((index, last_error("主スレッドを再開できません")));
+            }
+        }
     }
     Ok(())
 }

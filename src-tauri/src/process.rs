@@ -341,12 +341,16 @@ pub fn run(
         .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(not(windows))]
     let started = Instant::now();
     let mut child: Child = command
         .spawn()
         .map_err(|error| format!("起動できません：{error}"))?;
+    // Windows：実行時間は、Job に入れて再開し終わったときから数える（Job に入れるのに 50〜70 ms、混むと秒単位でかかるため。
+    // 段階 2 S5d）
     #[cfg(windows)]
-    crate::win::start_in_job(&child).map_err(|error| format!("起動できません：{error}"))?;
+    let started =
+        crate::win::start_in_job(&child).map_err(|error| format!("起動できません：{error}"))?;
     let pid = child.id() as Pid;
 
     let (sender, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -702,29 +706,38 @@ pub fn run_pair(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
     }
+    #[cfg(not(windows))]
     let started = Instant::now();
     let mut solution_child: Child = solution
         .spawn()
-        .map_err(|error| format!("解答を起動できません：{error}"))?;
-    #[cfg(windows)]
-    crate::win::start_in_job(&solution_child)
         .map_err(|error| format!("解答を起動できません：{error}"))?;
     let solution_pid = solution_child.id() as Pid;
     let mut judge_child: Child = match judge.spawn() {
         Ok(child) => child,
         Err(error) => {
-            kill_group(solution_pid);
-            let _ = reap(solution_pid);
+            #[cfg(not(windows))]
+            {
+                kill_group(solution_pid);
+                let _ = reap(solution_pid);
+            }
+            // Windows：解答はまだ Job に入れておらず、止まったまま。Child のハンドルで止めて待つ
+            #[cfg(windows)]
+            {
+                let _ = solution_child.kill();
+                let _ = solution_child.wait();
+            }
             return Err(format!("ジャッジを起動できません：{error}"));
         }
     };
-    // Windows：ジャッジを Job に入れられなければ（ジャッジは start_in_job が止める）、解答も止める
+    // Windows：解答とジャッジを両方 Job に入れてから、続けて再開する。対話の時間は、再開し終わったときから数える
+    // （段階 2 S5d）。どちらかで失敗したら、start_all_in_jobs が 2 つとも止める
     #[cfg(windows)]
-    if let Err(error) = crate::win::start_in_job(&judge_child) {
-        kill_group(solution_pid);
-        let _ = reap(solution_pid);
-        return Err(format!("ジャッジを起動できません：{error}"));
-    }
+    let started = crate::win::start_all_in_jobs(&[&solution_child, &judge_child]).map_err(
+        |(index, error)| {
+            let who = if index == 0 { "解答" } else { "ジャッジ" };
+            format!("{who}を起動できません：{error}")
+        },
+    )?;
     let judge_pid = judge_child.id() as Pid;
     let pids = [solution_pid, judge_pid];
 
@@ -1777,6 +1790,101 @@ mod windows_tests {
             assert!(failed, "{step:?} で失敗にならない");
             assert_eq!(ended, Some(KILLED), "{step:?} のあとで子が残っている");
         }
+    }
+
+    #[test]
+    fn stops_both_children_when_either_cannot_start() {
+        // 段階 2 S5d：解答とジャッジを両方 Job に入れてから続けて再開する（run_pair）。どちらかが、Job を作る・入れる・再開する
+        // のどこで失敗しても、2 つとも止めてエラーにする（失敗した側の番号を返す）。ジャッジの再開で失敗したときは、解答は
+        // もう再開して動いているので、動いている子も止めることを確かめる
+        let spawn = || {
+            let mut command = child(&["sleep:30000"]);
+            command
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.spawn().unwrap()
+        };
+        for side in [0, 1] {
+            for step in [
+                crate::win::JobStep::Create,
+                crate::win::JobStep::Assign,
+                crate::win::JobStep::Resume,
+            ] {
+                let mut children = [spawn(), spawn()];
+                let pids = children.each_ref().map(Child::id);
+                let started = crate::win::start_all_in_jobs_with(
+                    &[&children[0], &children[1]],
+                    |index, at| (index, at) == (side, step),
+                );
+                let ended = children.each_mut().map(ended_within);
+                // Job の記録が残っていない（失敗したら記録しない）
+                let recorded = pids.map(|pid| crate::win::working_set(pid).is_some());
+                // 後片付け（失敗したときに、止まったまま・動いたまま残さない）
+                for spawned in &mut children {
+                    let _ = spawned.kill();
+                    let _ = spawned.wait();
+                }
+                assert_eq!(
+                    started.as_ref().map_err(|(index, _)| *index).err(),
+                    Some(side),
+                    "{side} の {step:?} で、その側の失敗にならない：{started:?}"
+                );
+                assert_eq!(
+                    ended,
+                    [Some(KILLED), Some(KILLED)],
+                    "{side} の {step:?} のあとで子が残っている"
+                );
+                assert_eq!(recorded, [false, false], "{side} の {step:?}");
+            }
+        }
+    }
+
+    // 段階 2 S5d：Job に入れてから再開するまでを、テストのときだけ遅らせる（このスレッドだけ。捨てるときに戻す）
+    struct ResumeDelay;
+
+    impl ResumeDelay {
+        fn set(delay: Duration) -> Self {
+            crate::win::RESUME_DELAY.set(delay);
+            ResumeDelay
+        }
+    }
+
+    impl Drop for ResumeDelay {
+        fn drop(&mut self) {
+            crate::win::RESUME_DELAY.set(Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn counts_time_from_resuming_the_child() {
+        // 段階 2 S5d：実行時間は、子を Job に入れて再開したあとから数える。Job に入れるのが 1500 ms 遅れても、すぐ終わる子は
+        // 上限 1000 ms の中で終わり、実行時間にその遅れは入らない
+        let _delay = ResumeDelay::set(Duration::from_millis(1500));
+        let result = run_child(&["exit:0"], &limits(1000, 1024));
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert!(
+            result.elapsed < Duration::from_millis(1000),
+            "{:?}",
+            result.elapsed
+        );
+    }
+
+    #[test]
+    fn counts_pair_time_from_resuming_both() {
+        // 段階 2 S5d：対話の時間は、解答とジャッジを両方 Job に入れて再開したあとから数える。それぞれ 1500 ms 遅れても、
+        // 1 往復の対話は上限 1000 ms の中で終わる
+        let _delay = ResumeDelay::set(Duration::from_millis(1500));
+        let result = pair(&["out:5", "expect:10"], &["double"], &limits(1000, 1024));
+        assert!(!result.timed_out, "{:?}", result.elapsed);
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert!(
+            result.elapsed < Duration::from_millis(1000),
+            "{:?}",
+            result.elapsed
+        );
     }
 
     #[test]
