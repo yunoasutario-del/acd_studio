@@ -680,6 +680,42 @@ PyPy は settings.json の python.pypy の書き換えが要るので、あと�
 | 3 | 構文の誤りのメッセージの文字（`x = 1 ＋ 2`、全角の＋） | OK。CE。エラー一覧の文は「main.py:1:7: SyntaxError: invalid character '＋' (U+FF0B)」で、化けていなかった |
 | 4 | 実行時の誤り（`print(1 // 0)` のサンプルテスト） | OK。RE・終了コード 1・75 ms |
 
+S8 の画面の確かめ（2026-11-03。利用者が Windows 11 で確かめた。dev、S8 のコミット a3da2a4。C++ のパッケージ c1・c2・c3 を
+作業領域 C:\Users\yunoa\Documents の直下に IDE で作った。c1 は test/sample-1.in〔`3` と `1 2 3`〕・sample-1.out〔`6`〕、
+c2 は c1 と同じものに test/compare.json〔`{"mode": "exact"}`〕、c3 は sample-1.out が `こんにちは` の exact。
+サンプルテストの制限は既定の 2500 ms・1024 MiB。g++ は C:\Program Files (x86)\mingw64\bin の MinGW-Builds 15.2.0）
+
+手順と違えたこと：
+- 番号 12 の「実行」は test/input.txt を標準入力に使うので、c1/test/input.txt（sample-1.in と同じ中身）を確かめの前に足した
+- 番号 4・7 は、手順のコードの誤りで、IDE の不具合ではない。どちらも GCC の -O2 の最適化で、意図した動きが消えていた
+  （IDE と同じ引数の `g++ -O2 -S` で確かめた）。直したコードでやり直した
+  - 番号 4：手順の `volatile int z = 0; cout << 1 / z;` は WA（12 ms・出力 0）。int の `1 / z` は z が 1・−1 のとき以外は 0 に
+    なるので、GCC は割り算（idiv）を使わず、`z + 1` を符号なしで 2 と比べて 0 か z を選ぶ式（cmova）に書き換えていた。z = 0 では
+    割り算が起きない。直したコード `volatile int a = 1, z = 0; cout << a / z << endl;` では idivl があり、0xC0000094 になった
+  - 番号 7：手順の `vector<char> v(1500000000, 1); cout << (int)v.back();` は WA（15 ms・4.6 MiB）。値が分かるので、GCC は確保
+    （operator new・memset）ごと消し、定数 1 を出すだけにしていた。直したコード（入力の n で大きさを決めるので消せない）：
+    `int n; cin >> n; size_t m = (size_t)n * 500000000; vector<char> v(m); for (size_t i = 0; i < m; i += 4096) v[i] = (char)(i + n);
+    long long s = 0; for (size_t i = 0; i < m; i += 4096) s += v[i]; cout << s << endl;`（n = 3 で約 1.5 GB。operator new と memset が残る）
+
+| 番号 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1 | AC（入力の和） | OK。AC・19 ms・5.1 MiB |
+| 2 | WA（和 + 1） | OK。WA・19 ms・4.7 MiB |
+| 3 | RE（範囲外の書き込み。`v[100000000000]`） | OK。RE・0xC0000005（アクセス違反：範囲外・null の読み書きなど）・20 ms・4.1 MiB |
+| 4 | RE（0 での割り算。直したコード） | OK。RE・0xC0000094（整数の 0 除算）・14 ms・4.0 MiB（手順のコードでは WA。上のとおり） |
+| 5 | RE（深い再帰。1 KiB ずつ 10^7 段） | OK。RE・0xC00000FD（スタックあふれ：深い再帰など）・58 ms・6.0 MiB（今は既定のスタック 2 MiB。S9 のあとも、この深さなら落ちる見込み） |
+| 6 | TLE（volatile の数を増やし続ける） | OK。TLE「時間の制限を超えたので止めました」・2515 ms・3.7 MiB。タスクマネージャーで、動いている間は main.exe があり、TLE のあと消えた |
+| 7 | MLE（約 1.5 GB を確保して書く。直したコード） | OK。MLE「メモリの制限を超えました」・512 ms・1092.2 MiB（手順のコードでは WA。上のとおり） |
+| 8 | abort | OK。RE・0xC0000409（異常終了：C++ の abort・assert・捕まえない例外、Rust の abort など）・228 ms・3.7 MiB |
+| 9 | assert（`assert(n == 2)`、n = 1） | OK。RE・0xC0000409・117 ms・3.8 MiB |
+| 10 | 捕まえない例外（`throw runtime_error`） | OK。RE・0xC0000409・120 ms・4.3 MiB |
+| 11 | vector の .at の範囲外 | OK。RE・0xC0000409・119 ms・4.2 MiB |
+| 12 | 同じパッケージを続けて「実行」・「サンプルテスト」（`\\?\` の件） | OK。それぞれ 3 回続けた。毎回ビルドが通り、実行は 6・正常に終了（21 ms）、サンプルテストは AC。「ビルドに失敗しました」や cannot open output file は出なかった |
+| 13 | exact の比較（c2。MinGW の exe は `6\r\n` を出す） | OK。AC・13 ms・5.1 MiB（S6） |
+| 14 | 日本語と絵文字の出力（c3） | OK。実行：「こんにちは」「絵文字😀」が化けずに出た・正常に終了（15 ms）。サンプルテスト：WA（期待出力が 1 行だけなので正しい）・14 ms・4.6 MiB。実際の出力の 2 行とも化けていなかった |
+| 15 | 実行ログの「ローカル」と「AC Library」 | OK。「ローカル：g++.exe (x86_64-win32-seh-rev0, Built by MinGW-Builds project) 15.2.0（C:\Program Files (x86)\mingw64\bin\g++.exe）」。版が違うという注意は出なかった。「AC Library：なし（使うときは、アプリのフォルダの libraries/ac-library/atcoder/ に置いてください）」 |
+| 16 | 残っているもの（タスクマネージャーの「詳細」） | OK。main.exe・g++.exe・cc1plus.exe・ld.exe・collect2.exe・WerFault.exe は、すべて残っていなかった |
+
 段階 2 の既知の問題（まだ直さない）
 
 - 0xC0000409（__fastfail。C++ の abort・assert・捕まえない例外、Rust の abort）で落ちるたびに、Windows のエラー報告の記録が
