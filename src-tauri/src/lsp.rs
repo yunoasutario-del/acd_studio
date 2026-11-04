@@ -612,6 +612,9 @@ impl Server {
         // 回収する前に、グループの残り（rust-analyzer の子など）を止める
         kill_group(self.child.id() as Pid);
         let code = self.child.wait().ok().and_then(|status| status.code());
+        // Windows：回収したので、Job の記録（プロセスのハンドルの写し）を消す（段階 2 S13。run・run_pair の reap と同じ）
+        #[cfg(windows)]
+        let _ = crate::win::release_job(self.child.id());
         if report {
             (self.sink)(LspEvent::Exited { code });
         }
@@ -989,6 +992,33 @@ pub fn started(root: &Path, dir: &Path, already_running: bool, server: &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 段階 2 S13：言語サーバーを止めたあと、Job の記録（win.rs の JOBS。プロセスのハンドルの写しを持つ）が残らない。
+    // 言語サーバーの代わりに、テスト用の子のプログラム（30 秒眠るだけで、shutdown に答えない）を起動して止める
+    #[cfg(windows)]
+    #[test]
+    fn forgets_the_job_record_after_stopping_on_windows() {
+        let mut command = crate::process::command(crate::process::test_child_path());
+        command.arg("sleep:30000");
+        let dir = std::env::temp_dir();
+        let launch = Launch {
+            name: "rust-analyzer",
+            command,
+            dir: dir.clone(),
+            projects: Vec::new(),
+            options: Value::Null,
+            configuration: Value::Null,
+        };
+        let sink: Sink = Arc::new(|_| {});
+        let server = Server::spawn(launch, dir, "session".to_string(), sink).unwrap();
+        let pid = server.child.id();
+        assert!(crate::win::has_job_record(pid), "起動したのに記録がない");
+        server.stop(Duration::from_millis(200));
+        assert!(
+            !crate::win::has_job_record(pid),
+            "止めたあとも JOBS に pid {pid} の記録が残っている"
+        );
+    }
 
     #[test]
     fn encodes_and_decodes_split_messages() {

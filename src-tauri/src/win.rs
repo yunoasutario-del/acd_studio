@@ -119,8 +119,8 @@ pub fn terminate(pid: u32) {
 // Job は pid ごとに覚えておき、kill_job（process.rs の kill_group）で TerminateJobObject し、Job が空になるまで待ってから閉じる
 // （止めた直後に exe を上書きできるように。4.7）。Unix の作り（回収する前に必ずグループを止める）と同じく、kill_job は
 // 子を回収する前に必ず呼ばれる（run・run_pair・lsp の stop・debug の shutdown）。子が自然に終わっていても、残った孫は
-// ここで止まる。2 回目からは何もしない。覚えた pid は release_job（process.rs の reap）で忘れる。lsp・debug は reap を
-// 通らないので、閉じた印だけが残る（同じ pid が再利用されたら上書きする）。
+// ここで止まる。2 回目からは何もしない。覚えた pid は release_job（process.rs の reap と、lsp の stop〔段階 2 S13〕）で忘れる。
+// debug は reap を通らないので、閉じた印だけが残る（同じ pid が再利用されたら上書きする。段階 6 で扱う）。
 // 記録には、起動したときのプロセスのハンドルの写しも持ち、使用メモリ（今の WorkingSet と、終わったあとの最大）はそれで読む
 // （pid で開き直すと、pid が使い回されたときに別のプロセスを読むおそれがあるため。段階 2 S4）
 
@@ -436,6 +436,12 @@ pub fn release_job(pid: u32) -> Option<u64> {
         "kill_job を呼ばずに回収した、または Job に入れていないプロセス（pid {pid}）"
     );
     memory_counters(&entry?.process).map(|counters| counters.PeakWorkingSetSize as u64)
+}
+
+// テスト用：pid の Job の記録が残っているか（段階 2 S13）
+#[cfg(test)]
+pub(crate) fn has_job_record(pid: u32) -> bool {
+    jobs().contains_key(&pid)
 }
 
 // テスト用：止めずに Job のハンドルを閉じる（IDE が異常に終わったときにあたる）
