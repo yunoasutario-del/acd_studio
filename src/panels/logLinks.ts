@@ -12,15 +12,27 @@ const LOCATION = /((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:rs|cpp|cc|cxx|hpp|h
 // 直前がこれなら、パスの途中なので場所とみなさない（`/rustc/…/core/src/lib.rs:1:1`、`foo_bar.rs` の途中など）
 const PATH_CHAR = /[A-Za-z0-9_./-]/;
 
-export function splitLocations(text: string): Segment[] {
+// Windows（段階 2 S10）：rustc は場所を `src\main.rs:3:5` のように `\` 区切りで出すので、`\` も区切りとして読む。
+// 直前が `\` でもパスの途中とみなす（`C:\x\main.rs`、`/rustc/…/library\std\src\io\mod.rs` の途中など）
+const LOCATION_WINDOWS =
+  /((?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.(?:rs|cpp|cc|cxx|hpp|hh|h)):(\d+)(?::(\d+))?/g;
+const PATH_CHAR_WINDOWS = /[A-Za-z0-9_.\\/-]/;
+
+// IDE が Windows で動いているか（WebView2 の User-Agent。keybindings.ts の IS_MAC と同じ読み方）
+export const IS_WINDOWS = /Windows/.test(navigator.userAgent);
+
+// windows は、Windows の区切り（`\`）も読むか（テストでは引数で渡す）。場所のファイル名は `/` 区切りにして返す
+export function splitLocations(text: string, windows: boolean = IS_WINDOWS): Segment[] {
+  const pattern = windows ? LOCATION_WINDOWS : LOCATION;
+  const pathChar = windows ? PATH_CHAR_WINDOWS : PATH_CHAR;
   const segments: Segment[] = [];
   let last = 0;
-  for (const match of text.matchAll(LOCATION)) {
+  for (const match of text.matchAll(pattern)) {
     const start = match.index;
-    if (start > 0 && PATH_CHAR.test(text[start - 1])) {
+    if (start > 0 && pathChar.test(text[start - 1])) {
       continue;
     }
-    const file = match[1];
+    const file = windows ? match[1].replaceAll("\\", "/") : match[1];
     if (file.split("/").includes("..")) {
       continue;
     }
