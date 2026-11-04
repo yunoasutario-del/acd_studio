@@ -719,6 +719,32 @@ c2 は c1 と同じものに test/compare.json〔`{"mode": "exact"}`〕、c3 は
 | 15 | 実行ログの「ローカル」と「AC Library」 | OK。「ローカル：g++.exe (x86_64-win32-seh-rev0, Built by MinGW-Builds project) 15.2.0（C:\Program Files (x86)\mingw64\bin\g++.exe）」。版が違うという注意は出なかった。「AC Library：なし（使うときは、アプリのフォルダの libraries/ac-library/atcoder/ に置いてください）」 |
 | 16 | 残っているもの（タスクマネージャーの「詳細」） | OK。main.exe・g++.exe・cc1plus.exe・ld.exe・collect2.exe・WerFault.exe は、すべて残っていなかった |
 
+S9 の画面の確かめ（2026-11-04。利用者が Windows 11 で確かめた。dev、S9 のコミット 02b4945 のあと。作業領域 C:\Users\yunoa\Documents
+の t1〔Rust〕と c1〔C++〕を使った。どちらも、入力 n〔100000〕から読んだ深さだけ、1 段ごとに 1 KiB の配列〔C++ は volatile、Rust は
+std::hint::black_box〕を置いて再帰し、各段の n の偶奇を足して出す〔50000〕。test/sample-1.in・test/input.txt は `100000`、
+sample-1.out は `50000`。サンプルテストの制限は既定の 2500 ms・1024 MiB）
+
+手順のコードは、IDE と同じ引数（g++ -O2、cargo の release）のアセンブリで、再帰の呼び出しとスタックの確保が残っていることを
+確かめてから渡した。Rust の f は 1 段 1064 バイト（10 万段で約 101.5 MiB。既定の 1 MiB では足りない）。C++ の f は、g++ の -O2 が
+f を自分の中に 2 段埋め込み、1 回の呼び出しで n・n−1・n−2 の 3 段（buf を 48・1072・2096(%rsp) に置く）を処理して n−3 から再帰
+していた。`subq $3120, %rsp` は 3 段分の確保で、10 万段は約 3 万 3 千回の呼び出し、合わせて約 104 MB（既定の 2 MiB では足りない）。
+手順を書いたときは、3120 バイトを 1 段分と読み違えて「約 300 MB」の見込みを書いたが、測った 104.8 MiB と合うのは 3 段分の読み方。
+-ftrivial-auto-var-init=zero で各段の buf は memset で 0 にされるので、確保したスタックは全部書かれ、使用メモリに入る。
+1 GiB を付けて作った exe にファイルで 100000 を渡すと、どちらも 50000 で終了コード 0（Job の外では落とさず、ダンプを残さない
+ように確かめた）。利用者が t1/src/main.rs を貼るときに 1 行目の `use std::io::Read;` が抜けて CE になったので、足してから確かめた
+（手順の誤りではない）
+
+| 番号 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1-1 | Rust の深い再帰（t1 のサンプルテスト） | OK。AC・109 ms・108.6 MiB（S9 の前なら 0xC00000FD） |
+| 1-2 | Rust の深い再帰（t1 の実行。test/input.txt） | OK。50000、正常に終了・90 ms |
+| 2-1 | C++ の深い再帰（c1 のサンプルテスト） | OK。AC・77 ms・104.8 MiB（S9 の前なら 0xC00000FD。使用メモリは上の 3 段分の読み方と合う） |
+| 2-2 | C++ の深い再帰（c1 の実行。test/input.txt） | OK。50000、正常に終了・100 ms |
+| 3 | 実行ログのスタックの 1 行（Rust・C++） | OK。どちらも、書いた場所（Rust は「ジャッジ：rustc …」のあと、C++ は「手元のビルドは、ジャッジと違い…」のあと、「AC Library：なし…」の前）に「手元のビルドは、主スレッドのスタックを 1 GiB にしています（Windows だけ。ジャッジとは違う場合があります）」が出た |
+| 4-1 | Rust のランダムテスト（t1 に examples/gen.rs〔seed % 1000 + 1〕と examples/naive.rs〔(n + 1) / 2〕を足した） | OK。「生成器 examples/gen.rs、愚直解 examples/naive.rs、最大 100 回」、100 回すべて一致。ビルドは bin（0.09s）・gen（0.40s）・naive（0.32s）の 3 回に分かれていた（全体の時間は測っていない） |
+| 4-2 | 生成器にコンパイルエラー（`fn main() { let x: i32 = "a"; }`） | OK。CE。エラー一覧に examples/gen.rs:1 の error[E0308]: mismatched types。クリックすると gen.rs の 1 行目が開いた。実行ログでは、bin のビルドが通ったあと、gen で止まった |
+| 4-3 | 生成器を直したあとのランダムテスト | OK。エラー一覧から消え、4-1 と同じく 100 回すべて一致 |
+
 段階 2 の既知の問題（まだ直さない）
 
 - 0xC0000409（__fastfail。C++ の abort・assert・捕まえない例外、Rust の abort）で落ちるたびに、Windows のエラー報告の記録が
