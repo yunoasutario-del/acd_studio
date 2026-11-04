@@ -1,6 +1,7 @@
-// 実行ログの中の「ファイル名:行:列」（例：panic の `src/main.rs:5:10`、コンパイルエラーの `--> src/main.rs:3:5`、
-// C++ のコンパイルエラーの `main.cpp:4:5:`。Phase 16 作業 1）を
-// 見つけて、押して移動できるようにする（Phase 4a 作業 1。D-137）
+// 実行ログ（標準エラーとビルドの出力）の中の「ファイル名:行:列」（例：panic の `src/main.rs:5:10`、dbg! の `[src/main.rs:3:5]`、
+// C++ のコンパイルエラーの `main.cpp:4:5:`。Phase 16 作業 1）を見つけて、押して移動できるようにする（Phase 4a 作業 1。D-137）。
+// Rust のコンパイルエラー（`--> src/main.rs:3:5`）は、cargo の --message-format=json で受け取ってエラー一覧に出すので、
+// 実行ログには出ない（Windows 移植の段階 2 S10 の画面の確かめで分かった）
 
 export type Location = { file: string; line: number; column: number | null };
 

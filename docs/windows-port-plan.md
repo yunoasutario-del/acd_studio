@@ -156,7 +156,7 @@ session.rs の Keychain を使うテスト、storage.rs の 0o600・0o700 の検
 | storage.rs:13・441・466・469・820 | アプリのフォルダを 0o700、ファイルを 0o600 で作る | Windows では cfg で外す（`%APPDATA%` は利用者だけの ACL。推測）。必要なら ACL を明示する | 箇所：確認済み／代替案：未確認 |
 | storage.rs:814–828 | 単一起動のロック（`File::try_lock`） | Windows でも LockFileEx で動く（推測。2 つ起動して確かめる） | 箇所：確認済み／代替案：未確認 |
 | storage.rs:448–473 | 一時ファイルに書いて rename で置き換える | Windows の rename は置き換えに対応（MoveFileExW。Rust 1.99.0 の fs::rename は、5 で失敗すると POSIX の決まりの置き換えも試す）。段階 1 C7 で、5・32 のとき 20 ms おきに 100 回試し直す形にした。置き換える先を、削除の共有を許さずに開かれていると、試し直しを使い切って「アクセスが拒否されました (os error 5)」で失敗する（段階 2 S10d のテストで確認）。全部のテストと一緒に同時の保存をくり返すと、50 回中 2 回、同じ形で失敗した（原因は未確認）。S10d で、同じパスへの保存を IDE の中で 1 つずつにし、諦めたときにほかのプログラムの可能性を案内する。試し直しの時間（約 2 秒）を延ばすかは、測った長さを見てから決める | 箇所・試し直し：確認済み／同時の保存の失敗の原因：未確認 |
-| src/panels/logLinks.ts:11–13 | `src/main.rs:5:10` の形だけを場所として読む（`\` を含まない） | Windows の rustc の診断のパスは `examples\gen.rs` のように `\` 区切り（random.rs のテストで確認済み。段階 1 C7）→ `\` も区切りとして受け付ける。今のままだと `main.rs:5:10` だけに一致して、別のファイルへ移動しうる。エラー一覧に出す診断の file は、段階 2 S10a で `/` に直した（実行ログの本文は `\` のままなので、logLinks.ts は S10 で直す）。S10 で、Windows だけ `\` も区切りとして読み、開くファイル名を `/` にした | 箇所：確認済み／診断の file：確認済み（S10a）／logLinks.ts：S10 で対応（tests/logLinks.test.ts。画面は未確認） |
+| src/panels/logLinks.ts:11–13 | 実行ログの標準エラー・ビルドの出力の中の `src/main.rs:5:10` の形だけを場所として読む（`\` を含まない） | Windows では、Rust のプログラムが実行中に出す場所（panic の `src\main.rs:4:21`、dbg! の `[src\main.rs:3:5]`。file!() が `\` 区切り）が `\` 区切りになる → `\` も区切りとして受け付ける。S10 の前は `main.rs:4:21` だけに一致して、別のファイルへ移動しうるところだった。Rust のコンパイルエラーの場所（`--> src\main.rs:…`）は、`--message-format=json` で受け取ってエラー一覧だけに出すので、実行ログには出ない（はじめは実行ログにも出ると書いていたが、誤り。S10 の画面の確かめで分かった）。エラー一覧に出す診断の file は、段階 2 S10a で `/` に直した。C++ の g++ の出力（実行ログにも出る）は、もともと `/` か区切りなし。S10 で、Windows だけ `\` も区切りとして読み、開くファイル名を `/` にした | 箇所：確認済み／診断の file：確認済み（S10a）／logLinks.ts：S10 で対応（tests/logLinks.test.ts。画面で panic・dbg! を確認済み） |
 | run.rs:1457–1466、workspace.rs:310–320 | 相対パスを `/` でつなぐ | Windows でも components を `/` でつないでいるので、そのままでよい（推測） | 箇所：確認済み／代替案：未確認 |
 
 ### 3.4 画面・メニュー・設定
@@ -628,7 +628,7 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 | S10d | 同時の保存の失敗への手当て（S10c のあと。9.1 の追加 19） | 原因は決めきれなかった（全部のテストを合わせて 50 回くり返して 2 回、試しのプログラム〔同じ形の同時の保存を、全部のテストと同時に 561 秒、約 54 万回の置き換え〕では 0 回）。(2) Windows だけ、write_atomic で同じパスへの保存を IDE の中で 1 つずつにする（storage::save_lock。鍵は渡されたパスの形のままで、同じファイルを別の書き方で渡すと別のロックになる）。(3) win::rename_replacing が 5・32 の試し直しを使い切って諦めたときは、「ほかのプログラム（ウイルス対策など）が使っている可能性があります」を足す。試し直しの回数・時間は変えない（測った長さを見てから相談する） | 先にテストを書いて失敗を確かめる：置き換える先を共有を許さずに開いておくと、案内の入った文で失敗する（直す前は、同じ「アクセスが拒否されました (os error 5)。100 回試し直した」で、案内がなかった）／同じパスには同じロック。直したあと、全部のテストを 30 回くり返す（2026-11-01：30 回とも通った。直す前は 50 回中 2 回落ちていたので、30 回で落ちなくても直ったとは言い切れない） |
 | S11 | 問題の取得 | problem.rs の `/usr/bin/curl` を、Windows では `%SystemRoot%\System32\curl.exe` にする（PATH は探さない） | problem.rs のテスト。画面で問題ページ・問題の一覧を取る |
 | S12 | Defender の注意（9.1 の 8・追加 13） | Windows だけ：ビルドの直後の 1 ケース目が TLE のとき、実行ログに 1 行の注意を出す | 単体テスト |
-| S13 | まとめ | この文書に段階 2 の結果。後片付け：judges_cases_with_a_real_program の一時フォルダ、%TEMP% に前から残っている atcoder-studio-* のフォルダ（2026-11-03 の時点で 14 個。どれも 2026-10-29 の日付。どのテストが残したかを調べてから扱う）。Job に入れるのが遅いこと（S5d の行）を速くする工夫をするかの案 | 全体の cargo test・cargo clippy --all-targets・npm run build |
+| S13 | まとめ | この文書に段階 2 の結果。後片付け：judges_cases_with_a_real_program の一時フォルダ、%TEMP% に前から残っている atcoder-studio-* のフォルダ（2026-11-03 の時点で 14 個。どれも 2026-10-29 の日付。どのテストが残したかを調べてから扱う）。Job に入れるのが遅いこと（S5d の行）を速くする工夫をするかの案。電池で動いているときの時間のテスト：2026-11-04、ノート PC が電池（放電中・残り 45%・電源プラン「バランス」）のときに全部の cargo test を動かすと、全体が 33.69 秒・29.60 秒かかり（AC のときは約 15〜19 秒）、時間を確かめるテスト（run::tests::stops_a_case_at_the_time_limit〔1500 ms 未満〕、process::windows_tests::stops_both_on_request〔3 秒未満〕、process::windows_tests::stops_a_program_over_the_memory_limit_while_running〔2 秒未満〕）が 1〜3 つ落ちた。単独では 0.36 秒で通り、AC につないで全部を動かすと 297 通過・0 失敗（18.97 秒）。電池のときに CPU が遅くなり、一斉の起動が遅れるためと考えている（推測）。時間の確かめの余裕を見直すか、電源につないで動かすことを決まりにするかを S13 で決める | 全体の cargo test・cargo clippy --all-targets・npm run build |
 
 段階 2 で利用者が手で確かめること（各コミットのあとに手順を書いて頼む）
 - Rust・C++・CPython・PyPy のそれぞれで、AC・WA・RE（0 除算・範囲外・panic・アクセス違反）・TLE（無限ループ）・MLE（大きな配列）になる解答の判定と、時間・メモリ・RE の名前の表示
@@ -745,6 +745,30 @@ f を自分の中に 2 段埋め込み、1 回の呼び出しで n・n−1・n�
 | 4-2 | 生成器にコンパイルエラー（`fn main() { let x: i32 = "a"; }`） | OK。CE。エラー一覧に examples/gen.rs:1 の error[E0308]: mismatched types。クリックすると gen.rs の 1 行目が開いた。実行ログでは、bin のビルドが通ったあと、gen で止まった |
 | 4-3 | 生成器を直したあとのランダムテスト | OK。エラー一覧から消え、4-1 と同じく 100 回すべて一致 |
 
+S10 の画面の確かめ（2026-11-04。利用者が Windows 11 で確かめた。dev を起動し直してから、S10 のコミット 6981744 のあと。
+作業領域 C:\Users\yunoa\Documents の t1〔Rust〕と c1〔C++〕に、わざとコンパイルエラー・panic を起こすコードを貼った。
+出る文は、同じコードを scratchpad でビルド・実行して確かめてから手順に書いた）
+
+手順の前提の誤り：手順では「S10 の前は、実行ログの `--> src\main.rs:5:22` の `main.rs:5:22` の部分だけがリンクだった」と
+書いたが、誤り。Rust のビルドは `--message-format=json` で受け取るので、rustc の診断の本文（`--> …` を含む）は標準出力の JSON
+として出て、エラー一覧（rendered。リンクなし。BottomPanel.tsx の diagnostic-rendered）だけに出る。実行ログに送るのは cargo の
+標準エラー（`Compiling …`・`error: could not compile …` などの進み具合）だけなので、Rust のコンパイルエラー・警告の場所は、
+S10 の前も後も、macOS でも Windows でも、実行ログには出ない。そのため 1-a・3 は、確かめる場面がない項目だった。
+エラー一覧の見出しのリンクは列を渡さない（BottomPanel.tsx の column: null。そもそもエラー一覧の Diagnostic に列の欄がない）ので、
+行の一番左が開く。これも macOS と同じ作り（下の「移植の範囲の外の覚え書き」）。C++ の g++ の標準エラーは、実行ログ（build の
+種類）とエラー一覧の両方に出る。ビルドが CE で終わると画面が自動でエラー一覧に切り替わる（App.tsx の setPanelTab("errors")）
+ので、はじめの 4 ではエラー一覧を見ていた。実行ログのタブに切り替えて見直すと、期待どおりだった。
+S10 が効くのは、Rust のプログラムが実行中に標準エラーへ出す場所（panic・dbg! など。file!() が `\` 区切りのため）
+
+| 番号 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1-a | Rust のコンパイルエラー（`std::io::stdin().read_to_string();`）の `--> src\main.rs:5:22` | 確かめる場面がなかった（上の前提の誤り）。文はエラー一覧の本文に出て、下線はなかった。エラー一覧の見出しの場所を押すと、src/main.rs の 5 行目の一番左が開いた |
+| 1-b | 同じエラーの `note: method defined here` の `--> /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library\std\src\io\mod.rs:978:7` | OK（どこにも下線がない）。ただし、エラー一覧の本文はもともとリンクを付けないので、S10 の直しの確かめにはなっていない（S10 の直しは tests/logLinks.test.ts で確かめた） |
+| 2 | Rust の panic（範囲外の添字）の `src\main.rs:4:21` | OK。実行ログに「thread 'main' (44980) panicked at src\main.rs:4:21:」「index out of bounds: the len is 3 but the index is 10」、終了コード 101・30 ms。下線を押すと、src/main.rs の 4 行目の v と [i] の間（21 列目）が開いた |
+| 2b | Rust の dbg!（`fn main() { let x = 1; dbg!(x); }`）の `[src\main.rs:3:5]` | OK。実行ログの `src\main.rs:3:5` に下線があり、押すと src/main.rs の 3 行目の dbg! の直前（5 列目）が開いた |
+| 3 | ランダムテストの生成器のコンパイルエラーの `--> examples\gen.rs:1:26` | 確かめる場面がなかった（1-a と同じ理由）。エラー一覧の見出しの場所を押すと、gen.rs の 1 行目の一番左が開いた |
+| 4 | C++ のコンパイルエラー（`cout << m`）の `main.cpp:6:13: error: 'm' was not declared in this scope` | OK。実行ログのタブで、灰色の g++ の出力の中の main.cpp:6:13 に下線があり、押すと main.cpp の 6 行目の m の直前（13 列目）が開いた（はじめは、CE で自動で切り替わったエラー一覧を見ていたので、下線がないと見えた） |
+
 段階 2 の既知の問題（まだ直さない）
 
 - 0xC0000409（__fastfail。C++ の abort・assert・捕まえない例外、Rust の abort）で落ちるたびに、Windows のエラー報告の記録が
@@ -769,6 +793,15 @@ f を自分の中に 2 段埋め込み、1 回の呼び出しで n・n−1・n�
   書いたもの）では、行の最後に `\r` が残りうる（推測。4.9）。ジャッジが Python の `input()` なら `\r\n` を取り除くので影響は
   ない（S7 の connects_python_programs で、CPython の解答とジャッジの判定が正しく出ることを確かめた）。やり取りの記録
   （画面の表示）にも `\r` が残る（同じテストで、1 行目が `"1 100\r\n"` だった。画面で `\r` が見えるかは未確認）
+
+移植の範囲の外の覚え書き（今後の案。Windows 特有ではないので、移植では扱わない。2026-11-04 に利用者が決めた）
+
+- エラー一覧の見出しの場所のリンクは、列を渡さない（BottomPanel.tsx の DiagnosticsView の column: null）。そもそも、エラー一覧に
+  送る診断（run.rs の Diagnostic）に列の欄がない（level・message・rendered・file・line だけ）。そのため、押すと行の一番左が開く。
+  rustc の JSON（spans の column_start）と g++ の `ファイル:行:列:` には列があるので、Diagnostic に列を足して渡せば、列まで開ける
+- エラー一覧の本文（rendered）には、リンクを付けていない（BottomPanel.tsx の diagnostic-rendered は文字のまま）。本文の中の
+  `--> src/main.rs:5:22` や、note の場所（同じパッケージの別の行など）も、実行ログと同じく splitLocations で押せる場所にできる。
+  付けるなら、標準ライブラリなどパッケージの外の場所はリンクにしない今の決め（logLinks.ts）をそのまま使う
 
 ### 段階 3：ファイル・URL を開く処理、ログイン情報の保存
 
