@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use dom_query::Document;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Client, NOT_LOGGED_IN};
+use crate::session::Client;
+// Windows では、ログインして読み直す道を通らないので使わない（段階 2 S11）
+#[cfg_attr(windows, allow(unused_imports))]
+use crate::session::NOT_LOGGED_IN;
 use crate::storage;
 
 // 続けて取得するときの間隔（D-111）
@@ -113,7 +116,11 @@ fn is_not_found(stderr: &str) -> bool {
     stderr.contains("returned error: 404")
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 const NOT_FOUND_LOGGED_OUT: &str = "ページが見つかりません（404）。開催中のコンテストの問題は、AtCoder にログインしていないと読めません。「提出結果」タブの「ログイン」からログインしてください";
+// Windows（段階 2 S11）：ログイン（Keychain の代わりの資格情報マネージャー）は段階 3 で入れるので、それまではログインを勧めない
+#[cfg(windows)]
+const NOT_FOUND_LOGIN_UNAVAILABLE: &str = "ページが見つかりません（404）。開催中のコンテストの問題は、AtCoder にログインしていないと読めません。Windows 版では、まだログインできません";
 
 // 公開されているページを取得する。ログインなしで 404 なら、ログインしているときだけセッションを付けてもう 1 回読む（D-149）
 fn fetch(url: &str) -> Result<String, String> {
@@ -128,6 +135,13 @@ fn with_session_fallback(
     match first {
         Ok(body) => Ok(body),
         Err(FetchError::Other(error)) => Err(error),
+        // Windows（段階 2 S11）：Keychain（/usr/bin/security）を見に行かず、まだログインできないことを伝える
+        #[cfg(windows)]
+        Err(FetchError::NotFound) => {
+            let _ = (url, client);
+            Err(NOT_FOUND_LOGIN_UNAVAILABLE.to_string())
+        }
+        #[cfg(not(windows))]
         Err(FetchError::NotFound) => {
             if !client.keychain().exists()? {
                 return Err(NOT_FOUND_LOGGED_OUT.to_string());
@@ -156,7 +170,12 @@ fn with_session_fallback(
 // 公開されているページを、ログインなしで curl で取得する。https だけを許し、リダイレクトの先も https に限る
 fn fetch_public(url: &str) -> Result<String, FetchError> {
     wait_for_interval();
-    let output = Command::new("/usr/bin/curl")
+    #[cfg(not(windows))]
+    let mut curl = Command::new("/usr/bin/curl");
+    // Windows（段階 2 S11）：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
+    #[cfg(windows)]
+    let mut curl = crate::process::command(windows_curl().map_err(FetchError::Other)?);
+    let output = curl
         .args([
             "--silent",
             "--show-error",
@@ -188,6 +207,19 @@ fn fetch_public(url: &str) -> Result<String, FetchError> {
     }
     String::from_utf8(output.stdout)
         .map_err(|_| FetchError::Other("問題ページを読めません（UTF-8 ではない）".to_string()))
+}
+
+// Windows（段階 2 S11）：Windows に入っている curl.exe の場所。PATH は探さない（同じ名前の別のプログラムを使わないように）
+#[cfg(windows)]
+fn windows_curl() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| "curl.exe が見つかりません（SystemRoot が分かりません）".to_string())?;
+    let path = PathBuf::from(root).join(r"System32\curl.exe");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("curl.exe が見つかりません（{}）", path.display()))
+    }
 }
 
 // 空白をまとめて前後を切る
@@ -613,6 +645,87 @@ mod tests {
         assert!(!is_not_found(
             "curl: (6) Could not resolve host: atcoder.jp"
         ));
+    }
+
+    // 段階 2 S11：Windows の curl.exe（%SystemRoot%\System32\curl.exe）。テストの中で、本番とは別に場所を決める
+    #[cfg(windows)]
+    fn system_curl() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\curl.exe")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fetches_with_windows_curl() {
+        // 段階 2 S11：Windows でも curl を起動できる（今までは /usr/bin/curl を探して起動できなかった）。
+        // つながらない場所（127.0.0.1 の 9 番）では、curl の「つながらない」（終了コード 7）の文になる
+        let started = Instant::now();
+        let refused = fetch_public("https://127.0.0.1:9/");
+        eprintln!(
+            "https://127.0.0.1:9/ の失敗まで {} ms（前の取得から 1 秒あける待ちを含みうる）",
+            started.elapsed().as_millis()
+        );
+        let Err(FetchError::Other(message)) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(!message.contains("起動できません"), "{message}");
+        assert!(message.contains("つながりません"), "{message}");
+        // http は使わない（--proto =https が curl.exe でも効く）
+        let http = fetch_public("http://127.0.0.1:9/");
+        let Err(FetchError::Other(message)) = http else {
+            panic!("{http:?}");
+        };
+        assert!(!message.contains("起動できません"), "{message}");
+        assert!(message.contains("http"), "{message}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_curl_reports_404_in_the_same_words() {
+        // 段階 2 S11（前提の確かめ）：curl.exe も、--fail で 404 のとき「returned error: 404」を出す（is_not_found で見分けられる）。
+        // fetch_public は https だけなので、ここは curl.exe を直接、127.0.0.1 の小さなサーバーに向けて動かす。
+        // あわせて、つながらない場所で curl.exe が失敗するまでの時間を測る
+        let (url, server) =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let output = Command::new(system_curl())
+            .args(["--silent", "--show-error", "--fail", &url])
+            .output()
+            .unwrap();
+        let _ = server.join();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(is_not_found(&stderr), "{stderr}");
+        let started = Instant::now();
+        let refused = Command::new(system_curl())
+            .args(["--silent", "--show-error", "https://127.0.0.1:9/"])
+            .output()
+            .unwrap();
+        eprintln!(
+            "curl.exe が https://127.0.0.1:9/ で失敗するまで {} ms（終了コード {:?}）",
+            started.elapsed().as_millis(),
+            refused.status.code()
+        );
+        assert_eq!(refused.status.code(), Some(7));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tells_that_login_is_not_available_on_windows() {
+        // 段階 2 S11：Windows では、ログインなしで 404 のとき、Keychain（/usr/bin/security）を見に行かず、
+        // ログインしていないときの文に「Windows 版では、まだログインできません」を足して返す（段階 3 でログインを入れるまで）
+        let result = with_session_fallback(
+            "http://127.0.0.1:9/",
+            Err(FetchError::NotFound),
+            &Client::app(),
+        );
+        let Err(message) = result else {
+            panic!("{result:?}");
+        };
+        assert!(message.contains("404"), "{message}");
+        assert!(
+            message.contains("Windows 版では、まだログインできません"),
+            "{message}"
+        );
+        assert!(!message.contains("Keychain"), "{message}");
     }
 
     #[test]
