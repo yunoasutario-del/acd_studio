@@ -289,8 +289,8 @@ C++ の解答に手元だけで `_setmode` を入れる案は、ジャッジと�
 | --- | --- | --- |
 | main.rs | release のときだけ `windows_subsystem = "windows"`（コンソールなし） | 確認済み |
 | 起動の箇所 | src-tauri/src に `Command::new` が 36 か所、`creation_flags` は 0 か所 | 確認済み |
-| 起こること | コンソールを持たない GUI のプロセスから、cargo・g++・curl・clangd・rust-analyzer・解答などのコンソールのプログラムを起動すると、そのたびに窓が出る（推測） | 未確認（release でビルドして実行・テストを押す） |
-| 対策 | `std::os::windows::process::CommandExt::creation_flags(CREATE_NO_WINDOW)` を、共通の関数（例：toolchain.rs の cargo_command の隣に置く「外部コマンドを作る関数」）で必ず付ける。36 か所を 1 つの関数に寄せる | 未確認 |
+| 起こること | コンソールを持たない GUI のプロセスから、cargo・g++・curl・clangd・rust-analyzer・解答などのコンソールのプログラムを起動すると、そのたびに窓が出る（推測） | 未確認（対策を入れたあとなので、対策がないときに窓が出るかは確かめていない） |
+| 対策 | `std::os::windows::process::CommandExt::creation_flags(CREATE_NO_WINDOW)` を、共通の関数（例：toolchain.rs の cargo_command の隣に置く「外部コマンドを作る関数」）で必ず付ける。36 か所を 1 つの関数に寄せる。→ 段階 1 C6 で process::command にした。段階 2 で起動するようになった子（cargo・rustc・g++・python・curl.exe・解答・ジャッジ・生成器・愚直解）も、どれもこの関数を通る（2026-11-05 にコードで確認）。release の exe をエクスプローラーから起動し、実行・各テスト・止める・言語サーバーの再起動・問題の取得・C++ の abort で、黒い窓もエラー報告のダイアログも出なかった（段階 2 S13 の A6。2026-11-05） | 確認済み（target\release の exe で。インストーラーで入れた exe は未確認） |
 | Job Object との組み合わせ | CREATE_SUSPENDED・CREATE_NO_WINDOW を同時に付けて起動し、Job に入れて再開できた（段階 2 S3 のテスト）。画面の確かめ（2026-11-01）では、dev で解答が起動した ping の窓は出ず、npm と cargo の下で動く IDE から入れた Job が働いた（止める・TLE・子が自然に終わったあと・IDE をタスクの終了で止めたとき、孫まで消えた）。ただし IDE 自身が別の Job に入っていたかは見ていない | 確認済み（dev。IDE が別の Job に入っていたかは未確認） |
 | dev での見え方 | dev は IDE にコンソールがあるので、子は同じコンソールを使い、窓は出ない（推測）。そのため dev だけでは気づけない | 未確認 |
 
@@ -631,7 +631,7 @@ wry が SetAreDevToolsEnabled に devtools の設定（release では false）�
 | S10d | 同時の保存の失敗への手当て（S10c のあと。9.1 の追加 19） | 原因は決めきれなかった（全部のテストを合わせて 50 回くり返して 2 回、試しのプログラム〔同じ形の同時の保存を、全部のテストと同時に 561 秒、約 54 万回の置き換え〕では 0 回）。(2) Windows だけ、write_atomic で同じパスへの保存を IDE の中で 1 つずつにする（storage::save_lock。鍵は渡されたパスの形のままで、同じファイルを別の書き方で渡すと別のロックになる）。(3) win::rename_replacing が 5・32 の試し直しを使い切って諦めたときは、「ほかのプログラム（ウイルス対策など）が使っている可能性があります」を足す。試し直しの回数・時間は変えない（測った長さを見てから相談する） | 先にテストを書いて失敗を確かめる：置き換える先を共有を許さずに開いておくと、案内の入った文で失敗する（直す前は、同じ「アクセスが拒否されました (os error 5)。100 回試し直した」で、案内がなかった）／同じパスには同じロック。直したあと、全部のテストを 30 回くり返す（2026-11-01：30 回とも通った。直す前は 50 回中 2 回落ちていたので、30 回で落ちなくても直ったとは言い切れない） |
 | S11 | 問題の取得 | Windows だけ。problem.rs の fetch_public（問題ページ・問題の一覧をログインなしで取る）の `/usr/bin/curl` を、`%SystemRoot%\System32\curl.exe`（problem::windows_curl。PATH は探さない。SystemRoot が分からない・ファイルがないときは「curl.exe が見つかりません（…）」）にし、process::command で起動する（CREATE_NO_WINDOW を付ける）。引数は変えない。ログインなしで 404 のとき（開催中のコンテスト）は、Keychain（/usr/bin/security）を見に行かず、「…AtCoder にログインしていないと読めません。Windows 版では、まだログインできません」を返す（with_session_fallback の Windows だけの分かれ道。段階 3 でログインを入れるまで。利用者の選択）。macOS の文と動きは変えない。証明書の失効の確かめ（Schannel）の引数は足さない（利用者の選択。既知の問題に書いた）。ログインして読む部分（session.rs の curl と Keychain）は段階 3・5 の範囲で、reads_with_the_session_only_after_a_404_when_logged_in は ignore のまま | 先にテストを書いて失敗を確かめる：fetch_public が https://127.0.0.1:9/（つながらない場所）で、curl の「つながりません」（終了コード 7）の文になり、http://127.0.0.1:9/ は http を使わずに失敗する／Windows で 404 のとき、Keychain を見ずに「Windows 版では、まだログインできません」を返す。直す前は、それぞれ「curl を起動できません：指定されたパスが見つかりません。 (os error 3)」・「Keychain を使えません：指定されたパスが見つかりません。 (os error 3)」で失敗した。前提の確かめ：curl.exe も、--fail で 404 のとき「returned error: 404」を出す（127.0.0.1 の小さなサーバーで。is_not_found で見分けられる）。127.0.0.1 のつながらない場所で、curl.exe が失敗するまで 2057〜2076 ms（AC 電源。Windows は、つながらないと分かるまでに約 2 秒かかる）。テストは AC 電源で動かした。画面の確かめ：問題の選択欄で終わったコンテストの一覧と問題ページを取る、「コンテストを作る」、ないコンテストの 404 の文 |
 | S12 | Defender の注意（9.1 の 8・追加 13） | はじめの案は、Windows だけ、ビルドの直後の 1 ケース目が TLE のとき、実行ログに 1 行の注意を出すことだった。先に測ると（4.5 の「1 回目と 2 回目」の行）、S5d から実行時間を再開したあとから数えるので、新しい exe の 1 回目の遅れ（全体で約 80〜110 ms）は、ほぼ実行時間の外に出ていて、実行時間の差は約 2 ms だった。1 回目だけ TLE になる場面はほとんどないので、注意は出さずに S12 を閉じた（利用者の選択。コードは変えていない）。押してから結果が出るまでの全体の時間は、1 回目だけ約 0.1 秒延びるが、ビルドの時間に比べて小さいので気にしない（利用者の判断）。測ったのは写した exe だが、ビルドで書いた直後の exe でも、画面の確かめで 1 回目だけ遅くなる様子はなかった（S8 の画面の確かめで、ビルドの直後のサンプルテストが 19 ms で AC、S9 の画面の確かめでも 77〜109 ms で AC。測っていないことの補い） | 測定（コミットしない一時的なテスト。測ったあとで消し、目印の件数が 0 で、git status に出ないことを確かめた）。AC 電源 |
-| S13 | まとめ | この文書に段階 2 の結果。後片付け：judges_cases_with_a_real_program の一時フォルダ、%TEMP% に前から残っている atcoder-studio-* のフォルダ（2026-11-03 の時点で 14 個。どれも 2026-10-29 の日付。どのテストが残したかを調べてから扱う）。Job に入れるのが遅いこと（S5d の行）を速くする工夫をするかの案。電池で動いているときの時間のテスト：2026-11-04、ノート PC が電池（放電中・残り 45%・電源プラン「バランス」）のときに全部の cargo test を動かすと、全体が 33.69 秒・29.60 秒かかり（AC のときは約 15〜19 秒）、時間を確かめるテスト（run::tests::stops_a_case_at_the_time_limit〔1500 ms 未満〕、process::windows_tests::stops_both_on_request〔3 秒未満〕、process::windows_tests::stops_a_program_over_the_memory_limit_while_running〔2 秒未満〕）が 1〜3 つ落ちた。単独では 0.36 秒で通り、AC につないで全部を動かすと 297 通過・0 失敗（18.97 秒）。電池のときに CPU が遅くなり、一斉の起動が遅れるためと考えている（推測）。時間の確かめの余裕を見直すか、電源につないで動かすことを決まりにするかを S13 で決める。release でのコンソールの窓の確かめ：段階 2 で起動するようになったもの（Job に入れて動かす解答・ジャッジ、g++・Python、S11 の curl.exe など）を、release でビルドした IDE から動かして、コンソールの窓が出ないことを、まとめて確かめる（段階 1 の確かめの 6 と同じやり方。S11 で決めた）。LSP・デバッグの子の Job の記録（S13 で足した。2026-11-04）：win.rs の JOBS は、run・run_pair では reap（release_job）で消すが、言語サーバーを止めるとき（lsp.rs の stop。kill_group のあと child.wait）と、デバッグのアダプターを止めるとき（debug.rs の shutdown・debugpy につなげなかったとき）は release_job を呼ばないので、その pid の記録（job: None と、起動したときのプロセスのハンドルの写し）が、IDE が終わるか同じ pid が使い回されるまで残る（コードで確認。win.rs のコメントには書いてあったが、この文書には書いていなかった）。言語サーバーを起動し直すたびに、記録とハンドルが 1 つずつ増える。S13 で、言語サーバーは直した（Server::stop で、回収のあとに Windows だけ release_job を呼ぶ。先に書いたテスト forgets_the_job_record_after_stopping_on_windows〔test_child を Server::spawn で起動して Server::stop で止める〕が「止めたあとも JOBS に pid 41248 の記録が残っている」で落ちることを確かめてから直した）。デバッグ（debug.rs の 2 か所。965 行あたりの debugpy につなげなかったときと、1225 行あたりの shutdown）にも同じ記録が残るが、Windows ではまだ動かせずテストで確かめられないので、段階 6 で、テストと一緒に直す（利用者の選択。段階 6 の行に書いた）。設定の画面の Python の欄の説明（S13 の B1・B2 の手順を書くときに見つけた。2026-11-05）：処理系のパスを書いていないときの説明は、Windows でも macOS の探し方（「/opt/homebrew/bin・PATH・/usr/local/bin から探します」）を出していた。S13 で、文を src/settings/pythonNote.ts の pythonSearchNote に移し、Windows だけ S7 の探し方（CPython はレジストリ〔PEP 514〕の 3.13 → PATH の python.exe、Microsoft Store の実行エイリアスは使わない。PyPy は PATH の pypy3.11.exe・pypy3.exe）の文にした。macOS の文は変えていない。先に書いたテスト tests/pythonNote.test.ts の Windows の確かめが「「レジストリ（PEP 514）」がない：処理系は /opt/homebrew/bin・…」で落ちることを確かめてから直した。画面の確かめ（2026-11-05。利用者が dev で。settings.json の python.cpython・python.pypy はどちらも空）：「設定…」の Python の欄の説明に Windows の文がそのまま出て、/opt/homebrew は出なかった。「処理系」を「PyPy 3.11」に切り替えても同じ文のまま。キャンセルで閉じた（settings.json は変えていない）。手順の書き間違い：欄の一覧を「左の」と書いたが、設定の画面の上に横一列（キー・色・表示・問題文・提出・Python・スニペット・テンプレート）に並んでいる | 全体の cargo test・cargo clippy --all-targets・npm run build |
+| S13 | まとめ | この文書に段階 2 の結果。後片付け：judges_cases_with_a_real_program の一時フォルダ、%TEMP% に前から残っている atcoder-studio-* のフォルダ（2026-11-03 の時点で 14 個。どれも 2026-10-29 の日付。どのテストが残したかを調べてから扱う）。Job に入れるのが遅いこと（S5d の行）を速くする工夫をするかの案。電池で動いているときの時間のテスト：2026-11-04、ノート PC が電池（放電中・残り 45%・電源プラン「バランス」）のときに全部の cargo test を動かすと、全体が 33.69 秒・29.60 秒かかり（AC のときは約 15〜19 秒）、時間を確かめるテスト（run::tests::stops_a_case_at_the_time_limit〔1500 ms 未満〕、process::windows_tests::stops_both_on_request〔3 秒未満〕、process::windows_tests::stops_a_program_over_the_memory_limit_while_running〔2 秒未満〕）が 1〜3 つ落ちた。単独では 0.36 秒で通り、AC につないで全部を動かすと 297 通過・0 失敗（18.97 秒）。電池のときに CPU が遅くなり、一斉の起動が遅れるためと考えている（推測）。時間の確かめの余裕を見直すか、電源につないで動かすことを決まりにするかを S13 で決める。release でのコンソールの窓の確かめ：段階 2 で起動するようになったもの（Job に入れて動かす解答・ジャッジ、g++・Python、S11 の curl.exe など）を、release でビルドした IDE から動かして、コンソールの窓が出ないことを、まとめて確かめる（段階 1 の確かめの 6 と同じやり方。S11 で決めた）。→ 2026-11-05 に確かめた（A6。exe はエクスプローラーから起動。どの操作でも窓は出なかった。「S13 の release の確かめ」の節）。LSP・デバッグの子の Job の記録（S13 で足した。2026-11-04）：win.rs の JOBS は、run・run_pair では reap（release_job）で消すが、言語サーバーを止めるとき（lsp.rs の stop。kill_group のあと child.wait）と、デバッグのアダプターを止めるとき（debug.rs の shutdown・debugpy につなげなかったとき）は release_job を呼ばないので、その pid の記録（job: None と、起動したときのプロセスのハンドルの写し）が、IDE が終わるか同じ pid が使い回されるまで残る（コードで確認。win.rs のコメントには書いてあったが、この文書には書いていなかった）。言語サーバーを起動し直すたびに、記録とハンドルが 1 つずつ増える。S13 で、言語サーバーは直した（Server::stop で、回収のあとに Windows だけ release_job を呼ぶ。先に書いたテスト forgets_the_job_record_after_stopping_on_windows〔test_child を Server::spawn で起動して Server::stop で止める〕が「止めたあとも JOBS に pid 41248 の記録が残っている」で落ちることを確かめてから直した）。デバッグ（debug.rs の 2 か所。965 行あたりの debugpy につなげなかったときと、1225 行あたりの shutdown）にも同じ記録が残るが、Windows ではまだ動かせずテストで確かめられないので、段階 6 で、テストと一緒に直す（利用者の選択。段階 6 の行に書いた）。設定の画面の Python の欄の説明（S13 の B1・B2 の手順を書くときに見つけた。2026-11-05）：処理系のパスを書いていないときの説明は、Windows でも macOS の探し方（「/opt/homebrew/bin・PATH・/usr/local/bin から探します」）を出していた。S13 で、文を src/settings/pythonNote.ts の pythonSearchNote に移し、Windows だけ S7 の探し方（CPython はレジストリ〔PEP 514〕の 3.13 → PATH の python.exe、Microsoft Store の実行エイリアスは使わない。PyPy は PATH の pypy3.11.exe・pypy3.exe）の文にした。macOS の文は変えていない。先に書いたテスト tests/pythonNote.test.ts の Windows の確かめが「「レジストリ（PEP 514）」がない：処理系は /opt/homebrew/bin・…」で落ちることを確かめてから直した。画面の確かめ（2026-11-05。利用者が dev で。settings.json の python.cpython・python.pypy はどちらも空）：「設定…」の Python の欄の説明に Windows の文がそのまま出て、/opt/homebrew は出なかった。「処理系」を「PyPy 3.11」に切り替えても同じ文のまま。キャンセルで閉じた（settings.json は変えていない）。手順の書き間違い：欄の一覧を「左の」と書いたが、設定の画面の上に横一列（キー・色・表示・問題文・提出・Python・スニペット・テンプレート）に並んでいる | 全体の cargo test・cargo clippy --all-targets・npm run build |
 
 段階 2 で利用者が手で確かめること（各コミットのあとに手順を書いて頼む）
 - Rust・C++・CPython・PyPy のそれぞれで、AC・WA・RE（0 除算・範囲外・panic・アクセス違反）・TLE（無限ループ）・MLE（大きな配列）になる解答の判定と、時間・メモリ・RE の名前の表示
@@ -835,6 +835,33 @@ gen.cpp・naive.cpp をビルドし直し（run.rs の prepare_cpp。前の出�
 同じ gen.cpp を、この機械の g++（C:\Program Files (x86)\mingw64\bin）に同じ警告のオプションで 2 回続けて渡すと、2 回とも同じ警告が
 出た（scratchpad で確かめた）。そのため、gen.cpp を作り直さなかったからではない。2 回目を押す前に gen.cpp が変わっていたか、
 エラー一覧を見た時点が違ったかは分からない
+
+S13 の release の確かめ（A6：コンソールの窓。2026-11-05。利用者が Windows 11 で確かめた。92da88f を `npm run tauri build -- --no-bundle`
+〔AC 電源、5 分 11 秒〕でビルドした src-tauri\target\release\atcoder-studio.exe〔10,094,592 バイト〕を、dev を閉じてから、エクスプローラーで
+ダブルクリックして起動した。ターミナルから起動すると、子がそのコンソールを受け継いで窓が見えなくなるおそれがあるため。段階 1 の
+確かめ〔画面の操作の確認の 6〕でどう起動したかは未確認。インストーラーは作っていない）
+
+見たもの：操作のたびに、黒い窓（コマンドプロンプト・Windows ターミナル）、タスクバーに一瞬増えるアイコン、5 では Windows のエラー報告の
+ダイアログ（「動作を停止しました」など）と「Microsoft Visual C++ Runtime Library」のダイアログ。パッケージは B1・B2 と同じ t1・c1・p1
+
+| 番号 | 操作 | 動く子 | 結果 |
+| --- | --- | --- | --- |
+| 0-3 | ダブルクリックで起動 | — | OK。IDE の窓だけが出た |
+| 1-1 | Rust の対話テスト | cargo・rustc -vV・解答・ジャッジ（Job） | OK。窓は出なかった |
+| 1-2 | Rust のサンプルテスト（AC） | cargo・解答 | OK。窓は出なかった |
+| 1-3 | Rust の TLE（`fn main() { loop {} }`） | 解答 | OK。窓は出なかった |
+| 1-4 | 「実行」を「停止」で止める | 解答 | OK。窓は出なかった |
+| 1-5 | 言語サーバーの再起動 | rust-analyzer | OK。窓は出なかった |
+| 2-1 | C++ の対話テスト | g++（版・ビルド）・解答・ジャッジ | OK。窓は出なかった |
+| 2-2 | C++ のランダムテスト | g++・解答・生成器・愚直解 | OK。窓は出なかった |
+| 2-3 | C++ の実行 | g++・解答 | OK。窓は出なかった |
+| 3-1 | CPython の対話テスト | python（版の確かめ・-X utf8 での実行） | OK。窓は出なかった（利用者が途中で main.py の解答を消したので、B2 の 3-7 と同じコードを貼り直してから確かめた） |
+| 3-2 | CPython のランダムテスト | python | OK。窓は出なかった |
+| 3-3 | CPython のサンプルテスト | python | OK。窓は出なかった |
+| 4-1 | abc401 の一覧 | curl.exe | OK。窓は出なかった（abc400 は保存済みで、一覧・問題ページは保存したものを使い curl.exe を動かさない〔problem.rs の load_problem・load_task_list〕ので、まだ取ったことのない abc401 にした） |
+| 4-2 | abc401_a の問題ページ | curl.exe | OK。窓は出なかった |
+| 4-3 | 問題文の欄の「再取得」 | curl.exe | OK。窓は出なかった |
+| 5 | C++ の abort（`int main(){std::abort();}` を「実行」） | g++・解答 | OK。実行ログの最後に「終了コード 0xC0000409（異常終了：C++ の abort・assert・捕まえない例外、Rust の abort など）で終了しました（実行時間 114 ms（ローカルの計測））」。黒い窓も、エラー報告のダイアログも、Microsoft Visual C++ Runtime Library のダイアログも出なかった（ReportArchive の記録が 1 つ増えることは、利用者が了承した。数えてはいない） |
 
 段階 2 の既知の問題（まだ直さない）
 
@@ -1040,7 +1067,10 @@ gen.cpp・naive.cpp をビルドし直し（run.rs の prepare_cpp。前の出�
 - 4.3：Rust の出力の改行、exact の比較で WA になること、include_str! の testdata のテスト（CPython・PyPy の出力が CRLF になることは 2026-10-31 に確認済み）
 - 4.4：GUI から起動した子のコードページ、g++ が CP932 で出すもの、`-E` で PYTHONUTF8 が無視されること（PyPy が `-X utf8` を受け付けることは 2026-10-31 に確認済み）
 - 4.5：遅れの原因が Defender か、作業領域・大きな exe での遅れ、GetProcessTimes で検査を除けるか
-- 4.6：release で窓が出ること、Job Object との組み合わせ
+- 4.6：対策（CREATE_NO_WINDOW）がないときに窓が出ること（推測のまま）、IDE が別の Job に入っているときの Job Object との組み合わせ
+  （対策を入れたあとの release の exe で、操作のたびに窓が出ないことは、段階 2 S13 の A6〔2026-11-05〕で確認済み）
+- インストーラー（nsis）で入れた exe での動き（段階 1・段階 2 とも、画面の確認は target\release の exe で行った）。段階 1 の release の
+  確かめで、exe をどう起動したか（エクスプローラーか、ターミナルか）
 - 4.7：実行中の exe の上書きの失敗、TerminateJobObject が非同期か
 - 4.8：引数の引用、.cmd の制約、clangd の `--query-driver` の読み方、`\\?\` を受け付けないツール
 - 4.9：BrokenPipe、ハンドルの継承、CRLF の影響
