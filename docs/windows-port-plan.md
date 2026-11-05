@@ -791,6 +791,51 @@ AtCoder の公開ページにつないだ。この機械の Windows 版では、
 | 3-4 | 作ったパッケージを開いたときの問題文 | OK。abc400_b の src\main.rs（Rust なので main は src の中）を開くと、右の列にその問題の問題文が出た |
 | 4 | 開催中のコンテスト（AHC074）の 404 | OK。2 と同じ文が出た |
 
+S13 の画面の確かめ（B1：PyPy、B2：残りの言語とテストの種類。2026-11-05。利用者が Windows 11 で確かめた。dev、AC 電源、
+S13 のコミット c531943 のあと。Rust のパッケージ t1、Python の p1、C++ の c1。手順のコードは、Rust の 7 つと Python の 4 つを、
+先に scratchpad で動かして確かめた。時間とメモリは書き留めていない）
+
+手順の誤り：
+- 4-0・4-7 で、settings.json の `"pypy"` を外で書き換えてから、設定の画面で処理系を選んで保存するように書いたが、IDE を開いたまま
+  settings.json を書き換えると、設定の画面の保存は断られる（commands.rs の save_settings が、最後に読んだあとに外で変わっていれば
+  書かずに ChangedOutside を返す。コードで確認）。利用者は、IDE を閉じてから `"interpreter"` と `"pypy"` の 2 行を直接書き換え、
+  設定の画面は見るだけで保存しなかった。確かめのあと、2 行とも元に戻した
+- 5-1 の examples/gen.cpp を `int main(int argc,char**argv)` と書いたので、argc を使っておらず、`-Wextra` の警告
+  `unused parameter 'argc' [-Wunused-parameter]` が出た（判定には関係しない）。`int main(int, char**argv)` と書けば出ない
+
+| 番号 | 確かめたこと | 結果 |
+| --- | --- | --- |
+| 1-1 | Rust のサンプルテストの AC（入力 3、期待出力 6） | OK。AC |
+| 1-2 | Rust の WA | OK。WA |
+| 1-3 | Rust の範囲外の添字（panic） | OK。RE・終了コード 101（panic） |
+| 1-4 | Rust の 0 での割り算（panic） | OK。RE・終了コード 101（panic） |
+| 1-5 | Rust の MLE（入力で大きさを決める 1.5 GB の確保） | OK。MLE・メモリの制限を超えました |
+| 2 | Rust の対話テスト（examples/judge.rs、test/interactive-1.in が 7、interactive-2.in が 42） | OK。interactive-1 が AC、interactive-2 が WA。interactive-1 を開くと、やり取りが時系列で並び、`! 7` で終わっていた |
+| 3-1 | CPython のサンプルテストの AC | OK。AC |
+| 3-2 | CPython の WA | OK。WA |
+| 3-3 | CPython の範囲外（IndexError） | OK。RE・終了コード 1（1 回目は、利用者が 3 行目を貼り漏れて、何も出さずに終わったので WA だった。貼り直して RE。手順の誤りではない） |
+| 3-4 | CPython の TLE | OK。約 2.5 秒で TLE |
+| 3-5 | CPython の MLE | OK。MLE |
+| 3-6 | CPython のランダムテスト（生成器 gen.py・愚直解 naive.py） | OK。実行ログは期待どおり。7 回目で WA になり、test に random-1.in・random-1.out ができた |
+| 3-7 | CPython の対話テスト（ジャッジは Python） | OK。interactive-1 が AC、interactive-2 が WA。やり取りの記録に `\r` などの記号は見えなかった |
+| 4-0 | PyPy を処理系にする（上の手順の誤りのとおり、IDE を閉じて settings.json を書き換えた） | OK。設定の画面の「処理系」が PyPy 3.11 で、説明にパスが出た |
+| 4-1 | PyPy の AC と「ローカル：」の行 | OK。AC。「ローカル：Python 3.11.13 (413c9b7f57f5, Jul 03 2025, 18:04:37) [PyPy 7.3.20 with MSC v.1941 64 bit (AMD64)]（C:\Users\yunoa\AppData\Local\Programs\pypy3.11-v7.3.20-win64\pypy3.exe）」。版が違うという注意は出なかった |
+| 4-2 | PyPy の WA | OK。WA |
+| 4-3 | PyPy の 0 での割り算（ZeroDivisionError） | OK。RE・終了コード 1 |
+| 4-4 | PyPy の範囲外（IndexError） | OK。RE・終了コード 1 |
+| 4-5 | PyPy の TLE | OK。TLE |
+| 4-6 | PyPy の MLE | OK。MLE |
+| 4-7 | 元に戻したあと | OK。実行ログの「ローカル：」が Python 3.13.7 に戻った |
+| 5-1 | C++ のランダムテスト（生成器 gen.cpp・愚直解 naive.cpp） | OK。1 回目は、エラー一覧に「examples/gen.cpp:2:14: warning: unused parameter 'argc' [-Wunused-parameter]」が出た（上の手順の誤り）が、ランダムテストは動いた。2 回目は警告が出なかった（下の注）。3 回目のケースで WA になり、test に random-1.in・random-1.out ができた |
+| 5-2 | C++ の対話テスト（examples/judge.cpp） | OK。interactive-1 が AC、interactive-2 が WA |
+
+5-1 の 2 回目に警告が出なかったわけは未確認。コードでは、C++ は「ランダムテスト」を押すたびに、main.cpp と examples の
+gen.cpp・naive.cpp をビルドし直し（run.rs の prepare_cpp。前の出力を使い回す仕組みはない）、それまでのビルドの診断を合わせて
+エラー一覧に送る（build_cpp の RunEvent::Diagnostics。画面は App.tsx で、実行を始めるときに消し、届くたびに置き換える）。
+同じ gen.cpp を、この機械の g++（C:\Program Files (x86)\mingw64\bin）に同じ警告のオプションで 2 回続けて渡すと、2 回とも同じ警告が
+出た（scratchpad で確かめた）。そのため、gen.cpp を作り直さなかったからではない。2 回目を押す前に gen.cpp が変わっていたか、
+エラー一覧を見た時点が違ったかは分からない
+
 段階 2 の既知の問題（まだ直さない）
 
 - 0xC0000409（__fastfail。C++ の abort・assert・捕まえない例外、Rust の abort）で落ちるたびに、Windows のエラー報告の記録が
@@ -814,7 +859,8 @@ AtCoder の公開ページにつないだ。この機械の Windows 版では、
   それがそのままジャッジの標準入力に渡る。C++ の `getline` など、行の最後の `\r` を取り除かない読み方をするジャッジ（利用者が
   書いたもの）では、行の最後に `\r` が残りうる（推測。4.9）。ジャッジが Python の `input()` なら `\r\n` を取り除くので影響は
   ない（S7 の connects_python_programs で、CPython の解答とジャッジの判定が正しく出ることを確かめた）。やり取りの記録
-  （画面の表示）にも `\r` が残る（同じテストで、1 行目が `"1 100\r\n"` だった。画面で `\r` が見えるかは未確認）
+  （画面の表示）にも `\r` が残る（同じテストで、1 行目が `"1 100\r\n"` だった。S13 の画面の確かめの 3-7〔CPython の解答と
+  ジャッジ〕では、画面のやり取りの記録に `\r` などの記号は見えなかった。画面が `\r` を取り除いたのか、見えない文字として出したのかは未確認）
 - 証明書の失効の確かめ（S11 で扱わないと決めた）。Windows の curl.exe（Schannel）は、https の証明書が失効していないかを
   ネットワークで確かめる。会社などのネットワークで、その確かめの先（CRL・OCSP）につながらないと、問題の取得が失敗することが
   ある（推測。この機械では起きていない）。そのときは、session::curl_failure の終了コード 35 の文（「安全な接続（TLS）を
