@@ -500,6 +500,8 @@ Windows で飛ばしているテスト（`#[cfg_attr(windows, ignore = "…")]`�
 | 4 | 4 | sources の 3 件、lsp::overrides_initialize_and_answers_configuration | file: の URI・`\\?\`・パスの区切り |
 | 6 | 5 | debug の 5 件 | lldb-dap（デバッグは今回の移植に含めない） |
 
+（段階 1 の時点の表。段階 2 のあとは 23 件で、「段階 2 の結果」の表にある）
+
 Unix 専用にしたテスト（`#[cfg(unix)]`）：シンボリックリンク・Unix のパーミッション・/bin/sh・perl・kill・/bin/cat を使うもの（関数ごとに 34 件と、process.rs の sh のテストの mod 全体）。
 workspace.rs の 4 件と storage.rs の 3 件は、リンク・パーミッションの文だけを Unix に限り、ほかは Windows でも動かしている。Windows で同じことを確かめるテストは、後の段階で足す。
 
@@ -918,6 +920,129 @@ S13 の release の確かめ（A6：コンソールの窓。2026-11-05。利用�
   ジャッジは UTF-8 なので、解答の出力は UTF-8 を前提にする）、(b) 出力が UTF-8 として読めないときだけ CP932 として読み直す
   （推し量りが外れると、別の化け方になる）。(a) を勧める（未確認）
 
+### 段階 2 の結果（2026-11-05）
+
+ブランチ windows-port-stage2。main からのコミットは、このまとめを入れて 32 個（9545504〜）。origin/windows-port-stage2 には
+S7 の 1df2e10 まで push してあり、そのあとの 16 個（a3da2a4〜このまとめ）はまだ push していない（push は B3 で決める）。
+最後の確かめ（Windows、AC 電源、62daae6）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 301 通過・0 失敗・
+23 無視、npm test 9 通過・0 失敗、npm run build 通過。一つひとつの直し方・直す前の失敗・測った値は、上の段階 2 の表の各行と
+コミットのメッセージにある
+
+コミット（段階ごと。並びはコミットの順）
+
+| 段階 | コミット | 入れたもの |
+| --- | --- | --- |
+| S1 | 9545504 | この文書（段階 2 の計画・決めたこと） |
+| S2 | 8271399・eeef85e | テスト用の子のプログラム（examples/test_child.rs。テストの中で rustc で作る）と、process.rs の Windows のテスト |
+| S3 | 83f40ac | 子を Job Object に入れ、止めるときは子孫ごと止める |
+| S3b | d4c1abf | 止めた直後のビルドの前に、出力の exe が書けるまで待つ |
+| S4 | 66d2d4f | 使用メモリを WorkingSet で測る（MLE） |
+| S10a | bc85242 | rustc の診断の場所の区切りを / にする |
+| S10b | 5b782ca・6c58873 | 対話テストの、先に失敗した側の決め方（**Unix の動きも変わる**） |
+| S10c・S10d | ede085a・25370f1 | 同時の保存の失敗の文に段階と OS のエラーを入れ、Windows では同じパスへの保存を 1 つずつにする |
+| S5〜S5d | 78d1796・1e4964c・07939e6・dbd91c8 | 例外の終了コードの名前、扱われない例外と __fastfail で落ちた解答がすぐ終わる、実行時間を再開のあとから数える |
+| S6 | db1c4e9 | exact の比較と期待出力の保存の前に \r\n を \n に直す |
+| S7 | 1df2e10 | CPython をレジストリから見つけ、Python に -X utf8 を付ける |
+| S8 | a3da2a4・1a93f87 | MinGW の g++ を見つけてビルドし、作った exe を動かす。画面の確かめ |
+| S9 | 02b4945・1b0bb59 | 手元のビルドの主スレッドのスタックを 1 GiB にする。画面の確かめ |
+| S10 | 6981744・9417665 | 実行ログの `\` 区切りの場所をリンクにする、npm test（node --test）を足す。画面の確かめ |
+| S11 | 47fcbe2・b50904c | curl.exe で問題ページと問題の一覧を取る。画面の確かめ |
+| S12 | 6ec7297 | Defender の注意を、測った結果で取りやめる（コードは変えていない） |
+| S13 | 9cbe099・c531943・c2f837f・92da88f・62daae6・このまとめ | 決めたこと、言語サーバーの Job の記録、B1・B2 の画面の確かめ、設定の画面の Python の説明、release の確かめ（A6）、このまとめ |
+
+push と CI（段階 2 の間に、利用者の許可を得て push したもの）
+
+- CI の結果を見たもの（どれも macos-latest・windows-latest とも成功。そのときの報告から）：run 41308130068（d4c1abf）、
+  run 41312029609（bc85242）、run 41313266501（5b782ca。macOS の cargo test の段階も成功）、run 41446504987（6c58873）
+- d4c1abf より前の push と、78d1796〜1df2e10（S5〜S7）の push の CI の結果は、まとめの中では確かめていない。push のあとの CI で
+  まとめて確かめる
+- npm test の段階（S10 で ci.yml に足した）は、まだ push していないので、CI ではどちらの OS でも動いたことがない
+
+macOS / Unix の経路を変えた所（cfg・属性を付ける以外の変更。コミットのメッセージと `git diff main` で確かめた。手元の Mac では
+何も確かめていない。どれも push のあとの CI の macos-latest で確かめる）
+
+| コミット | 変えた所 | Unix の動き | push のあとの CI（macos-latest）で見ること |
+| --- | --- | --- | --- |
+| **5b782ca（S10b）** | process.rs の run_pair・spawn_relay：中継のスレッドが EOF を読んだら、相手の標準入力を閉じる前に PairEvent::OutputClosed を送る。両方がこちらが止める前に異常に終わったときは、出力が先に閉じた側を先に失敗した側とする | **変わる**（対話テストで両方が異常に終わったときの、先に失敗した側） | **いちばん大事**。cargo test の段階で、process::tests::blames_the_side_whose_output_closed_first（/bin/sh で順番を作る）と interactive の対話テストが通ること。このコミットの CI（run 41313266501）では通ったが、そのあと process.rs の run・run_pair を S5c・S5d で変えた（Windows の cfg の中だけ）ので、もう一度見る |
+| **6c58873（S10b の直し）** | 同じ run_pair：決め直すのは、先に閉じた側の閉じた知らせが、相手の終わりの知らせより先に届いていたときだけにする | **変わる**（出力の閉じた知らせが遅れたとき、終わった順のまま） | **いちばん大事**。process::tests::keeps_the_exit_order_when_output_closes_late と、書き直した blames_the_side_whose_output_closed_first が通ること（run 41446504987 では通った） |
+| d4c1abf（S3b） | run.rs：cargo metadata の結果を変数に取っておく形、C++ の build_cpp(...)? を let built = …; built?; に分けた | 同じ | cargo build・clippy・test が通ること（run 41308130068 では通った） |
+| ede085a（S10c） | storage.rs の write_atomic：失敗の文に段階と OS のエラーを入れた（「設定を保存できません（名前を変えて置き換える：…）」） | 文だけ変わる（動きは同じ） | storage のテストが通ること |
+| 78d1796（S5） | run.rs の exit_code_text を共通にし、RunOutcome::Exited に label（画面に出す文字）を足した。history.rs、interactive.rs・random.rs の文、画面（ipc/run.ts の exitLabel・runLog.ts・TestResults.tsx） | 同じ（Unix の終了コード 0〜255 は今までどおり「終了コード N」。前の版の実行履歴は label がなくても今までの形） | run・interactive・random のテストと npm run build が通ること |
+| 1e4964c（S5b） | runLog.ts：label が「）」で終わるときは、「で終了しました」の前の空白を入れない | 同じ（Unix の label は「）」で終わらない） | npm run build が通ること |
+| dbd91c8（S5d） | process.rs の run・run_pair：実行時間の数え始めと、ジャッジを起動できなかったときの止め方に cfg(not(windows)) を付けた | 同じ（cfg だけ） | process のテストが通ること |
+| db1c4e9（S6） | compare.rs：exact_compares_bytes の「CRLF は一致しない」の行に cfg(not(windows))。Mode::Exact の腕は cfg だけ | 同じ | compare のテストが通ること |
+| 1df2e10（S7） | python.rs：names・hint・find_in・program の引数・find_interpreter の最後の形・library_dirs_command を cfg で分ける・場所を移す | 同じ | python・random・interactive の Python のテスト（runner に python3.13 がなければ自分で飛ぶ） |
+| a3da2a4（S8） | cpp.rs・run.rs：GCC_HINT・sdk_path・find_compiler の最後の形・find_compiler_in・executable・header_dirs_command・Program::built_with・gcc_output（Unix ではそのまま返す関数を通す） | 同じ | cpp・run のテスト（runner に g++-15 がなければ自分で飛ぶ） |
+| 02b4945（S9） | run.rs：Rust のビルドの命令の組み立てを cargo_builds に移し、命令（今までの cargo build 1 つ）を for で順に動かす。診断を送る所を、失敗したときとループのあとに分けた | 同じ（命令が 1 つなので） | run・random・interactive の、本物の cargo を使うテストが通ること |
+| 6981744（S10） | logLinks.ts の splitLocations に引数 windows を足した（Windows 以外は今までと同じ正規表現と判定）。scaffold.rs はテストの比べ方だけ。package.json に npm test、ci.yml に npm test の段階（両方の OS） | 同じ | **npm test の段階が macOS で初めて動く**。tests/logLinks.test.ts（7 件）と tests/pythonNote.test.ts（2 件）が通ること（.nvmrc の Node 24.22.0） |
+| 47fcbe2（S11） | problem.rs：fetch_public の Command::new("/usr/bin/curl") を let に分けた。with_session_fallback の 404 の腕に cfg(not(windows))。import を 2 行に分けた | 同じ（起動するものと引数、文は同じ） | problem のテストが通ること |
+| 92da88f（S13） | 設定の画面の Python の説明の文を SettingsDialog.tsx から src/settings/pythonNote.ts に移した（文字は同じ） | 同じ | npm test の pythonNote の「macOS：今までの文のまま」が通ること |
+
+ほか（Unix のコードは変えていない）：examples/test_child.rs（S2〜。std だけ。Unix の部分は cfg(unix)）は、macOS でも
+cargo clippy --all-targets・cargo test がビルドする（run 41308130068 からの CI で通っている）。S3・S4・S5c・S13（c531943）の lsp.rs・debug.rs・
+process.rs・win.rs の変更は cfg(windows) の中と Windows のテストだけ。Cargo.toml は windows-sys（Windows だけの依存）の feature を
+足しただけ。push のあとの CI では、まずすべての段階（fmt・build・clippy・test・npm test）が通ることを見て、そのあと上の太字の
+3 つ（S10b・その直し・npm test）を確かめる。clippy は `-D warnings` を付けていないので、警告の有無はログを開かないと分からない
+（段階 1 からの未確認）
+
+Windows で飛ばしているテスト（2026-11-05 の時点で 23 件。段階 1 の表〔25 件〕のうち、段階 2 の 3 件は ignore を外した。
+debug の 1 件は S8 で足した）
+
+| 直す段階 | 件数 | テスト | 理由 |
+| --- | --- | --- | --- |
+| 3・5 | 13 | session の 4 件、problem::reads_with_the_session_only_after_a_404_when_logged_in、submit の 8 件 | /usr/bin/security（Keychain）と /usr/bin/curl（ログインの経路） |
+| 4 | 4 | sources の 3 件、lsp::overrides_initialize_and_answers_configuration | file: の URI・`\\?\`・パスの区切り |
+| 6 | 6 | debug の builds_launch_configuration・reports_missing_adapter・debugs_with_real_lldb_dap・debugs_cpp_with_real_lldb_dap（S8 で足した）・stops_pauses_and_catches_panics・ignores_lldbinit_and_does_not_wait_for_input | デバッグは段階 6 |
+
+段階 2 で確認済みになったこと（主なもの。詳しくは各行と画面の確かめの表）
+
+- Job Object で子孫まで止まる・使用メモリを測れる・MLE になる（S3・S4）。止めたあと 10〜40 ms ほど exe に書けないことがある（原因は未確認）
+- 例外の終了コード（0xC0000005・0xC0000094・0xC00000FD・0xC0000409）と、C++ の abort・assert・捕まえない例外が 0xC0000409 に
+  なること（S5・S5b）。WER のせいで落ちた解答が TLE になっていたことと、その直し（S5b・S5c）
+- Job に入れて再開するまでの時間（子 1 つで 53〜73 ms、30 個同時で最大 1.7〜2.3 秒）と、それを実行時間から外したこと（S5d）。
+  新しい exe の 1 回目の遅れは実行時間の外に出ていること（S12）
+- CPython・MinGW の出力の CRLF と、exact の比較（S6）。CPython の PEP 514 のレジストリと -X utf8（S7）
+- MinGW の exe が PATH にコンパイラの bin がないと 0xC0000135 で落ちること、ld が `\\?\` の -o で上書きできないこと（S8）
+- 既定のスタック（Rust の MSVC 1 MiB・MinGW 2 MiB）と、1 GiB にしたあと深い再帰が通ること。cargo rustc の `--` の後ろの引数で
+  依存を作り直さないこと（S9）
+- curl.exe（Schannel）で、ログインなしの問題ページと一覧が取れること（S11）
+- release の exe で、段階 2 の操作のたびにコンソールの窓もエラー報告のダイアログも出ないこと（A6）
+- 画面の確かめ：Rust・C++・CPython・PyPy のサンプルテスト（AC・WA・RE・TLE・MLE）、ランダムテスト、対話テスト（S5b〜S11・B1・B2）
+
+段階 2 のあとも未確認のまま残っていること
+
+- **macOS**：
+  - S8 からあと（a3da2a4〜）は、CI でまだ一度も動いていない。上の「macOS / Unix の経路を変えた所」を、push のあとの CI で確かめる
+  - d4c1abf より前と S5〜S7 の push の CI の結果は、まとめの中では確かめていない
+  - 手元の Mac での画面の操作は、段階 1 から一度もしていない
+  - clippy の警告の有無（CI は `-D warnings` なし）
+  - debugs_with_real_lldb_dap（CI では飛ばしている。段階 1 から）
+- **配り方**：インストーラー（nsis）で入れた exe での動き。段階 1 の release の確かめで exe をどう起動したか
+- **原因が分からないまま手当てしたもの**：
+  - 止めたあと exe に 10〜40 ms 書けないこと（S3b で待つ）
+  - 同時の保存がアクセス拒否で失敗すること（S10d で 1 つずつにし、案内を出す）
+- **Windows で動かしていない・決めていないもの**：
+  - Rust の gnu ターゲットのスタックのリンクの引数（`-Wl,--stack`。S9）
+  - AC Library を置いたときの画面の確かめ（`-I` に `\\?\` が付かないことはソースで確かめただけ。S10）
+  - IDE が別の Job に入っているときの Job Object の組み合わせ（4.6）
+  - 言語サーバー・ビルドと重なったときに、Job に入れて再開する時間がどれだけ延びるか（4.5）
+- **画面で見たが、仕組みを確かめていないもの**：
+  - 対話テストのやり取りの記録の `\r` が、画面で取り除かれたのか、見えない文字として出たのか（B2 の 3-7）
+  - C++ のランダムテストの 2 回目に、gen.cpp の警告が出なかったわけ（B2 の 5-1）
+- **段階 2 では直さないと決めたもの**：
+  - 子を Job に入れて再開するまでを速くする案（A4）
+  - GUI から起動した子の CP932 の文字化けの案（A7）
+
+  どちらも「段階 2 のあとの案」の節にある
+- **あとの段階で直すもの**：
+  - デバッグのアダプターを止めたあとの Job の記録（debug.rs の 2 か所。段階 6）
+  - VS Code のスニペットの場所と `/usr/bin/open`（段階 3）
+  - 言語サーバー・デバッグの見つからないときの案内文（段階 4・6）
+- 段階 1 から残っているもの：Ctrl+S そのものの保存（自動保存と区別していない）
+
+既知の問題（まだ直さない）は「段階 2 の既知の問題」の節にある：WER の ReportArchive の記録、入力の CRLF、対話テストの `\r`、
+証明書の失効の確かめ（Schannel）
+
 ### 段階 3：ファイル・URL を開く処理、ログイン情報の保存
 
 何を変えるか
@@ -1060,25 +1185,35 @@ S13 の release の確かめ（A6：コンソールの窓。2026-11-05。利用�
 - 2.2：cargo build のエラーを直したあとに出る、型検査より後の段階のエラー
 - 3 章の代替案のすべて（Windows で動かしていない）
 - std の Command が `.exe` のないパスに `.exe` を補うか
-- curl.exe が今の引数と `--config -` で同じに動くか
+- curl.exe が今の引数と `--config -` で同じに動くか（→ ログインなしの取得の引数〔--fail・--proto =https など〕は段階 2 S11 で確認済み。
+  `--config -` を使うログインの経路は段階 3）
 - menu.rs の macOS 向けの項目を Windows で使ったときの動き
 - WebView2 のブラウザの既定のキー（Ctrl+R など）と、keydown の preventDefault の効き方
 - 4.1：資格情報マネージャーの値の大きさの上限、incognito の効き方、パスワードの自動保存・自動入力の既定値
-- 4.3：Rust の出力の改行、exact の比較で WA になること、include_str! の testdata のテスト（CPython・PyPy の出力が CRLF になることは 2026-10-31 に確認済み）
-- 4.4：GUI から起動した子のコードページ、g++ が CP932 で出すもの、`-E` で PYTHONUTF8 が無視されること（PyPy が `-X utf8` を受け付けることは 2026-10-31 に確認済み）
-- 4.5：遅れの原因が Defender か、作業領域・大きな exe での遅れ、GetProcessTimes で検査を除けるか
+- 4.3：Rust の出力の改行、include_str! の testdata のテスト（CPython・PyPy の出力が CRLF になることは 2026-10-31 に確認済み。
+  exact の比較で WA になることは段階 2 S6 で確かめ、Windows だけ \r\n を \n に直してから比べるようにした）
+- 4.4：GUI から起動した子のコードページ（ping が CP932 で出すことは段階 2 S3 の画面の確かめで確認済み。ほかのプログラムは未確認）、
+  g++ が CP932 で出すもの、`-E` で PYTHONUTF8 が無視されること（PyPy が `-X utf8` を受け付けることは 2026-10-31 に、CPython が `-X utf8` で
+  パイプへ UTF-8 で出すことは段階 2 S7 のテストで確認済み）
+- 4.5：遅れの原因が Defender か、作業領域・大きな exe での遅れ、GetProcessTimes で検査を除けるか（新しい exe の 1 回目の遅れが
+  実行時間の外〔起動から再開まで〕に出ることは、段階 2 S12 で測って確認済み）
 - 4.6：対策（CREATE_NO_WINDOW）がないときに窓が出ること（推測のまま）、IDE が別の Job に入っているときの Job Object との組み合わせ
   （対策を入れたあとの release の exe で、操作のたびに窓が出ないことは、段階 2 S13 の A6〔2026-11-05〕で確認済み）
 - インストーラー（nsis）で入れた exe での動き（段階 1・段階 2 とも、画面の確認は target\release の exe で行った）。段階 1 の release の
   確かめで、exe をどう起動したか（エクスプローラーか、ターミナルか）
-- 4.7：実行中の exe の上書きの失敗、TerminateJobObject が非同期か
+- 4.7：TerminateJobObject が非同期か（止めたあと 10〜40 ms ほど exe に書けないことがあるのは段階 2 S3 で確認済み。原因は未確認で、
+  S3b でビルドの前に待つようにした）
 - 4.8：引数の引用、.cmd の制約、clangd の `--query-driver` の読み方、`\\?\` を受け付けないツール
-- 4.9：BrokenPipe、ハンドルの継承、CRLF の影響
+- 4.9：BrokenPipe、ハンドルの継承、CRLF の影響（ジャッジが Python の input() なら \r\n の影響がないことと、やり取りの記録に \r が
+  残ることは段階 2 S7 のテストで確認済み。C++ の getline で読むジャッジは未確認）
 - 4.10：`:`・末尾の `.` と空白・予約名を Windows が実際にどう扱うか（段階 1 では名前で断ったので、断る前の動きは確かめていない）、大文字・小文字の比較
 - 5 章：WinLibs・MSYS2 の入手できる版、ジャッジのパッケージの Windows 用の wheel、std::thread・std::print のリンクと実行
   （CPython 3.13.7・PyPy v7.3.20 の入手、MinGW と MSVC の Rust の既定のスタックは 2026-10-31 に確認済み）
-- 段階 2 の案で前提にしていること：`cargo rustc` の `--` の後ろの引数で依存を作り直さないこと、PATH に g++ がないと MinGW の exe が 0xC0000135 で落ちること、
-  各 NTSTATUS（スタックあふれ・abort・0 除算など）が実際にどの終了コードになるか、PeakWorkingSetSize を終わったプロセスのハンドルで読めるか
+- 段階 2 の案で前提にしていたこと（→ 段階 2 ですべて確認済み。この項目は記録として残す）：PeakWorkingSetSize を終わったプロセスのハンドルで読めること（S4）、
+  各 NTSTATUS の終了コード（0xC0000005・0xC0000094・0xC00000FD・0xC0000409。S5・S5b）、PATH に g++ がないと MinGW の exe が
+  0xC0000135 で落ちること（S8）、`cargo rustc` の `--` の後ろの引数で依存を作り直さないこと（S9）
+- macOS で、段階 2 の S8 からあと（a3da2a4〜）が CI で通ること。S10b とその直し（run_pair の、先に失敗した側の決め方。Unix の動きも
+  変わる）と npm test の段階を、push のあとの CI の macos-latest で見る（「段階 2 の結果」の「macOS / Unix の経路を変えた所」）
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
 - macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709〕。clippy の警告の有無、debugs_with_real_lldb_dap、画面の操作は macOS の機械で確かめる）
 
