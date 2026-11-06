@@ -187,11 +187,27 @@ fn float_equal(expected: &str, actual: &str, abs: Option<f64>, rel: Option<f64>)
             })
 }
 
+// Windows だけ（段階 2 S6）：\r のすぐあとに \n が来る組だけを \n に直す（\r だけのものは残す）。
+// C++（MinGW）・Python の解答はパイプへ \r\n を出し、Windows のエディタで作った期待出力も \r\n になりうるため
+#[cfg(windows)]
+pub(crate) fn crlf_to_lf(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(index, byte)| !(**byte == b'\r' && bytes.get(index + 1) == Some(&b'\n')))
+        .map(|(_, byte)| *byte)
+        .collect()
+}
+
 // 比べた結果。None は「比較不可・目視確認」
 pub fn judge(mode: &Mode, expected: &[u8], actual: &[u8]) -> Option<bool> {
     match mode {
         Mode::None => None,
+        #[cfg(not(windows))]
         Mode::Exact => Some(expected == actual),
+        // Windows では、両方の \r\n を \n に直してから比べる（段階 2 S6）
+        #[cfg(windows)]
+        Mode::Exact => Some(crlf_to_lf(expected) == crlf_to_lf(actual)),
         Mode::Whitespace => Some(whitespace_equal(
             &String::from_utf8_lossy(expected),
             &String::from_utf8_lossy(actual),
@@ -236,7 +252,29 @@ mod tests {
     #[test]
     fn exact_compares_bytes() {
         assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1 2\n"), Some(true));
+        // Windows では CRLF を LF に直してから比べる（下の exact_ignores_crlf_on_windows）
+        #[cfg(not(windows))]
         assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1 2\r\n"), Some(false));
+        assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1 3\n"), Some(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_ignores_crlf_on_windows() {
+        // 段階 2 S6：C++（MinGW）・Python の解答はパイプへ \r\n を出す。Windows では、期待出力と実際の出力の両方で、
+        // \r のすぐあとに \n が来る組だけを \n に直してから比べる
+        assert_eq!(
+            judge(&Mode::Exact, b"1 2\n3\n", b"1 2\r\n3\r\n"),
+            Some(true)
+        );
+        // Windows のエディタで作った期待出力（CRLF）と、Rust の解答の出力（LF）
+        assert_eq!(judge(&Mode::Exact, b"1 2\r\n", b"1 2\n"), Some(true));
+        // \r だけのものは直さない（違いとして見つかる）
+        assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1 2\r"), Some(false));
+        assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1\r2\n"), Some(false));
+        assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1 2\r\r\n"), Some(false));
+        // 直したあとも中身が違えば不正解
+        assert_eq!(judge(&Mode::Exact, b"1 2\n", b"1 3\r\n"), Some(false));
     }
 
     #[test]

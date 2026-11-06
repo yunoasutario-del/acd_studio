@@ -13,9 +13,10 @@
 // （結果の output_left_open が true になる）。
 // macOS（Unix）だけを対象にする。Windows は将来、Job Object で別に作る（05 P-05-3）
 //
-// Windows（移植の段階 1。docs/windows-port-plan.md 7 章 C3）は仮の実装：Unix の関数と同じ名前・同じ形の関数を
-// `#[cfg(windows)]` で置き、中身は win.rs に任せる。限界：止めるのは直接の子だけで子孫は残り、使用メモリは測らない
-// （段階 2 で Job Object にする）。Unix の経路のコードは変えない
+// Windows（移植の段階 1 C3・段階 2 S3。docs/windows-port-plan.md 7 章）：Unix の関数と同じ名前・同じ形の関数を
+// `#[cfg(windows)]` で置き、中身は win.rs に任せる。プロセスグループの代わりに Job Object を使う：process_group(0) で
+// CREATE_SUSPENDED を付けて起動し、spawn の直後に win::start_in_job で Job に入れてから動かす。kill_group は Job の中を
+// すべて止める（TerminateJobObject）。使用メモリは WorkingSet で測る（段階 2 S4）。Unix の経路のコードは変えない
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -75,7 +76,7 @@ pub struct Limits {
 // 外部のプログラムを起動する Command を作る。Unix では Command::new と同じ。
 // Windows では、窓だけで端末を持たない IDE からコンソールのプログラム（cargo・g++・解答など）を起動すると、そのたびに
 // コンソールの窓が出る（推測。未確認）ので、CREATE_NO_WINDOW を付ける（Windows 移植の段階 1 C6。docs/windows-port-plan.md 4.6）。
-// creation_flags は上書きなので、段階 2 で CREATE_SUSPENDED などを足すときも、ここで組み合わせる
+// creation_flags は上書きなので、process_group(0)（下の ProcessGroupShim）は CREATE_NO_WINDOW と CREATE_SUSPENDED を合わせて付ける
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg_attr(unix, allow(unused_mut))]
     let mut command = Command::new(program);
@@ -94,7 +95,9 @@ pub type Pid = libc::pid_t;
 pub type Pid = i32;
 
 // Windows には、プロセスグループもシグナルもない。Unix の CommandExt::process_group と ExitStatusExt::signal と
-// 同じ名前のものを置き、Unix と同じ書き方のまま動くようにする（何もしない・いつも None）。段階 2 で Job Object に置き換える
+// 同じ名前のものを置き、Unix と同じ書き方のまま動くようにする。
+// process_group(0) は、Job に入れるために CREATE_SUSPENDED（と CREATE_NO_WINDOW）を付ける。止まったまま起動するので、
+// spawn の直後に必ず win::start_in_job を呼ぶ（呼ばないと動き出さない。段階 2 S3）。signal はいつも None
 #[cfg(windows)]
 pub(crate) trait ProcessGroupShim {
     fn process_group(&mut self, pgroup: i32) -> &mut Self;
@@ -103,7 +106,9 @@ pub(crate) trait ProcessGroupShim {
 #[cfg(windows)]
 impl ProcessGroupShim for Command {
     fn process_group(&mut self, _pgroup: i32) -> &mut Self {
-        self
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        self.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
     }
 }
 
@@ -129,10 +134,11 @@ fn current_rss(pid: libc::pid_t) -> Option<u64> {
     (result == 0).then_some(info.ri_resident_size)
 }
 
-// Windows：段階 1 では測らない（メモリの上限で止めない。段階 2）
+// Windows：今の WorkingSetSize（実際に使っているページ。Unix の RSS にあたる）。起動したときのハンドルの写しで読む
+// （win::working_set。段階 2 S4）。Windows の WorkingSet には共有の DLL のページも入るので、macOS より大きく出る（推測）
 #[cfg(windows)]
-fn current_rss(_pid: Pid) -> Option<u64> {
-    None
+fn current_rss(pid: Pid) -> Option<u64> {
+    crate::win::working_set(pid as u32)
 }
 
 pub struct RunResult {
@@ -237,13 +243,15 @@ fn reap(pid: libc::pid_t) -> Result<(std::process::ExitStatus, Option<u64>), Str
     }
 }
 
-// Windows：終わるのを待って終了コードを受け取る。最大使用メモリは段階 1 では測らない（None）
+// Windows：終わるのを待って終了コードを受け取り、Job の記録を忘れる（Job は kill_group で閉じてある）。
+// 最大使用メモリは、終わったあとの PeakWorkingSetSize（直接の子だけ。起動したときのハンドルの写しで読む。段階 2 S4）
 #[cfg(windows)]
 fn reap(pid: Pid) -> Result<(std::process::ExitStatus, Option<u64>), String> {
     use std::os::windows::process::ExitStatusExt;
-    let code = crate::win::wait_for_exit(pid as u32)
-        .ok_or_else(|| "終了を確かめられません".to_string())?;
-    Ok((std::process::ExitStatus::from_raw(code), None))
+    let code = crate::win::wait_for_exit(pid as u32);
+    let max_rss = crate::win::release_job(pid as u32);
+    let code = code.ok_or_else(|| "終了を確かめられません".to_string())?;
+    Ok((std::process::ExitStatus::from_raw(code), max_rss))
 }
 
 // グループ全体に SIGKILL を送る。直接の子を回収する前にだけ呼ぶ
@@ -255,10 +263,11 @@ pub(crate) fn kill_group(pgid: libc::pid_t) {
     }
 }
 
-// Windows：直接の子だけを止める（子孫は残る。段階 2 で Job Object の TerminateJobObject にする）
+// Windows：Job の中（直接の子と、その子孫）をすべて止め、すべて終わるまで待ってから Job を閉じる。
+// 直接の子を回収する前に呼ぶ（Unix と同じ）。2 回目からは何もしない
 #[cfg(windows)]
 pub(crate) fn kill_group(pid: Pid) {
-    crate::win::terminate(pid as u32);
+    crate::win::kill_job(pid as u32);
 }
 
 // 直接の子が終わったかを、回収せずに確かめる（waitid の WNOHANG・WNOWAIT）。rust-analyzer の停止で使う（Phase 3b-1）。
@@ -332,10 +341,16 @@ pub fn run(
         .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(not(windows))]
     let started = Instant::now();
     let mut child: Child = command
         .spawn()
         .map_err(|error| format!("起動できません：{error}"))?;
+    // Windows：実行時間は、Job に入れて再開し終わったときから数える（Job に入れるのに 50〜70 ms、混むと秒単位でかかるため。
+    // 段階 2 S5d）
+    #[cfg(windows)]
+    let started =
+        crate::win::start_in_job(&child).map_err(|error| format!("起動できません：{error}"))?;
     let pid = child.id() as Pid;
 
     let (sender, events) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -372,6 +387,14 @@ pub fn run(
 
     // メモリの上限で止めたか（止めるのは 1 回だけ）
     let mut memory_killed = false;
+    // Windows：落ちた子のエラー報告（WerFault.exe）を止める（段階 2 S5c）。時間の上限がある実行
+    // （解答・ジャッジ・生成器・愚直解）だけ。ビルドや構文の確かめには上限がないので、見張らない。
+    // 子を見張りに登録し、直接の子が終わったら（下の loop を出たら）解除する
+    #[cfg(windows)]
+    let crash_reporters = limits
+        .time
+        .is_some()
+        .then(|| crate::win::CrashReporterWatch::new(pid as u32));
     // 直接の子が終わるか、止めるまで待つ
     let exit_at = loop {
         match events.recv_timeout(POLL_INTERVAL) {
@@ -408,6 +431,8 @@ pub fn run(
             break *at;
         }
     };
+    #[cfg(windows)]
+    drop(crash_reporters);
 
     // 回収する前に、グループの残り（直接の子が残した子孫）を止める
     kill_group(pid);
@@ -476,6 +501,14 @@ impl Side {
             Side::Judge => 1,
         }
     }
+
+    // 相手の側
+    fn other(self) -> Side {
+        match self {
+            Side::Solution => Side::Judge,
+            Side::Judge => Side::Solution,
+        }
+    }
 }
 
 // 片方が異常に終わった後、もう片方に終わるのを待つ時間（その間にジャッジの標準エラーなどを集める）。過ぎたら止める
@@ -487,6 +520,8 @@ enum PairEvent {
     Stderr(Side, Vec<u8>),
     // 読み取り（中継または標準エラー）が終わった
     Closed,
+    // その側の標準出力が閉じた（中継が EOF を読んだ）。相手の標準入力を閉じる前に送る（段階 2 S10b）
+    OutputClosed(Side),
     // 直接の子が終わった（回収はしていない）。終わった時刻つき
     Exited(Side, ExitKind, Instant),
 }
@@ -545,9 +580,14 @@ fn spawn_relay(
 ) {
     thread::spawn(move || {
         let mut buffer = vec![0u8; 64 * 1024];
+        // この側の標準出力が閉じた（EOF・読み取りの失敗）か。相手が閉じて中継をやめたときは false
+        let mut output_closed = false;
         loop {
             match source.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    output_closed = true;
+                    break;
+                }
                 Ok(n) => {
                     if events
                         .send(PairEvent::Chunk(side, buffer[..n].to_vec()))
@@ -565,6 +605,11 @@ fn spawn_relay(
                     }
                 }
             }
+        }
+        // 出力が閉じたことを、相手に EOF を伝える前に知らせる。相手がその EOF のせいで終わった知らせより、
+        // 必ず先に届く（先に失敗した側を、原因の順で決めるのに使う。段階 2 S10b）
+        if output_closed {
+            let _ = events.send(PairEvent::OutputClosed(side));
         }
         // 相手の標準入力を閉じて、EOF を伝える
         drop(sink);
@@ -661,6 +706,7 @@ pub fn run_pair(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
     }
+    #[cfg(not(windows))]
     let started = Instant::now();
     let mut solution_child: Child = solution
         .spawn()
@@ -669,11 +715,29 @@ pub fn run_pair(
     let mut judge_child: Child = match judge.spawn() {
         Ok(child) => child,
         Err(error) => {
-            kill_group(solution_pid);
-            let _ = reap(solution_pid);
+            #[cfg(not(windows))]
+            {
+                kill_group(solution_pid);
+                let _ = reap(solution_pid);
+            }
+            // Windows：解答はまだ Job に入れておらず、止まったまま。Child のハンドルで止めて待つ
+            #[cfg(windows)]
+            {
+                let _ = solution_child.kill();
+                let _ = solution_child.wait();
+            }
             return Err(format!("ジャッジを起動できません：{error}"));
         }
     };
+    // Windows：解答とジャッジを両方 Job に入れてから、続けて再開する。対話の時間は、再開し終わったときから数える
+    // （段階 2 S5d）。どちらかで失敗したら、start_all_in_jobs が 2 つとも止める
+    #[cfg(windows)]
+    let started = crate::win::start_all_in_jobs(&[&solution_child, &judge_child]).map_err(
+        |(index, error)| {
+            let who = if index == 0 { "解答" } else { "ジャッジ" };
+            format!("{who}を起動できません：{error}")
+        },
+    )?;
     let judge_pid = judge_child.id() as Pid;
     let pids = [solution_pid, judge_pid];
 
@@ -705,6 +769,8 @@ pub fn run_pair(
     let mut killed_at: Option<Instant> = None;
     // 読み取りの数：中継 2 つと標準エラー 2 つ
     let mut open = 4;
+    // 標準出力が閉じた側（閉じた知らせが届いた順）と、そのとき相手の終わりの知らせがまだ届いていなかったか
+    let mut output_closed: Vec<(Side, bool)> = Vec::new();
 
     let kill_both = || {
         for pid in pids {
@@ -736,6 +802,12 @@ pub fn run_pair(
                 *open -= 1;
                 None
             }
+            PairEvent::OutputClosed(side) => {
+                if !output_closed.iter().any(|(closed, _)| *closed == side) {
+                    output_closed.push((side, exits[side.other().index()].is_none()));
+                }
+                None
+            }
             PairEvent::Exited(side, kind, at) => {
                 exits[side.index()] = Some((kind, at));
                 None
@@ -743,6 +815,15 @@ pub fn run_pair(
         }
     };
 
+    // Windows：落ちた子（解答・ジャッジ）のエラー報告（WerFault.exe）を止める（段階 2 S5c）。時間の上限がある実行だけ
+    // （run と同じ。対話テストには上限がある）。両方を見張りに登録し、それぞれ終わったら解除する
+    #[cfg(windows)]
+    let mut crash_reporters: [Option<crate::win::CrashReporterWatch>; 2] = pids.map(|pid| {
+        limits
+            .time
+            .is_some()
+            .then(|| crate::win::CrashReporterWatch::new(pid as u32))
+    });
     loop {
         let event = events.recv_timeout(POLL_INTERVAL);
         match event {
@@ -770,6 +851,12 @@ pub fn run_pair(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        #[cfg(windows)]
+        for (watch, exit) in crash_reporters.iter_mut().zip(&exits) {
+            if exit.is_some() {
+                *watch = None;
+            }
+        }
         if exits.iter().all(Option::is_some) {
             break;
         }
@@ -792,6 +879,8 @@ pub fn run_pair(
             }
         }
     }
+    #[cfg(windows)]
+    drop(crash_reporters);
 
     // 両方が終わった。時間の上限は、終わった時刻で判定する
     let finished_at = killed_at.unwrap_or_else(|| {
@@ -831,6 +920,33 @@ pub fn run_pair(
             }
             Err(_) => break,
         }
+    }
+
+    // 両方が、こちらが止める前に異常に終わったときは、標準出力が先に閉じた側を、先に失敗した側とする（段階 2 S10b）。
+    // 終わりの知らせが届いた順は、2 つの終わりが重なると、原因（片方の終わり）と結果（それで EOF を読んだ相手の終わり）を
+    // 取り違えうる（Windows で、全部のテストと一緒に動かしたときに起きた。Unix も同じ作りで、Unix の動きも変わる）。
+    // 出力が閉じた知らせは、相手の標準入力を閉じる前に送るので、それが原因で相手が終わった知らせより必ず先に届く。
+    // そのため、決め直すのは、先に閉じた側の閉じた知らせが、相手の終わりの知らせより先に届いていたときだけにする
+    // （そうでなければ、相手の終わりはこちらの EOF によるものではありえない）。
+    // 出力が閉じた知らせが、プロセスの終わりより遅れる場合（孫が標準出力を受け継いで持ち続けるなど）：
+    // - 遅れた側の相手には EOF が届かないので、相手は普通、こちらが猶予のあとに止めるまで終わらない。止めたあとの終わりは
+    //   数えないので、決め直さず、終わりの知らせが届いた順（上のループで決めたもの）のまま
+    // - 相手がそれでも自分で異常に終わったときは、先に閉じるのは相手の出力だが、その知らせは遅れた側の終わりの知らせより
+    //   あとに届くので、決め直さず、終わりの知らせが届いた順のまま（段階 2 S10b の直し。それまでは、終わった順と逆の
+    //   相手を先としていた）
+    // どちらの側の出力も閉じた知らせがなければ（相手が先に閉じて中継をやめたなど）、決め直さない
+    let failed_on_its_own = |side: Side| {
+        exits[side.index()].is_some_and(|(kind, at)| {
+            kind.is_abnormal() && killed_at.is_none_or(|killed| at < killed)
+        })
+    };
+    if first_failure.is_some()
+        && failed_on_its_own(Side::Solution)
+        && failed_on_its_own(Side::Judge)
+        && let Some(&(side, before_other_exit)) = output_closed.first()
+        && before_other_exit
+    {
+        first_failure = Some(side);
     }
 
     let [solution_stderr, judge_stderr] = stderr;
@@ -1187,6 +1303,60 @@ mod tests {
         assert_eq!(result.solution.outcome, Outcome::Signaled(libc::SIGSEGV));
     }
 
+    // 印のファイル（場所はテストごとに変える）。テストが失敗しても残さないように、捨てるときに消す
+    struct Marker(std::path::PathBuf);
+
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn marker(name: &str) -> Marker {
+        let path =
+            std::env::temp_dir().join(format!("atcoder-studio-mark-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Marker(path)
+    }
+
+    #[test]
+    fn blames_the_side_whose_output_closed_first() {
+        // 段階 2 S10b（Unix の動きも変わる）：解答は標準出力を閉じ、ジャッジが印のファイルを作るまで待ってから、0.05 秒して
+        // 101 で終わる。ジャッジは EOF を読んだら印を作って 2 で終わる。終わった順ではジャッジが先、原因の順
+        // （出力が閉じた順）では解答が先。順番は時間ではなく印のファイルで作る
+        let mark = marker("blame");
+        let m = mark.0.display();
+        let result = pair(
+            &format!("exec >&-; while [ ! -e '{m}' ]; do sleep 0.01; done; sleep 0.05; exit 101"),
+            &format!("read q; : > '{m}'; exit 2"),
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        // 逆：ジャッジが先に 1 で終わり（出力も先に閉じる）、解答は EOF を読んで 3 で終わる → ジャッジが先
+        let result = pair("read q || exit 3", "exit 1", &limits(5000, 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(3));
+        assert_eq!(result.first_failure, Some(Side::Judge));
+    }
+
+    #[test]
+    fn keeps_the_exit_order_when_output_closes_late() {
+        // 段階 2 S10b の直し（Unix の動きも変わる）：解答は、標準出力を受け継ぐ sleep を残して、印を作ってすぐ 101 で終わる
+        // （解答の出力は sleep が持つので、閉じた知らせは IDE がグループごと止めるまで来ない）。ジャッジは EOF を待たずに、
+        // 印を見てから 0.1 秒待って 2 で終わる。終わった順のとおり解答が先
+        let mark = marker("late");
+        let m = mark.0.display();
+        let result = pair(
+            &format!("sleep 30 & : > '{m}'; exit 101"),
+            &format!("while [ ! -e '{m}' ]; do sleep 0.01; done; sleep 0.1; exit 2"),
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+    }
+
     #[test]
     fn stops_the_other_side_after_a_grace_period() {
         // 解答が 2 で終わり、ジャッジは何も読まず眠り続ける。猶予のあとで止める
@@ -1263,17 +1433,91 @@ mod tests {
     }
 }
 
-// Windows の仮の実装（段階 1）のテスト。cmd.exe の組み込みのコマンドだけで動かす（子孫を作らないもの）。
-// 子孫を止めること・使用メモリは、段階 2 の Job Object で確かめる
+// テスト用の子のプログラム（examples/test_child.rs。Windows 移植の段階 2 S2）の場所。
+// cargo test が examples を作り直すとは限らない（絞り込みを付けた cargo test で、古い target/debug/examples/test_child.exe が
+// 使われた）ので、テストの中で rustc で直接コンパイルする（test_child.rs は std だけを使う）。
+// - テストの実行ファイル 1 つにつき 1 回だけ作る（OnceLock）
+// - 名前にソースのハッシュを入れ、テストの実行ファイル（target/debug/deps/…）の 2 つ上の test-child に置く。同じソースなら作り直さない
+// - 一時的な名前で書いてから名前を変えるので、同時に作っても壊れない
+// - rustc を動かす場所とソースの場所は CARGO_MANIFEST_DIR から決める（今いるフォルダに頼らない。rust-toolchain.toml の版になる）
+#[cfg(all(test, windows))]
+pub(crate) fn test_child_path() -> std::path::PathBuf {
+    static PATH: OnceLock<Result<std::path::PathBuf, String>> = OnceLock::new();
+    match PATH.get_or_init(build_test_child) {
+        Ok(path) => path.clone(),
+        Err(message) => panic!("テスト用の子のプログラムを作れません：{message}"),
+    }
+}
+
+#[cfg(all(test, windows))]
+fn build_test_child() -> Result<std::path::PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+    const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+    const SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/test_child.rs"
+    ));
+    let source = std::path::Path::new(MANIFEST_DIR).join("examples/test_child.rs");
+    // コンパイルするのはディスクの上のファイルなので、テストをビルドしたときの中身（ハッシュの元）と同じかを確かめる
+    let on_disk = std::fs::read_to_string(&source)
+        .map_err(|error| format!("{} を読めません：{error}", source.display()))?;
+    if on_disk != SOURCE {
+        return Err(format!(
+            "{} がテストのビルドのあとで変わりました。cargo test をやり直してください",
+            source.display()
+        ));
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    SOURCE.hash(&mut hasher);
+    let name = format!("test_child-{:016x}", hasher.finish());
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("test-child")))
+        .ok_or("テストの実行ファイルの場所が分かりません")?;
+    let path = dir.join(format!("{name}.exe"));
+    if path.is_file() {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("{} を作れません：{error}", dir.display()))?;
+    let temporary = dir.join(format!("{name}-{}.tmp.exe", std::process::id()));
+    let output = Command::new("rustc")
+        .current_dir(MANIFEST_DIR)
+        .args(["--edition", "2024", "-o"])
+        .arg(&temporary)
+        .arg(&source)
+        .output()
+        .map_err(|error| format!("rustc を起動できません：{error}"))?;
+    // rustc が一時的な名前の隣に作るデバッグ情報は要らない
+    let _ = std::fs::remove_file(temporary.with_extension("pdb"));
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "rustc が失敗しました：{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    match std::fs::rename(&temporary, &path) {
+        Ok(()) => Ok(path),
+        // ほかのテストの実行ファイルが先に作った（そちらを使う）
+        Err(_) if path.is_file() => {
+            let _ = std::fs::remove_file(&temporary);
+            Ok(path)
+        }
+        Err(error) => Err(format!("{} を置けません：{error}", path.display())),
+    }
+}
+
+// Windows のテスト（段階 2）。上の Unix のテストの /bin/sh の代わりに、テスト用の子のプログラムを使う（手順の意味は
+// examples/test_child.rs の先頭）。子孫を止めること（S3）・使用メモリ（S4）・落ちたときの終了コード（S5）は後のコミットで足す。
+// setsid で抜けた子孫のテスト（returns_even_if_escaped_descendant_keeps_writing）にあたるものは、Job から抜けられないので作らない
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use std::os::windows::process::CommandExt;
 
-    // cmd /c に、引用の加工をせずにそのまま渡す
-    fn cmd(script: &str) -> Command {
-        let mut command = Command::new("cmd");
-        command.arg("/c").raw_arg(script);
+    fn child(steps: &[&str]) -> Command {
+        let mut command = Command::new(test_child_path());
+        command.args(steps);
         command
     }
 
@@ -1285,9 +1529,9 @@ mod windows_tests {
         }
     }
 
-    fn run_cmd(script: &str, limits: &Limits) -> RunResult {
+    fn run_child(steps: &[&str], limits: &Limits) -> RunResult {
         run(
-            cmd(script),
+            child(steps),
             None,
             limits,
             &Arc::new(AtomicBool::new(false)),
@@ -1296,15 +1540,445 @@ mod windows_tests {
         .unwrap()
     }
 
+    // IDE が止めたときの終了コード（i32 で読んだ値）
+    const KILLED: i32 = crate::win::KILLED_EXIT_CODE as i32;
+
+    // 孫が持つ印のファイル（場所はテストごとに変える）。孫は `hold:パス` で、このファイルを排他で、閉じたら消える指定で
+    // 開いたまま 30 秒生きる。テストが失敗しても残さないように、捨てるときにも消す（孫がまだ持っていて消せなければ、
+    // 孫が終わったときに消える）
+    struct Marker(std::path::PathBuf);
+
+    impl std::ops::Deref for Marker {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn marker(name: &str) -> Marker {
+        let path =
+            std::env::temp_dir().join(format!("atcoder-studio-mark-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Marker(path)
+    }
+
+    // テストで作るフォルダ。失敗しても残さないように、捨てるときに消す
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn grandchild_step(marker: &std::path::Path) -> String {
+        format!("grandchild:{}", marker.display())
+    }
+
+    // 印のファイルを持つプロセス（孫）が終わったか。消せたら終わっている（開いている間は消せない）。
+    // 止めてから消えるまで少しかかることがあるので、2 秒まで待つ。pid は再利用されうるので使わない
+    fn released(marker: &std::path::Path) -> bool {
+        (0..200).any(|_| {
+            let done = match std::fs::remove_file(marker) {
+                Ok(()) => true,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            };
+            if !done {
+                thread::sleep(Duration::from_millis(10));
+            }
+            done
+        })
+    }
+
+    // 孫が生きて印のファイルを持っていることを、止める前に確かめる：ファイルがあり、消せない（排他で開かれている）。
+    // ファイルができるまで 5 秒まで待つ。できない、または消せてしまった（孫が起動していない・印を持っていない）なら false。
+    // これを確かめずに released だけを見ると、孫が起動しなかったときも「止まった」と読んでしまう
+    fn holding(marker: &std::path::Path) -> bool {
+        for _ in 0..500 {
+            if marker.exists() {
+                return std::fs::remove_file(marker).is_err();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    // 子が動いている間に、別のスレッドで holding を確かめる
+    fn watch_holding(marker: &std::path::Path) -> thread::JoinHandle<bool> {
+        let marker = marker.to_path_buf();
+        thread::spawn(move || holding(&marker))
+    }
+
+    // 孫が生きているのを確かめてから、止める印を立てる。確かめられたかを返す
+    fn cancel_when_holding(
+        marker: &std::path::Path,
+        cancel: &Arc<AtomicBool>,
+    ) -> thread::JoinHandle<bool> {
+        let (marker, flag) = (marker.to_path_buf(), cancel.clone());
+        thread::spawn(move || {
+            let seen = holding(&marker);
+            flag.store(true, Ordering::SeqCst);
+            seen
+        })
+    }
+
+    // 直接の子が終わるのを、2 秒まで待つ。終われば終了コード
+    fn ended_within(child: &mut Child) -> Option<i32> {
+        (0..200).find_map(|_| match child.try_wait() {
+            Ok(Some(status)) => status.code(),
+            _ => {
+                thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn stops_at_time_limit_with_descendants() {
+        // 時間の上限は、孫が起動して印を開くまでの時間より十分長くする（ほかのテストと同時に動くと、起動が 1.5 秒を
+        // 超えることがあり、上限で止まってから孫を確かめられずに落ちた）
+        let mark = marker("time");
+        let watch = watch_holding(&mark);
+        let result = run_child(
+            &[&grandchild_step(&mark), "sleep:30000"],
+            &limits(4000, 1024),
+        );
+        assert!(
+            watch.join().unwrap(),
+            "止める前に孫が生きているのを確かめられない"
+        );
+        assert_eq!(result.outcome, Outcome::TimedOut);
+        assert!(result.elapsed < Duration::from_secs(7));
+        assert!(released(&mark), "子孫のプロセスが残っている");
+    }
+
+    #[test]
+    fn stops_descendants_when_cancelled() {
+        let mark = marker("cancel");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let watch = cancel_when_holding(&mark, &cancel);
+        let result = run(
+            child(&[&grandchild_step(&mark), "sleep:30000"]),
+            None,
+            &limits(10000, 1024),
+            &cancel,
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(
+            watch.join().unwrap(),
+            "止める前に孫が生きているのを確かめられない"
+        );
+        assert_eq!(result.outcome, Outcome::Stopped);
+        assert!(released(&mark), "子孫のプロセスが残っている");
+    }
+
+    #[test]
+    fn stops_descendants_left_after_exit() {
+        // 直接の子は 1 秒で自分で終わるが、孫が残る。孫の標準入出力は空にしてあるが、親の出力のパイプのハンドルを
+        // 受け継ぐ（推測）ので、孫が残っているとパイプが閉じない（output_left_open）。孫を止めればパイプも閉じる
+        let mark = marker("exit");
+        let watch = watch_holding(&mark);
+        let result = run_child(
+            &[&grandchild_step(&mark), "sleep:1000"],
+            &limits(10000, 1024),
+        );
+        assert!(
+            watch.join().unwrap(),
+            "止める前に孫が生きているのを確かめられない"
+        );
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert!(released(&mark), "子孫のプロセスが残っている");
+        assert!(!result.output_left_open);
+    }
+
+    #[test]
+    fn closing_the_job_stops_the_child_and_descendants() {
+        // IDE が落ちたときにあたる：止める操作をせずに Job のハンドルを閉じる（KILL_ON_JOB_CLOSE）
+        let mark = marker("close");
+        let mut command = child(&[&grandchild_step(&mark), "sleep:30000"]);
+        command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut spawned = command.spawn().unwrap();
+        let entered = crate::win::start_in_job(&spawned);
+        // 閉じる前に、孫が生きて印を持っていることを確かめる
+        let made = holding(&mark);
+        crate::win::close_job_without_terminating(spawned.id());
+        let child_ended = ended_within(&mut spawned);
+        let grandchild_gone = released(&mark);
+        // 後片付け（失敗したときに子を残さない。子は Child のハンドルで止めるので、別のプロセスを止めることはない。
+        // 孫は 30 秒で自分で終わる）
+        let _ = spawned.kill();
+        let _ = spawned.wait();
+        assert!(entered.is_ok() && made, "{entered:?} {made}");
+        // KILL_ON_JOB_CLOSE で止まったときの終了コードは 0 になる（この環境で確かめた。KILLED_EXIT_CODE ではない）
+        assert_eq!(child_ended, Some(0), "子が残っている");
+        assert!(grandchild_gone, "孫が残っている");
+    }
+
+    #[test]
+    fn overwrites_the_program_right_after_stopping() {
+        // 止めたあと 2 秒のうちに、動いていた exe（子と孫の両方が使う）を上書きできるようになる（4.7。ビルドし直しにあたる）。
+        // Job が空になって直接の子の終わりを待ったあとでも、10〜40 ms ほど書けないことがある（4.7 で測った）ので、
+        // 止めてすぐの 1 回目は求めず、win::wait_until_writable で待ってから 1 回で書けることを見る。孫が残っていれば
+        // 30 秒書けないので、子孫を止めたことは確かめられる
+        let dir = TempDir(
+            std::env::temp_dir().join(format!("atcoder-studio-overwrite-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let program = dir.0.join("victim.exe");
+        std::fs::copy(test_child_path(), &program).unwrap();
+        let mark = dir.0.join("mark");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let watch = cancel_when_holding(&mark, &cancel);
+        let mut command = Command::new(&program);
+        command.args([grandchild_step(&mark).as_str(), "spin"]);
+        let result = run(command, None, &limits(10000, 1024), &cancel, |_, _| {}).unwrap();
+        assert!(
+            watch.join().unwrap(),
+            "止める前に孫が生きているのを確かめられない"
+        );
+        assert_eq!(result.outcome, Outcome::Stopped);
+        // IDE がビルドの前に行うのと同じく、書けるようになるまで待ってから（段階 2 S3b）、1 回で書けることを確かめる
+        let stopped = Instant::now();
+        let writable = crate::win::wait_until_writable(&program, crate::win::WRITABLE_WAIT);
+        // かかった時間を記録する（cargo test -- --show-output で見える）
+        eprintln!("止めてから書けるまで {} ms", stopped.elapsed().as_millis());
+        assert!(
+            writable,
+            "止めてから {} ms たっても書けない",
+            stopped.elapsed().as_millis()
+        );
+        let written = std::fs::write(&program, b"replaced");
+        assert!(
+            written.is_ok(),
+            "待ったあとの 1 回目で書けない：{written:?}"
+        );
+    }
+
+    #[test]
+    fn stops_the_child_when_it_cannot_enter_a_job() {
+        // CREATE_SUSPENDED で起動したあと、Job を作る・入れる・再開するのどこで失敗しても、子を止めてエラーにする
+        // （止まったままのプロセスを残さない）
+        for step in [
+            crate::win::JobStep::Create,
+            crate::win::JobStep::Assign,
+            crate::win::JobStep::Resume,
+        ] {
+            let mut command = child(&["sleep:30000"]);
+            command
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut spawned = command.spawn().unwrap();
+            let failed = crate::win::start_in_job_with(&spawned, |at| at == step).is_err();
+            let ended = ended_within(&mut spawned);
+            // 後片付け（失敗したときに、止まったまま残さない）
+            let _ = spawned.kill();
+            let _ = spawned.wait();
+            assert!(failed, "{step:?} で失敗にならない");
+            assert_eq!(ended, Some(KILLED), "{step:?} のあとで子が残っている");
+        }
+    }
+
+    #[test]
+    fn stops_both_children_when_either_cannot_start() {
+        // 段階 2 S5d：解答とジャッジを両方 Job に入れてから続けて再開する（run_pair）。どちらかが、Job を作る・入れる・再開する
+        // のどこで失敗しても、2 つとも止めてエラーにする（失敗した側の番号を返す）。ジャッジの再開で失敗したときは、解答は
+        // もう再開して動いているので、動いている子も止めることを確かめる
+        let spawn = || {
+            let mut command = child(&["sleep:30000"]);
+            command
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command.spawn().unwrap()
+        };
+        for side in [0, 1] {
+            for step in [
+                crate::win::JobStep::Create,
+                crate::win::JobStep::Assign,
+                crate::win::JobStep::Resume,
+            ] {
+                let mut children = [spawn(), spawn()];
+                let pids = children.each_ref().map(Child::id);
+                let started = crate::win::start_all_in_jobs_with(
+                    &[&children[0], &children[1]],
+                    |index, at| (index, at) == (side, step),
+                );
+                let ended = children.each_mut().map(ended_within);
+                // Job の記録が残っていない（失敗したら記録しない）
+                let recorded = pids.map(|pid| crate::win::working_set(pid).is_some());
+                // 後片付け（失敗したときに、止まったまま・動いたまま残さない）
+                for spawned in &mut children {
+                    let _ = spawned.kill();
+                    let _ = spawned.wait();
+                }
+                assert_eq!(
+                    started.as_ref().map_err(|(index, _)| *index).err(),
+                    Some(side),
+                    "{side} の {step:?} で、その側の失敗にならない：{started:?}"
+                );
+                assert_eq!(
+                    ended,
+                    [Some(KILLED), Some(KILLED)],
+                    "{side} の {step:?} のあとで子が残っている"
+                );
+                assert_eq!(recorded, [false, false], "{side} の {step:?}");
+            }
+        }
+    }
+
+    // 段階 2 S5d：Job に入れてから再開するまでを、テストのときだけ遅らせる（このスレッドだけ。捨てるときに戻す）
+    struct ResumeDelay;
+
+    impl ResumeDelay {
+        fn set(delay: Duration) -> Self {
+            crate::win::RESUME_DELAY.set(delay);
+            ResumeDelay
+        }
+    }
+
+    impl Drop for ResumeDelay {
+        fn drop(&mut self) {
+            crate::win::RESUME_DELAY.set(Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn counts_time_from_resuming_the_child() {
+        // 段階 2 S5d：実行時間は、子を Job に入れて再開したあとから数える。Job に入れるのが 1500 ms 遅れても、すぐ終わる子は
+        // 上限 1000 ms の中で終わり、実行時間にその遅れは入らない
+        let _delay = ResumeDelay::set(Duration::from_millis(1500));
+        let result = run_child(&["exit:0"], &limits(1000, 1024));
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert!(
+            result.elapsed < Duration::from_millis(1000),
+            "{:?}",
+            result.elapsed
+        );
+    }
+
+    #[test]
+    fn counts_pair_time_from_resuming_both() {
+        // 段階 2 S5d：対話の時間は、解答とジャッジを両方 Job に入れて再開したあとから数える。それぞれ 1500 ms 遅れても、
+        // 1 往復の対話は上限 1000 ms の中で終わる
+        let _delay = ResumeDelay::set(Duration::from_millis(1500));
+        let result = pair(&["out:5", "expect:10"], &["double"], &limits(1000, 1024));
+        assert!(!result.timed_out, "{:?}", result.elapsed);
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert!(
+            result.elapsed < Duration::from_millis(1000),
+            "{:?}",
+            result.elapsed
+        );
+    }
+
+    #[test]
+    fn reports_max_memory_of_the_child() {
+        // 50 MiB を確保して全部のページに書くと、最大使用メモリ（PeakWorkingSetSize）が増える（段階 2 S4）
+        let small = run_child(&["exit:0"], &limits(5000, 1024));
+        let large = run_child(&["alloc:50", "exit:0"], &limits(10000, 1024));
+        let small = small.max_rss_bytes.expect("最大使用メモリが取れない");
+        let large = large.max_rss_bytes.expect("最大使用メモリが取れない");
+        assert!(small > 0);
+        assert!(large > 40 * 1024 * 1024, "{large}");
+        assert!(large > small);
+    }
+
+    #[test]
+    fn stops_a_program_over_the_memory_limit_while_running() {
+        // 10 MiB ずつ、最大 400 MiB まで使ってから 3 秒眠る。上限 50 MiB なら、使っている途中で止まる（D-175。段階 2 S4）
+        let mut steps = vec!["alloc:10"; 40];
+        steps.push("sleep:3000");
+        let mut limits = limits(5000, 1024);
+        limits.memory = Some(50 * 1024 * 1024);
+        let started = Instant::now();
+        let result = run_child(&steps, &limits);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.outcome, Outcome::Exited(KILLED));
+        assert!(
+            result
+                .max_rss_bytes
+                .is_some_and(|bytes| bytes > 50 * 1024 * 1024),
+            "{:?}",
+            result.max_rss_bytes
+        );
+        // 上限より少なければ止めない（1 MiB だけ使い、そのまま終わる）
+        let quiet = run_child(&["alloc:1", "exit:0"], &limits);
+        assert_eq!(quiet.outcome, Outcome::Exited(0));
+    }
+
+    #[test]
+    fn crashes_are_runtime_errors_within_a_short_time_limit() {
+        // 段階 2 S5b：扱われない例外で落ちると、Windows のエラー報告（WER）が約 4 秒（測って 3.2〜4.8 秒）プロセスを
+        // 持ったままにする。Job の DIE_ON_UNHANDLED_EXCEPTION で、すぐ終わるようにする。サンプルテストの既定の上限
+        // （2500 ms）で、TLE ではなく例外のコードで終わる。上限を 1 秒にしなかったのは、全部のテストを同時に動かすと、
+        // 一斉の起動の混み合いで、子を Job に入れて再開するまでに約 2 秒かかることがあるため（測定。文書の S5b・S13）
+        for (kind, code) in [
+            ("access-violation", 0xC000_0005_u32 as i32),
+            ("divide-by-zero", 0xC000_0094_u32 as i32),
+            ("stack-overflow", 0xC000_00FD_u32 as i32),
+        ] {
+            let result = run_child(
+                &[&format!("crash:{kind}")],
+                &limits(crate::compare::DEFAULT_TIME_LIMIT_MS, 1024 * 1024),
+            );
+            assert_eq!(result.outcome, Outcome::Exited(code), "{kind}");
+        }
+    }
+
+    #[test]
+    fn fast_fail_crashes_are_runtime_errors_within_the_time_limit() {
+        // 段階 2 S5c：__fastfail（0xC0000409。Rust の abort、C++ の abort・assert・捕まえない例外）は DIE では速くならず、
+        // 落ちた子が親の WerFault.exe が約 4 秒持ったままにする。IDE がその WerFault.exe を止めるので、既定の上限
+        // （2500 ms）で TLE ではなく 0xC0000409 で終わる
+        let result = run_child(
+            &["crash:abort"],
+            &limits(crate::compare::DEFAULT_TIME_LIMIT_MS, 1024 * 1024),
+        );
+        assert_eq!(result.outcome, Outcome::Exited(0xC000_0409_u32 as i32));
+    }
+
+    #[test]
+    fn reports_exit_codes_of_crashes() {
+        // 段階 2 S5：test_child で本当に落として、Windows の終了コードを確かめる（RE の名前の表のもと）
+        for (kind, code) in [
+            ("access-violation", 0xC000_0005_u32 as i32),
+            ("divide-by-zero", 0xC000_0094_u32 as i32),
+            ("stack-overflow", 0xC000_00FD_u32 as i32),
+            ("abort", 0xC000_0409_u32 as i32),
+            ("panic", 101),
+        ] {
+            let result = run_child(&[&format!("crash:{kind}")], &limits(10000, 1024 * 1024));
+            assert_eq!(result.outcome, Outcome::Exited(code), "{kind}");
+        }
+    }
+
     #[test]
     fn captures_output_and_exit_code() {
-        let result = run_cmd("echo out& 1>&2 echo err& exit /b 3", &limits(5000, 1024));
+        let result = run_child(&["out:out", "err:err", "exit:3"], &limits(5000, 1024));
         assert_eq!(result.outcome, Outcome::Exited(3));
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "out");
-        assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err");
+        assert_eq!(result.stdout, b"out\n");
+        assert_eq!(result.stderr, b"err\n");
         assert!(!result.output_left_open);
-        // 使用メモリは段階 1 では測らない
-        assert_eq!(result.max_rss_bytes, None);
     }
 
     #[test]
@@ -1312,10 +1986,8 @@ mod windows_tests {
         let path =
             std::env::temp_dir().join(format!("atcoder-studio-win-stdin-{}", std::process::id()));
         std::fs::write(&path, "1 2\n").unwrap();
-        let mut findstr = Command::new("findstr");
-        findstr.arg("^");
         let result = run(
-            findstr,
+            child(&["cat"]),
             Some(File::open(&path).unwrap()),
             &limits(5000, 1024),
             &Arc::new(AtomicBool::new(false)),
@@ -1323,14 +1995,35 @@ mod windows_tests {
         )
         .unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "1 2");
+        assert_eq!(result.stdout, b"1 2\n");
     }
 
     #[test]
     fn stops_at_time_limit() {
-        let result = run_cmd("for /l %i in () do @rem", &limits(300, 1024));
+        let result = run_child(&["spin"], &limits(300, 1024));
         assert_eq!(result.outcome, Outcome::TimedOut);
         assert!(result.elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn stops_at_output_limit() {
+        let result = run_child(&["yes"], &limits(5000, 1024 * 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
+        assert_eq!(result.stdout.len(), 1024 * 1024);
+        let result = run_child(&["yeserr"], &limits(5000, 1024 * 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stderr));
+    }
+
+    #[test]
+    fn reads_both_streams_without_blocking() {
+        // 標準エラーに大量に書いてから、標準出力に書く（片方だけを読むと詰まる）
+        let result = run_child(
+            &["errbytes:2000000", "out:done"],
+            &limits(5000, 4 * 1024 * 1024),
+        );
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert_eq!(result.stderr.len(), 2_000_000);
+        assert_eq!(result.stdout, b"done\n");
     }
 
     #[test]
@@ -1342,7 +2035,7 @@ mod windows_tests {
             flag.store(true, Ordering::SeqCst);
         });
         let result = run(
-            cmd("for /l %i in () do @rem"),
+            child(&["sleep:100000"]),
             None,
             &limits(5000, 1024),
             &cancel,
@@ -1354,68 +2047,248 @@ mod windows_tests {
     }
 
     #[test]
-    fn stops_at_output_limit() {
-        let result = run_cmd(
-            "for /l %i in () do @echo yyyyyyyyyyyyyyyy",
-            &limits(10000, 64 * 1024),
-        );
-        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
-        assert_eq!(result.stdout.len(), 64 * 1024);
-    }
-
-    #[test]
-    fn reads_both_streams_without_blocking() {
-        // 標準エラーに、パイプの容量より多く書いてから、標準出力に書く（片方だけを読むと詰まる）
-        let result = run_cmd(
-            "(for /l %i in (1,1,3000) do @(1>&2 echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx))& echo done",
-            &limits(20000, 4 * 1024 * 1024),
-        );
+    fn keeps_exact_limit_and_stops_one_byte_over() {
+        let result = run_child(&["bytes:1024"], &limits(5000, 1024));
         assert_eq!(result.outcome, Outcome::Exited(0));
-        assert!(result.stderr.len() > 100_000, "{}", result.stderr.len());
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "done");
+        assert_eq!(result.stdout.len(), 1024);
+        let result = run_child(&["bytes:1025"], &limits(5000, 1024));
+        assert_eq!(result.outcome, Outcome::OutputLimit(Stream::Stdout));
     }
 
     #[test]
-    fn relays_between_two_processes() {
-        // 解答が 5 を出して終わる。ジャッジ（findstr）は届いた行を返し、EOF で終わる
-        let result = run_pair(
-            cmd("echo 5"),
-            {
-                let mut judge = Command::new("findstr");
-                judge.arg("^");
-                judge
-            },
-            &limits(5000, 1024),
+    fn reads_all_output_with_slow_callback() {
+        // 1 MiB 以上を書いてすぐ終わる。受け取り側が遅くても、末尾まで読む
+        let result = run(
+            child(&["bytes:3000000"]),
+            None,
+            &limits(10000, 4 * 1024 * 1024),
             &Arc::new(AtomicBool::new(false)),
+            |_, _| thread::sleep(Duration::from_millis(2)),
         )
         .unwrap();
-        assert_eq!(result.solution.outcome, Outcome::Exited(0));
-        assert_eq!(result.judge.outcome, Outcome::Exited(0));
-        assert!(!result.timed_out && !result.stopped);
-        let text: Vec<(Side, String)> = result
+        assert_eq!(result.outcome, Outcome::Exited(0));
+        assert_eq!(result.stdout.len(), 3_000_000);
+    }
+
+    #[test]
+    fn passes_output_to_callback() {
+        let mut seen = Vec::new();
+        run(
+            child(&["out:a", "err:b"]),
+            None,
+            &limits(5000, 1024),
+            &Arc::new(AtomicBool::new(false)),
+            |stream, bytes| seen.push((stream, bytes.to_vec())),
+        )
+        .unwrap();
+        assert!(seen.contains(&(Stream::Stdout, b"a\n".to_vec())));
+        assert!(seen.contains(&(Stream::Stderr, b"b\n".to_vec())));
+    }
+
+    // ---- run_pair ----
+
+    fn pair(solution: &[&str], judge: &[&str], limits: &Limits) -> PairResult {
+        run_pair(
+            child(solution),
+            child(judge),
+            limits,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+    }
+
+    fn text(result: &PairResult) -> Vec<(Side, String)> {
+        result
             .transcript
             .iter()
-            .map(|(side, bytes)| (*side, String::from_utf8_lossy(bytes).trim().to_string()))
-            .collect();
+            .map(|(side, bytes)| (*side, String::from_utf8_lossy(bytes).into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn relays_between_two_processes_in_order() {
+        // 解答が 5 を出し、ジャッジが 2 倍を返し、解答が確かめる
+        let result = pair(&["out:5", "expect:10"], &["double"], &limits(5000, 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert_eq!(result.first_failure, None);
+        assert!(!result.timed_out && !result.stopped && result.output_limit.is_none());
+        assert!(!result.output_left_open);
         assert_eq!(
-            text,
+            text(&result),
             vec![
-                (Side::Solution, "5".to_string()),
-                (Side::Judge, "5".to_string())
+                (Side::Solution, "5\n".to_string()),
+                (Side::Judge, "10\n".to_string())
             ]
         );
+        // 最大使用メモリが取れる（段階 2 S4）
+        assert!(result.solution.max_rss_bytes.is_some());
+    }
+
+    #[test]
+    fn collects_stderr_of_each_side() {
+        let result = pair(
+            &["err:from-solution"],
+            &["err:from-judge"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.stderr, b"from-solution\n");
+        assert_eq!(result.judge.stderr, b"from-judge\n");
+    }
+
+    #[test]
+    fn finds_who_failed_first() {
+        // 解答が出力せずに 3 で終わる。ジャッジは EOF を読んで 2 で終わる → 解答が先
+        let result = pair(&["exit:3"], &["read-or-exit:2"], &limits(5000, 1024));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        assert_eq!(result.solution.outcome, Outcome::Exited(3));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        // ジャッジが先に 1 で終わる。解答は読み取りが EOF になって 0 で終わる → ジャッジが先
+        let result = pair(&["read", "exit:0"], &["exit:1"], &limits(5000, 1024));
+        assert_eq!(result.first_failure, Some(Side::Judge));
+        assert_eq!(result.judge.outcome, Outcome::Exited(1));
+        // 両方が 0 で終われば、失敗はない。解答が先に終わっても、ジャッジを待つ
+        let result = pair(
+            &["out:done"],
+            &["read", "sleep:300", "exit:0"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.first_failure, None);
+        assert_eq!(result.judge.outcome, Outcome::Exited(0));
+        assert!(result.elapsed >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn blames_the_side_whose_output_closed_first() {
+        // 取り違えを毎回起こす（段階 2 S10b）：解答は標準出力を閉じ、ジャッジが印のファイルを作るまで待ってから、50 ms して
+        // 101 で終わる。ジャッジは EOF を読んだら印を作って 2 で終わる。終わった順ではジャッジが先、原因の順
+        // （出力が閉じた順）では解答が先。順番は時間ではなく印のファイルで作る（混んでいても、解答は猶予の中で終わる）
+        let mark = marker("blame");
+        let wait = format!("wait-file:{}", mark.display());
+        let touch = format!("touch:{}", mark.display());
+        let result = pair(
+            &["close-stdout", &wait, "sleep:50", "exit:101"],
+            &["read", &touch, "exit:2"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        // 逆：ジャッジが先に 1 で終わり（出力も先に閉じる）、解答は EOF を読んで 3 で終わる → ジャッジが先
+        let result = pair(&["read-or-exit:3"], &["exit:1"], &limits(5000, 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(3));
+        assert_eq!(result.first_failure, Some(Side::Judge));
+    }
+
+    #[test]
+    fn keeps_the_exit_order_when_output_closes_late() {
+        // 段階 2 S10b の直し：解答は、標準出力を受け継ぐ孫を作ってすぐ 101 で終わる（解答の出力は孫が持つので、閉じた知らせは
+        // IDE が止めるまで来ない）。ジャッジは EOF を待たずに、孫ができた（印のファイルがある）のを見てから 100 ms 待って
+        // 2 で終わる（ジャッジの出力はそこで閉じる）。ジャッジの失敗は解答の EOF によるものではないので、終わった順のとおり
+        // 解答が先。出力が先に閉じたのはジャッジだが、その知らせは解答の終わりの知らせよりあとに届くので、決め直さない
+        let mark = marker("late");
+        let wait = format!("wait-file:{}", mark.display());
+        let result = pair(
+            &[&grandchild_step(&mark), "exit:101"],
+            &[&wait, "sleep:100", "exit:2"],
+            &limits(5000, 1024),
+        );
+        assert_eq!(result.solution.outcome, Outcome::Exited(101));
+        assert_eq!(result.judge.outcome, Outcome::Exited(2));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        assert!(released(&mark), "孫が残っている");
+    }
+
+    #[test]
+    fn stops_the_other_side_after_a_grace_period() {
+        // 解答が 2 で終わり、ジャッジは何も読まず眠り続ける。猶予のあとで止める（IDE が止めたときの終了コード）
+        let started = Instant::now();
+        let result = pair(&["exit:2"], &["sleep:30000"], &limits(10000, 1024));
+        assert_eq!(result.first_failure, Some(Side::Solution));
+        assert!(!result.timed_out);
+        assert_eq!(result.judge.outcome, Outcome::Exited(KILLED));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
     fn times_out_and_stops_both() {
+        // 解答もジャッジも待ち続ける（出力のあとの flush 忘れなどで起きる）
+        let started = Instant::now();
+        let result = pair(&["sleep:30000"], &["sleep:30000"], &limits(300, 1024));
+        assert!(result.timed_out);
+        assert_eq!(result.first_failure, None);
+        assert_eq!(result.solution.outcome, Outcome::Exited(KILLED));
+        assert_eq!(result.judge.outcome, Outcome::Exited(KILLED));
+        assert!(result.elapsed < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stops_descendants_of_both_sides() {
+        // 解答もジャッジも孫を作ってから待ち続ける。時間の上限で、両方の孫も止まる
+        // （上限は stops_at_time_limit_with_descendants と同じく、孫の起動より十分長くする）
+        let (solution_mark, judge_mark) = (marker("pair-solution"), marker("pair-judge"));
+        let watches = [watch_holding(&solution_mark), watch_holding(&judge_mark)];
+        let result = pair(
+            &[&grandchild_step(&solution_mark), "sleep:30000"],
+            &[&grandchild_step(&judge_mark), "sleep:30000"],
+            &limits(4000, 1024),
+        );
+        for watch in watches {
+            assert!(
+                watch.join().unwrap(),
+                "止める前に孫が生きているのを確かめられない"
+            );
+        }
+        assert!(result.timed_out);
+        assert!(released(&solution_mark), "解答の孫が残っている");
+        assert!(released(&judge_mark), "ジャッジの孫が残っている");
+    }
+
+    #[test]
+    fn stops_both_on_request() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
         let result = run_pair(
-            cmd("for /l %i in () do @rem"),
-            cmd("for /l %i in () do @rem"),
-            &limits(300, 1024),
-            &Arc::new(AtomicBool::new(false)),
+            child(&["sleep:30000"]),
+            child(&["sleep:30000"]),
+            &limits(20000, 1024),
+            &cancel,
         )
         .unwrap();
-        assert!(result.timed_out);
-        assert!(result.elapsed < Duration::from_secs(3));
+        assert!(result.stopped);
+        assert!(!result.timed_out);
+        assert_eq!(result.first_failure, None);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn limits_output_of_each_side() {
+        // 解答が出力し続ける。ジャッジは読み捨てる。上限（4 KiB）を超えたら両方を止める
+        let result = pair(&["yes"], &["discard"], &limits(10000, 4096));
+        assert_eq!(result.output_limit, Some(Side::Solution));
+        assert!(!result.timed_out);
+        assert!(result.elapsed < Duration::from_secs(5));
+        // 標準エラーは、上限を超えた分を捨てるだけで止めない
+        let result = pair(&["errbytes:100000"], &["exit:0"], &limits(10000, 4096));
+        assert_eq!(result.output_limit, None);
+        assert_eq!(result.solution.stderr.len(), 4096);
+    }
+
+    #[test]
+    fn keeps_a_long_exchange_in_order() {
+        // 1000 往復。順序と、往復の数が保たれる
+        let result = pair(&["ask:1000"], &["echo-lines"], &limits(20000, 1024 * 1024));
+        assert_eq!(result.solution.outcome, Outcome::Exited(0));
+        // 解答の出力と、ジャッジの返事が交互に並び、まとめられていない（往復ごとに側が変わる）
+        assert_eq!(result.transcript.len(), 2000);
+        assert_eq!(result.transcript[0], (Side::Solution, b"0\n".to_vec()));
+        assert_eq!(result.transcript[1], (Side::Judge, b"0\n".to_vec()));
+        assert_eq!(result.transcript[1998], (Side::Solution, b"999\n".to_vec()));
     }
 }

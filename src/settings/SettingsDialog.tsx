@@ -36,6 +36,8 @@ import {
   type KeyBinding,
 } from "../keybindings";
 import { remeasureEditor } from "../editor/Editor";
+import { IS_WINDOWS } from "../panels/logLinks";
+import { pythonSearchNote } from "./pythonNote";
 
 // 言語ごとの、今読めているスニペットと、ファイルを読めなかったときの理由（D-187・D-213）
 export type SnippetsViews = Record<Language, { loaded: LoadedSnippets | null; error: string | null }>;
@@ -634,7 +636,7 @@ function PythonSection({
         main.py の実行・テストに使います。ジャッジの「Python (CPython 3.13.7)」「Python (PyPy 3.11-v7.3.20)」に合わせてください。
         {path
           ? `処理系のパス：${path}（settings.json で書いたもの）。`
-          : "処理系は /opt/homebrew/bin・PATH・/usr/local/bin から探します（決まったパスを使うときは、settings.json の python.cpython・python.pypy に書きます）。"}
+          : pythonSearchNote(IS_WINDOWS)}
       </p>
     </div>
   );

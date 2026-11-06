@@ -23,7 +23,11 @@ pub const NOT_LIKE_JUDGE: &str = "手元のビルドは、ジャッジと違い 
 // 提出の確認のダイアログの注意に添える（D-209）
 pub const JUDGE_SUBMIT_NOTE: &str =
     "ジャッジは、AtCoder の 2025/10 版の言語の一覧の C++23 (GCC 15.2.0) です（2026-10-28 に確認）";
+#[cfg(not(windows))]
 pub const GCC_HINT: &str = "C++ には GCC が要ります（Apple の clang では bits/stdc++.h が使えません）。ターミナルで `brew install gcc` を実行して入れてください。別の場所の GCC を使うときは、settings.json の cpp.compiler に g++ のパスを書いてください";
+// Windows の案内（段階 2 S8。9.1 の 10：既存の MinGW-Builds を勧める）
+#[cfg(windows)]
+pub const GCC_HINT: &str = "C++ には GCC（MinGW-w64 の g++）が要ります。MinGW-Builds（GitHub の niXman/mingw-builds-binaries）の GCC 15.2.0（x86_64・ucrt）を入れて、bin を PATH に足すか、%ProgramFiles%\\mingw64 などに置いてください。別の場所の GCC を使うときは、settings.json の cpp.compiler に g++.exe のパスを書いてください";
 
 // パッケージの中のソースと、ビルドしたものの置き場所（パッケージの target/）
 pub const SOURCE: &str = "main.cpp";
@@ -78,16 +82,56 @@ pub fn find_compiler(settings: &CppSettings) -> Result<PathBuf, String> {
             settings.compiler
         ));
     }
-    find_compiler_in(
+    #[cfg(not(windows))]
+    let found = find_compiler_in(
         std::env::var_os("PATH").as_deref(),
         &[
             PathBuf::from("/opt/homebrew/bin"),
             PathBuf::from("/usr/local/bin"),
         ],
-    )
-    .ok_or_else(|| format!("g++-15 が見つかりません。{GCC_HINT}"))
+    );
+    #[cfg(windows)]
+    let found =
+        find_compiler_on_windows(std::env::var_os("PATH").as_deref(), &fixed_compiler_dirs());
+    found.ok_or_else(|| format!("{COMPILER_NAME} が見つかりません。{GCC_HINT}"))
 }
 
+// 探す g++ の名前（見つからないときの文に使う）
+#[cfg(not(windows))]
+const COMPILER_NAME: &str = "g++-15";
+#[cfg(windows)]
+const COMPILER_NAME: &str = "g++.exe";
+
+// Windows（段階 2 S8。9.1 の 10）：g++.exe を PATH（相対パスのフォルダは見ない）→ 決まった場所の順に探す。
+// 版は確かめない（15.2.0 でなければ、ビルドのときに実行ログで知らせる。利用者の選択）
+#[cfg(windows)]
+fn find_compiler_on_windows(path_var: Option<&OsStr>, fixed: &[PathBuf]) -> Option<PathBuf> {
+    let in_path: Vec<PathBuf> = path_var
+        .map(|paths| std::env::split_paths(paths).collect())
+        .unwrap_or_default();
+    in_path
+        .into_iter()
+        .filter(|dir| dir.is_absolute())
+        .chain(fixed.iter().cloned())
+        .map(|dir| dir.join("g++.exe"))
+        .find(|path| path.is_file())
+}
+
+// g++.exe を探す決まった場所（MinGW-Builds を展開したときの場所を先に、MSYS2 の UCRT64 を最後に）
+#[cfg(windows)]
+fn fixed_compiler_dirs() -> Vec<PathBuf> {
+    [
+        std::env::var_os("ProgramFiles").map(|dir| PathBuf::from(dir).join(r"mingw64\bin")),
+        std::env::var_os("ProgramFiles(x86)").map(|dir| PathBuf::from(dir).join(r"mingw64\bin")),
+        Some(PathBuf::from(r"C:\mingw64\bin")),
+        Some(PathBuf::from(r"C:\msys64\ucrt64\bin")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+#[cfg(any(not(windows), test))]
 fn find_compiler_in(path_var: Option<&OsStr>, brews: &[PathBuf]) -> Option<PathBuf> {
     let name = "g++-15";
     let in_path = || {
@@ -133,7 +177,14 @@ pub fn version(compiler: &Path) -> Result<(String, String), String> {
     Ok((line, output("-dumpfullversion")?))
 }
 
+// Windows（段階 2 S8）：SDK はない（xcrun を起動しようとしない）
+#[cfg(windows)]
+fn sdk_path() -> Option<&'static str> {
+    None
+}
+
 // macOS の SDK の場所（`xcrun --show-sdk-path`）。取れなければ None（-isysroot を付けない）
+#[cfg(not(windows))]
 fn sdk_path() -> Option<&'static str> {
     static SDK: OnceLock<Option<String>> = OnceLock::new();
     SDK.get_or_init(|| {
@@ -149,8 +200,25 @@ fn sdk_path() -> Option<&'static str> {
 
 // ビルドしたものの場所。release でなければデバッグ用（-g -O0）の別のファイル
 pub fn output_path(dir: &Path, release: bool) -> PathBuf {
-    dir.join(OUTPUT_DIR)
-        .join(if release { BIN } else { "main-debug" })
+    executable(
+        dir.join(OUTPUT_DIR)
+            .join(if release { BIN } else { "main-debug" }),
+    )
+}
+
+// 作った実行ファイルの名前。Unix はそのまま
+#[cfg(not(windows))]
+fn executable(path: PathBuf) -> PathBuf {
+    path
+}
+
+// Windows（段階 2 S8）：MinGW の g++ は `-o main` で main.exe を作るので、IDE も `.exe` の名前で扱う
+// （with_extension は名前の中の `.` のあとを置き換えるので使わず、後ろに足す）
+#[cfg(windows)]
+fn executable(path: PathBuf) -> PathBuf {
+    let mut name = path.into_os_string();
+    name.push(".exe");
+    PathBuf::from(name)
 }
 
 // g++ に渡す引数（パッケージのディレクトリで動かす。ソースは main.cpp）。ジャッジに合わせる（D-205）
@@ -183,6 +251,10 @@ fn build_args_with(
     ac_library: Option<&Path>,
 ) -> Vec<String> {
     let mut args = flags_with(release, sdk, ac_library);
+    // Windows（段階 2 S9）：主スレッドのスタックを 1 GiB にする。ビルドの命令だけに付け、flags_with（clangd の解析の命令と
+    // 共通）には入れない
+    #[cfg(windows)]
+    args.push(format!("-Wl,--stack,{}", crate::toolchain::STACK_SIZE));
     args.extend([
         "-o".into(),
         output.to_string_lossy().into_owned(),
@@ -214,7 +286,7 @@ pub fn example_names(dir: &Path) -> Vec<String> {
 
 // ビルドした example の場所（パッケージの target/examples/<名前>）
 pub fn example_output_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(OUTPUT_DIR).join("examples").join(name)
+    executable(dir.join(OUTPUT_DIR).join("examples").join(name))
 }
 
 // ビルドのオプション（出力の場所とソースの前まで）
@@ -343,10 +415,7 @@ fn parse_search_dirs(stderr: &str) -> Vec<PathBuf> {
 // 定義ジャンプの行き先として、読み取り専用で開いてよい C++ のヘッダーの場所（D-210・D-133）。
 // GCC の検索の場所（`g++ -E -v`）、SDK の usr/include、AC Library。canonicalize 済み、ないものは載せない
 pub fn header_dirs(compiler: &Path, ac_library: Option<&Path>) -> Vec<PathBuf> {
-    let mut command = crate::process::command(compiler);
-    command.args(["-E", "-v", "-x", "c++", "/dev/null"]);
-    crate::toolchain::clear_ide_env(&mut command);
-    let mut dirs = command
+    let mut dirs = header_dirs_command(compiler)
         .output()
         .map(|output| parse_search_dirs(&String::from_utf8_lossy(&output.stderr)))
         .unwrap_or_default();
@@ -361,6 +430,21 @@ pub fn header_dirs(compiler: &Path, ac_library: Option<&Path>) -> Vec<PathBuf> {
         }
     }
     real
+}
+
+// header_dirs の命令（段階 2 S8 で、終わり方をテストで確かめるために分けた）
+fn header_dirs_command(compiler: &Path) -> Command {
+    let mut command = crate::process::command(compiler);
+    #[cfg(not(windows))]
+    command.args(["-E", "-v", "-x", "c++", "/dev/null"]);
+    // Windows（段階 2 S8）：/dev/null はないので、`-`（標準入力）を読ませる。標準入力は必ず空にする
+    // （空にしないと、g++ が入力を待って止まる）
+    #[cfg(windows)]
+    command
+        .args(["-E", "-v", "-x", "c++", "-"])
+        .stdin(std::process::Stdio::null());
+    crate::toolchain::clear_ide_env(&mut command);
+    command
 }
 
 // C++ のコンテストのフォルダに置く .clang-format（clangd の整形の書き方。エディタの字下げの 4 に合わせる。D-208・D-210）
@@ -438,6 +522,27 @@ pub fn parse_diagnostics(stderr: &str) -> Vec<Diagnostic> {
         });
     }
     items
+}
+
+// テスト用（段階 2 S8）：この機械の g++.exe（PATH の絶対パスのフォルダ → 決まった場所の順）。答え合わせと、
+// 本番の探し方を通さずに g++ を使うテストに使う。なければ None
+#[cfg(all(test, windows))]
+pub(crate) fn local_gpp_for_test() -> Option<PathBuf> {
+    let in_path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let fixed = [
+        std::env::var_os("ProgramFiles").map(|dir| PathBuf::from(dir).join(r"mingw64\bin")),
+        std::env::var_os("ProgramFiles(x86)").map(|dir| PathBuf::from(dir).join(r"mingw64\bin")),
+        Some(PathBuf::from(r"C:\mingw64\bin")),
+        Some(PathBuf::from(r"C:\msys64\ucrt64\bin")),
+    ];
+    in_path
+        .into_iter()
+        .filter(|dir| dir.is_absolute())
+        .chain(fixed.into_iter().flatten())
+        .map(|dir| dir.join("g++.exe"))
+        .find(|path| path.is_file())
 }
 
 #[cfg(test)]
@@ -533,8 +638,195 @@ mod tests {
             })
             .unwrap_err();
             assert!(error.contains(compiler), "{error}");
+            // Windows の案内は guides_installation_on_windows
+            #[cfg(not(windows))]
             assert!(error.contains("brew install gcc"), "{error}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guides_installation_on_windows() {
+        // 段階 2 S8：Windows の案内は Homebrew ではなく、MinGW-Builds の GCC と settings.json の g++.exe のパス
+        let error = find_compiler(&CppSettings {
+            compiler: r"C:\nonexistent\gcc".to_string(),
+            ac_library: None,
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("cpp.compiler")
+                && error.contains("MinGW-Builds")
+                && error.contains("g++.exe")
+                && !error.contains("brew"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_gcc_on_windows() {
+        // 段階 2 S8：PATH の g++.exe か、決まった場所の g++.exe を見つける（この機械にどちらもなければ飛ばす）
+        let Some(expected) = local_gpp_for_test() else {
+            eprintln!("g++.exe がないので飛ばします");
+            return;
+        };
+        assert_eq!(find_compiler(&CppSettings::default()), Ok(expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_gcc_in_path_then_fixed_places_on_windows() {
+        // 段階 2 S8：PATH（相対パスのフォルダは見ない）→ 決まった場所（並べた順）の順に g++.exe を探す
+        let base = TempDir::new("find-windows");
+        let (path_dir, fixed1, fixed2) = (
+            base.0.join("path"),
+            base.0.join("fixed1"),
+            base.0.join("fixed2"),
+        );
+        for dir in [&path_dir, &fixed1, &fixed2] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let path_var = std::env::join_paths([Path::new("relative"), path_dir.as_path()]).unwrap();
+        let fixed = [fixed1.clone(), fixed2.clone()];
+        assert_eq!(find_compiler_on_windows(Some(&path_var), &fixed), None);
+        std::fs::write(fixed2.join("g++.exe"), "").unwrap();
+        assert_eq!(
+            find_compiler_on_windows(Some(&path_var), &fixed),
+            Some(fixed2.join("g++.exe"))
+        );
+        std::fs::write(fixed1.join("g++.exe"), "").unwrap();
+        assert_eq!(
+            find_compiler_on_windows(Some(&path_var), &fixed),
+            Some(fixed1.join("g++.exe"))
+        );
+        std::fs::write(path_dir.join("g++.exe"), "").unwrap();
+        assert_eq!(
+            find_compiler_on_windows(Some(&path_var), &fixed),
+            Some(path_dir.join("g++.exe"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sets_the_stack_size_only_for_builds_on_windows() {
+        // 段階 2 S9：スタックの大きさ（-Wl,--stack,1073741824）は、ビルドの命令（提出用・デバッグ用・example）だけに付け、
+        // clangd に渡す解析の命令と compile_flags.txt には付けない（リンクの引数なので）
+        let stack = "-Wl,--stack,1073741824";
+        let output = Path::new(r"C:\p\target\main.exe");
+        let settings = CppSettings::default();
+        assert!(
+            build_args(true, output, &settings)
+                .iter()
+                .any(|arg| arg == stack)
+        );
+        assert!(
+            build_args(false, output, &settings)
+                .iter()
+                .any(|arg| arg == stack)
+        );
+        assert!(
+            build_args_for("examples/gen.cpp", output, &settings)
+                .iter()
+                .any(|arg| arg == stack)
+        );
+        let analysis = analysis_command_with(
+            Path::new(r"C:\gcc\bin\g++.exe"),
+            Path::new(r"C:\p\main.cpp"),
+            None,
+            None,
+        );
+        assert!(
+            !analysis.iter().any(|arg| arg.contains("--stack")),
+            "{analysis:?}"
+        );
+        assert!(!compile_flags(None).contains("--stack"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn names_outputs_with_exe_on_windows() {
+        // 段階 2 S8：MinGW の g++ は `-o main` で main.exe を作るので、IDE も .exe の名前で扱う
+        let dir = Path::new(r"C:\p");
+        assert_eq!(output_path(dir, true), dir.join(r"target\main.exe"));
+        assert_eq!(output_path(dir, false), dir.join(r"target\main-debug.exe"));
+        assert_eq!(
+            example_output_path(dir, "gen"),
+            dir.join(r"target\examples\gen.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_header_dirs_without_waiting_for_input() {
+        // 段階 2 S8：`g++ -E -v` が止まらずに終わり（標準入力は空）、終了コードが 0 で、ヘッダーの場所の一覧が取れる。
+        // 30 秒で終わらなければ失敗にする
+        let Some(compiler) = local_gpp_for_test() else {
+            eprintln!("g++.exe がないので飛ばします");
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let command_compiler = compiler.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(header_dirs_command(&command_compiler).output());
+        });
+        let output = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("g++ -E -v が 30 秒で終わらない")
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let dirs = parse_search_dirs(&stderr);
+        assert!(
+            dirs.iter().any(|dir| dir.join("bits/stdc++.h").is_file()),
+            "{dirs:?}"
+        );
+        // header_dirs も、同じ場所を返す
+        assert!(
+            header_dirs(&compiler, None)
+                .iter()
+                .any(|dir| dir.join("bits/stdc++.h").is_file())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn needs_compiler_dlls_on_the_path() {
+        // 段階 2 S8（前提の確かめ）：MinGW の g++ で作った exe は、コンパイラの bin の DLL（libstdc++-6.dll など）を使う。
+        // PATH にその bin がないと 0xC0000135（DLL が見つからない）で落ち、先頭に足すと動く
+        let Some(compiler) = local_gpp_for_test() else {
+            eprintln!("g++.exe がないので飛ばします");
+            return;
+        };
+        let dir = TempDir::new("dlls");
+        std::fs::write(
+            dir.0.join(SOURCE),
+            "#include <bits/stdc++.h>\nint main(){std::cout<<\"ok\"<<std::endl;}\n",
+        )
+        .unwrap();
+        let output = dir.0.join("hello.exe");
+        let built = Command::new(&compiler)
+            .current_dir(&dir.0)
+            .args(build_args(true, &output, &CppSettings::default()))
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        let without = Command::new(&output).env("PATH", &system).output().unwrap();
+        assert_eq!(without.status.code(), Some(0xC000_0135_u32 as i32));
+        let bin = compiler.parent().unwrap();
+        let with = Command::new(&output)
+            .env(
+                "PATH",
+                std::env::join_paths([bin, system.as_path()]).unwrap(),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(with.status.code(), Some(0));
+        assert_eq!(with.stdout, b"ok\r\n");
     }
 
     #[test]
@@ -698,9 +990,16 @@ compilation terminated.
         }
         // .cpp のファイルだけ（フォルダ・名前のないものは入れない）、名前の順
         assert_eq!(example_names(&dir.0), vec!["gen", "naive"]);
+        // Windows は .exe が付く（names_outputs_with_exe_on_windows）
+        #[cfg(not(windows))]
         assert_eq!(
             example_output_path(&dir.0, "gen"),
             dir.0.join("target/examples/gen")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            example_output_path(&dir.0, "gen"),
+            dir.0.join(r"target\examples\gen.exe")
         );
         let args = build_args_for("examples/gen.cpp", Path::new("/o"), &CppSettings::default());
         assert!(args.contains(&"-O2".to_string()));
@@ -732,6 +1031,12 @@ compilation terminated.
             return;
         };
         let (line, number) = version(&compiler).unwrap();
+        // Windows は名前に版のない g++.exe を探すので、15 でなければ飛ばす（段階 2 S8。CI の機械の g++ の版は分からない）
+        #[cfg(windows)]
+        if !number.starts_with("15.") {
+            eprintln!("g++ の版が 15 ではない（{number}）ので飛ばします");
+            return;
+        }
         assert!(!line.is_empty() && number.starts_with("15."));
         let dir = TempDir::new("build");
         std::fs::write(
@@ -773,7 +1078,11 @@ compilation terminated.
         use std::io::Write;
         child.stdin.take().unwrap().write_all(b"2 40\n").unwrap();
         let out = child.wait_with_output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // MinGW の g++ で作った exe は \r\n を出す（段階 2 S6・S8）
+        #[cfg(windows)]
+        let stdout = stdout.replace("\r\n", "\n");
+        assert_eq!(stdout, "42\n");
         // エラーのあるソース
         std::fs::write(dir.0.join(SOURCE), "int main() { x = 1; }\n").unwrap();
         let failed = Command::new(&compiler)

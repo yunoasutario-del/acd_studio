@@ -473,6 +473,24 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
         .map_err(|_| "アプリのフォルダを作れません".to_string())
 }
 
+// 同じパスへの保存を、IDE の中で 1 つずつにするためのロック（Windows 移植の段階 2 S10d。Windows だけ）。
+// Windows では、自分のスレッドどうしが同じファイルを同時に置き換えると、名前の変更が失敗しうる（Unix の名前の変更は
+// 同時でも失敗しないので、Unix では使わない）。
+// - 鍵は、渡されたパスの形のまま（canonicalize しない。呼び出し側は、アプリのフォルダなどに決まった名前をつないだパスを渡す）
+// - 限界：同じファイルを別の書き方（相対パスと絶対パス、大文字と小文字、`\\?\` の有無、`/` と `\` など）で渡すと、
+//   別のロックになって 1 つずつにならない
+// - IDE の外のもの（ウイルス対策など）が開いているときには効かない（そのときの案内は win::rename_replacing）
+// - 鍵は消さない（保存するファイルは決まった数なので増え続けない）
+#[cfg(windows)]
+fn save_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
 // W3：同じフォルダの一時ファイルに書き、sync_all で確定させ、名前の変更で置き換える（D-036）。
 // 権限は 0600（D-041）。OS のクラッシュ・電源断に対する完全な耐久性は保証しない
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -488,30 +506,43 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{name}.tmp-{}-{serial}", std::process::id()));
-    let result = (|| {
+    // Windows：同じパスへの保存は 1 つずつ（save_lock。段階 2 S10d）
+    #[cfg(windows)]
+    let lock = save_lock(path);
+    #[cfg(windows)]
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 失敗したら、どの段階か（と OS のエラー）を返す（Windows 移植の段階 2 S10c。同時の保存の失敗の原因を調べる）
+    let result = (|| -> Result<(), (&str, std::io::Error)> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&tmp)?;
+            .open(&tmp)
+            .map_err(|error| ("一時ファイルを作る", error))?;
         // すでにあった一時ファイルの権限も 0600 にそろえる
         #[cfg(unix)]
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| ("一時ファイルの権限", error))?;
+        file.write_all(bytes)
+            .map_err(|error| ("一時ファイルに書く", error))?;
+        file.sync_all()
+            .map_err(|error| ("一時ファイルを確定する", error))?;
         // Windows では、同時に置き換えていると失敗するので、少し待って試し直す（win.rs。Windows 移植の段階 1 C7）
         #[cfg(windows)]
         drop(file);
         #[cfg(windows)]
-        return crate::win::rename_replacing(&tmp, path);
+        return crate::win::rename_replacing(&tmp, path)
+            .map_err(|error| ("名前を変えて置き換える", error));
         #[cfg(unix)]
-        return fs::rename(&tmp, path);
+        return fs::rename(&tmp, path).map_err(|error| ("名前を変えて置き換える", error));
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
-    result.map_err(|_| "設定を保存できません".to_string())
+    result.map_err(|(step, error)| format!("設定を保存できません（{step}：{error}）"))
 }
 
 // 退避したファイルを、種類ごとに残す数（新しいものから。Phase 10 作業 15。D-173）
@@ -978,6 +1009,50 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["same.json".to_string()]);
+    }
+
+    // Windows（段階 2 S10d）：置き換える先をほかが削除の共有を許さずに開いている間は、試し直しを使い切って諦め、
+    // ほかのプログラムが使っている可能性を案内する。一時ファイルは残さない
+    #[cfg(windows)]
+    #[test]
+    fn tells_that_another_program_may_hold_the_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TempDir::new("held");
+        ensure_dir(&dir.0).unwrap();
+        let path = dir.0.join("held.json");
+        fs::write(&path, "old").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let result = write_atomic(&path, b"new");
+        drop(held);
+        let message = result.unwrap_err();
+        assert!(
+            message.contains("ほかのプログラム（ウイルス対策など）が使っている可能性があります"),
+            "{message}"
+        );
+        assert!(
+            message.contains("os error") && message.contains("回試し直した"),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        let names: Vec<_> = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["held.json".to_string()]);
+    }
+
+    // Windows（段階 2 S10d）：同じパスへの保存は同じロックで 1 つずつにする。別のパスは別のロック
+    #[cfg(windows)]
+    #[test]
+    fn uses_one_lock_per_path() {
+        let a = Path::new(r"C:\app\settings.json");
+        let b = Path::new(r"C:\app\state.json");
+        assert!(std::sync::Arc::ptr_eq(&save_lock(a), &save_lock(a)));
+        assert!(!std::sync::Arc::ptr_eq(&save_lock(a), &save_lock(b)));
     }
 
     #[test]

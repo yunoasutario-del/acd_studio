@@ -153,7 +153,7 @@ fn helper_of(
         Outcome::Stopped => return Helper::Stopped,
         Outcome::Exited(0) if !result.output_left_open => return Helper::Done(result.stdout),
         Outcome::Exited(0) => "出力の全体を得られませんでした".to_string(),
-        Outcome::Exited(code) => format!("終了コード {code}"),
+        Outcome::Exited(code) => crate::run::exit_code_text(code),
         Outcome::Signaled(signal) => format!("シグナル {signal}"),
         Outcome::TimedOut => format!("{} 秒の上限を超えました", RUN_TIME_LIMIT.as_secs()),
         Outcome::OutputLimit(_) => format!(
@@ -210,6 +210,12 @@ pub(crate) fn save_case(
     if input.len() as u64 > MAX_FILE_SIZE || expected.len() as u64 > MAX_FILE_SIZE {
         return Err("入力か期待出力が 1 MB を超えるので保存できません".to_string());
     }
+    // Windows だけ（段階 2 S6）：期待出力（愚直解の出力）は、\r のすぐあとに \n が来る組だけを \n に直して保存する
+    // （\r だけのものは残す）。入力（生成器の出力）は、解答に渡したそのままを残す（同じ失敗を起こし直せるように）
+    #[cfg(windows)]
+    let normalized = crate::compare::crlf_to_lf(expected);
+    #[cfg(windows)]
+    let expected = normalized.as_slice();
     ensure_inside(root, folder)?;
     fs::create_dir_all(folder).map_err(|error| format!("テストのフォルダを作れません：{error}"))?;
     ensure_inside(root, folder)?;
@@ -708,6 +714,27 @@ mod tests {
         assert!(!folder.join("random-11.in").exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn saves_expected_output_of_failed_cases_with_lf_on_windows() {
+        // 段階 2 S6：Windows では、愚直解の出力（random-N.out）の \r\n を \n に直して保存する（\r だけのものは残す）。
+        // 生成器の出力（random-N.in）は、解答に渡したそのままを残す（同じ失敗を起こし直せるように）
+        let ws = workspace("save-crlf");
+        let folder = ws.0.join("pkg/test");
+        assert_eq!(
+            save_case(&ws.0, &folder, b"5\r\n", b"1\r2\r\n10\r\n"),
+            Ok(Saved {
+                name: "random-1".to_string(),
+                existing: false
+            })
+        );
+        assert_eq!(fs::read(folder.join("random-1.in")).unwrap(), b"5\r\n");
+        assert_eq!(
+            fs::read(folder.join("random-1.out")).unwrap(),
+            b"1\r2\n10\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn does_not_save_outside_the_workspace() {
@@ -863,10 +890,6 @@ fn main() {
 
     // ビルドから保存・停止まで、実際のプログラムで確かめる。cargo が要る（cargo build はネットワークを使わない）
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 2（rustc の診断のパスの区切りが \\ になる）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn finds_differences_with_real_programs() {
         let ws = workspace("e2e");
         let pkg = ws.0.join("pkg");
@@ -1146,10 +1169,15 @@ fn main() {
         assert_eq!(*done, 2);
         assert_eq!((failure.seed, failure.verdict.as_str()), (101, "WA"));
         assert_eq!(failure.case.as_deref(), Some("random-1"));
+        // Windows の MinGW の生成器は \r\n を出し、random-N.in にはそのまま保存する（段階 2 S6）
+        #[cfg(not(windows))]
         assert_eq!(fs::read(pkg.join("test/random-1.in")).unwrap(), b"101\n");
+        #[cfg(windows)]
+        assert_eq!(fs::read(pkg.join("test/random-1.in")).unwrap(), b"101\r\n");
         assert_eq!(fs::read(pkg.join("test/random-1.out")).unwrap(), b"202\n");
-        assert!(pkg.join("target/examples/gen").is_file());
-        assert!(pkg.join("target/examples/naive").is_file());
+        // Windows は target/examples/gen.exe・naive.exe（段階 2 S8）
+        assert!(crate::cpp::example_output_path(&pkg, "gen").is_file());
+        assert!(crate::cpp::example_output_path(&pkg, "naive").is_file());
         let text = logs(&events);
         assert!(
             text.contains("生成器 examples/gen.cpp、愚直解 examples/naive.cpp"),
@@ -1290,5 +1318,91 @@ fn main() {
             matches!(&finish, Finish::Failed { message } if message.contains("ジャッジの CPython") && message.contains("brew install python@3.13")),
             "{finish:?}"
         );
+    }
+
+    // 上の Windows 版（段階 2 S7）。手元の CPython 3.13 を、設定なしで（PEP 514 のレジストリから）見つけて動かす。
+    // レジストリにない機械では飛ばす。生成器の出力（\r\n）は random-N.in にそのまま、愚直解の出力は \n に直して
+    // random-N.out に保存する（S6）。ジャッジと違う版を断ることは、ほかの版が手元にないので確かめない
+    #[cfg(windows)]
+    #[test]
+    fn finds_differences_with_python_programs_on_windows() {
+        if crate::python::registry_cpython_for_test().is_none() {
+            eprintln!("レジストリに CPython 3.13 がないので飛ばします");
+            return;
+        }
+        let ws = workspace("python-windows");
+        let langs = LangSettings::default();
+        let pkg = ws.0.join("pkg");
+        write(
+            &pkg.join("main.py"),
+            "n = int(input())\nprint(n * 2 + 1 if n % 7 == 3 else n * 2)\n",
+        );
+        write(
+            &pkg.join("examples/naive.py"),
+            "n = int(input())\nprint(n * 2)\n",
+        );
+        write(
+            &pkg.join("examples/gen.py"),
+            "import sys\nprint(int(sys.argv[1]))\n",
+        );
+        let target = Target {
+            package: "pkg".to_string(),
+            bin: crate::python::BIN.to_string(),
+            language: crate::language::Language::Python,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run = |langs: &LangSettings| {
+            let (channel, events) = collecting_channel(|_| {});
+            let finish = random_target(&pkg, &ws.0, &target, langs, 100, &cancel, &channel);
+            (finish, events)
+        };
+
+        // seed 101 で WA になり、random-1 に保存する
+        let (finish, events) = run(&langs);
+        let Finish::RandomTested {
+            done,
+            failure: Some(failure),
+            ..
+        } = &finish
+        else {
+            panic!("{finish:?}\n{}", logs(&events));
+        };
+        assert_eq!(*done, 2);
+        assert_eq!((failure.seed, failure.verdict.as_str()), (101, "WA"));
+        assert_eq!(fs::read(pkg.join("test/random-1.in")).unwrap(), b"101\r\n");
+        assert_eq!(fs::read(pkg.join("test/random-1.out")).unwrap(), b"202\n");
+        let text = logs(&events);
+        assert!(text.contains("ローカル：Python 3.13."), "{text}");
+        assert!(
+            text.contains("生成器 examples/gen.py、愚直解 examples/naive.py"),
+            "{text}"
+        );
+        // __pycache__ を作らない（-B・compile だけの確かめ）
+        assert!(!pkg.join("__pycache__").exists());
+        assert!(!pkg.join("examples/__pycache__").exists());
+
+        // 愚直解がない：Python の名前で案内する
+        fs::rename(pkg.join("examples/naive.py"), pkg.join("naive.bak")).unwrap();
+        let (finish, _) = run(&langs);
+        assert!(
+            matches!(&finish, Finish::Failed { message } if message.contains("examples/main_naive.py") && message.contains("examples/naive.py")),
+            "{finish:?}"
+        );
+        fs::rename(pkg.join("naive.bak"), pkg.join("examples/naive.py")).unwrap();
+
+        // 生成器に構文の誤り：CE。エラー一覧に、生成器のファイルの場所と行が出る
+        write(
+            &pkg.join("examples/gen.py"),
+            "import sys\nif True\n    print(1)\n",
+        );
+        let (finish, events) = run(&langs);
+        assert!(matches!(finish, Finish::CompileError), "{finish:?}");
+        let events = events.lock().unwrap();
+        let diagnostics = events
+            .iter()
+            .rfind(|event| event["type"] == "diagnostics")
+            .unwrap();
+        assert_eq!(diagnostics["items"][0]["file"], "examples/gen.py");
+        assert_eq!(diagnostics["items"][0]["line"], 2);
     }
 }

@@ -14,11 +14,17 @@ export type Diagnostic = {
 };
 
 export type RunOutcome =
-  | { kind: "exited"; code: number }
+  // label は画面に出す文字（Windows の例外の名前など。段階 2 S5）。前の版の実行履歴にはない
+  | { kind: "exited"; code: number; label?: string }
   | { kind: "signaled"; signal: number }
   | { kind: "timedOut" }
   | { kind: "outputLimit"; stream: LogKind }
   | { kind: "stopped" };
+
+// 終了コードの表示。Rust が作った label があればそれ、なければ（前の版の実行履歴）今までどおりの形
+export function exitLabel(outcome: { code: number; label?: string }): string {
+  return outcome.label || `終了コード ${outcome.code}`;
+}
 
 export type Finish =
   | { kind: "failed"; message: string }

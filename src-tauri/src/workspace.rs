@@ -265,6 +265,12 @@ pub fn write_expected(
     if content.len() as u64 > MAX_FILE_SIZE {
         return Err("1 MB を超える内容は保存できません".to_string());
     }
+    // Windows だけ（段階 2 S6）：\r のすぐあとに \n が来る組だけを \n に直してから保存する（\r だけのものは残す）。
+    // 「すでに同じ内容」の判断も、直したあとの内容で行う
+    #[cfg(windows)]
+    let normalized = crate::compare::crlf_to_lf(content.as_bytes());
+    #[cfg(windows)]
+    let content = std::str::from_utf8(&normalized).expect("\\r を除いても UTF-8 のまま");
     let (parent, name) = relative.rsplit_once('/').unwrap_or(("", relative));
     let stem = expected_name_stem(name).ok_or_else(|| {
         "期待出力として保存できるのは sample-N.out と random-N.out だけです".to_string()
@@ -580,6 +586,41 @@ mod tests {
         fs::create_dir_all(base.0.join("ws2")).unwrap();
         fs::write(base.0.join("ws2/other.txt"), "other").unwrap();
         (base, ws)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saves_expected_output_with_lf_on_windows() {
+        // 段階 2 S6：Windows では、実際の出力の \r\n を \n に直してから期待出力として保存する（\r だけのものは残す）
+        let (_base, ws) = setup("expected-crlf");
+        fs::create_dir_all(ws.join("pkg/test")).unwrap();
+        fs::write(ws.join("pkg/test/sample-1.in"), "1\n").unwrap();
+        fs::write(ws.join("pkg/test/sample-2.in"), "2\n").unwrap();
+        fs::write(ws.join("pkg/test/sample-2.out"), "old\n").unwrap();
+        let never = || -> bool { panic!("確認は要らないはず") };
+        // 新しく作る
+        assert_eq!(
+            write_expected(&ws, "pkg/test/sample-1.out", "2\r\n3\r\n", never),
+            Ok(ExpectedSaved::Written)
+        );
+        assert_eq!(
+            fs::read(ws.join("pkg/test/sample-1.out")).unwrap(),
+            b"2\n3\n"
+        );
+        // 直したあとが同じ内容なら、書かず、確認も出さない
+        assert_eq!(
+            write_expected(&ws, "pkg/test/sample-1.out", "2\r\n3\r\n", never),
+            Ok(ExpectedSaved::Unchanged)
+        );
+        // 上書きも直す。\r だけのものは残す
+        assert_eq!(
+            write_expected(&ws, "pkg/test/sample-2.out", "a\rb\r\n", || true),
+            Ok(ExpectedSaved::Written)
+        );
+        assert_eq!(
+            fs::read(ws.join("pkg/test/sample-2.out")).unwrap(),
+            b"a\rb\n"
+        );
     }
 
     #[test]

@@ -870,6 +870,9 @@ impl Client {
         let mut child = command
             .spawn()
             .map_err(|error| format!("lldb-dap を起動できません：{error}"))?;
+        #[cfg(windows)]
+        crate::win::start_in_job(&child)
+            .map_err(|error| format!("lldb-dap を起動できません：{error}"))?;
         let stdin = child.stdin.take().expect("piped");
         let stdout = child.stdout.take().expect("piped");
         spawn_stderr_reader(
@@ -931,6 +934,9 @@ impl Client {
             .stderr(Stdio::piped());
         let mut child = command
             .spawn()
+            .map_err(|error| format!("debugpy を起動できません：{error}"))?;
+        #[cfg(windows)]
+        crate::win::start_in_job(&child)
             .map_err(|error| format!("debugpy を起動できません：{error}"))?;
         // 出力は、つないでから読む（それまでは debugpy がつなぎを待つので、デバッグ対象は出力しない）
         let stdout = child.stdout.take().expect("piped");
@@ -2334,6 +2340,10 @@ int main() {
 
     // 止まる → 変数（vector・string）→ ステップ → 式 → 続行。例外・範囲外の読み書きで止まる
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows：デバッグは段階 6（今回の移植には含めない）。docs/windows-port-plan.md 7 章"
+    )]
     fn debugs_cpp_with_real_lldb_dap() {
         if crate::cpp::find_compiler(&crate::cpp::CppSettings::default()).is_err() {
             eprintln!("g++-15 がないので飛ばします");

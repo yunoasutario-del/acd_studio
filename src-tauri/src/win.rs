@@ -2,27 +2,48 @@
 //
 // - プロセス：pid でプロセスを開き、終わるのを待つ・終わったかを確かめる・止める。標準ライブラリの Child がハンドルを
 //   持っている間は、pid は別のプロセスに再利用されない（推測。未確認）
-// - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる
+// - Job：子を Job に入れ、止めるときは子孫ごと止める（段階 2 S3。下の「Job」の節）。使用メモリを読む（S4）
+// - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる。
+//   止めた直後のビルドの前に、exe が書けるようになるまで待つ（S3b）
 // - 時刻：UNIX 時刻（ミリ秒）を手元の時刻の月・日・時・分にする（Unix の localtime_r にあたる）
-//
-// 限界（段階 1 の仮の実装）：止めるのは直接の子だけで、子孫は残る。使用メモリは測らない。
-// 段階 2 で Job Object（CREATE_SUSPENDED で起動して入れる。9.1 の 1）に置き換える
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+use std::process::Child;
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
+};
+use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+};
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_ACCESS_RIGHTS,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE, OpenProcess, OpenThread,
+    PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, PROCESS_VM_READ, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
     WaitForSingleObject,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -79,7 +100,7 @@ pub fn is_alive(pid: u32) -> bool {
         .is_some_and(|code| code == STILL_ACTIVE as u32)
 }
 
-// 止める（直接の子だけ。子孫は残る）。終了コードは 1 にする
+// 止める（直接の子だけ。子孫は残る）。終了コードは 1 にする。Job に入れていないプロセス（デバッグの対象など）に使う
 pub fn terminate(pid: u32) {
     if let Some(handle) = open_process(pid, PROCESS_TERMINATE) {
         // SAFETY: 開いたハンドルを渡す。すでに終わっていれば失敗するだけ
@@ -87,6 +108,620 @@ pub fn terminate(pid: u32) {
             TerminateProcess(handle.0, 1);
         }
     }
+}
+
+// ---- Job（段階 2 S3。docs/windows-port-plan.md 9.1 の 1） ----
+//
+// IDE が起動する子（解答・ビルド・言語サーバーなど。process.rs で process_group(0) を付けたもの）は、CREATE_SUSPENDED で
+// 止めたまま起動し、start_in_job で Job に入れてから主スレッドを再開する（子が孫を作る前に Job に入る）。
+// Job には KILL_ON_JOB_CLOSE を付けるので、IDE が異常に終わって Job のハンドルが閉じても、子と孫は止まる。
+// 子孫は Job から抜けられない（JOB_OBJECT_LIMIT_BREAKAWAY_OK を付けない）。
+// Job は pid ごとに覚えておき、kill_job（process.rs の kill_group）で TerminateJobObject し、Job が空になるまで待ってから閉じる
+// （止めた直後に exe を上書きできるように。4.7）。Unix の作り（回収する前に必ずグループを止める）と同じく、kill_job は
+// 子を回収する前に必ず呼ばれる（run・run_pair・lsp の stop・debug の shutdown）。子が自然に終わっていても、残った孫は
+// ここで止まる。2 回目からは何もしない。覚えた pid は release_job（process.rs の reap と、lsp の stop〔段階 2 S13〕）で忘れる。
+// debug は reap を通らないので、閉じた印だけが残る（同じ pid が再利用されたら上書きする。段階 6 で扱う）。
+// 記録には、起動したときのプロセスのハンドルの写しも持ち、使用メモリ（今の WorkingSet と、終わったあとの最大）はそれで読む
+// （pid で開き直すと、pid が使い回されたときに別のプロセスを読むおそれがあるため。段階 2 S4）
+
+// IDE が止めたときの終了コード（9.1 の追加 10）。上位の E は「エラー」と「利用者が定める値」の印で、NTSTATUS と重ならない
+pub const KILLED_EXIT_CODE: u32 = 0xE0AC_0001;
+// 止めたあと、Job の中のプロセスがすべて終わるのを待つ時間の上限
+const JOB_EMPTY_WAIT: Duration = Duration::from_secs(5);
+
+struct Job {
+    // Job のハンドル。kill_job で止めて閉じたら None
+    job: Option<Handle>,
+    // 起動したときのプロセスのハンドルの写し（使用メモリを読む）
+    process: Handle,
+}
+
+// SAFETY: ハンドルはプロセスの中のどのスレッドからでも使え、閉じられる
+unsafe impl Send for Handle {}
+
+static JOBS: LazyLock<Mutex<HashMap<u32, Job>>> = LazyLock::new(Default::default);
+
+fn jobs() -> MutexGuard<'static, HashMap<u32, Job>> {
+    JOBS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// Job に入れる段階（テストで、それぞれの段階の失敗を起こすのに使う）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobStep {
+    Create,
+    Assign,
+    Resume,
+}
+
+// CREATE_SUSPENDED で起動した子を Job に入れ、主スレッドを再開する。再開し終わった時刻を返す（実行時間はここから数える。
+// 段階 2 S5d）。失敗したら子を止めて（止まったまま残さない）エラーにする
+pub fn start_in_job(child: &Child) -> Result<Instant, String> {
+    start_in_job_with(child, |_| false)
+}
+
+// fail が true を返した段階で失敗したことにする（テスト用。本番は常に false）
+pub(crate) fn start_in_job_with(
+    child: &Child,
+    fail: impl Fn(JobStep) -> bool,
+) -> Result<Instant, String> {
+    start_all_in_jobs_with(&[child], |_, step| fail(step)).map_err(|(_, message)| message)
+}
+
+// CREATE_SUSPENDED で起動した子をいくつか（run_pair の解答とジャッジ）、それぞれの Job に入れてから、スレッドの一覧を 1 回だけ
+// 取って続けて再開する（段階 2 S5d）。再開し終わった時刻を返す。どれか 1 つでも、Job を作る・入れる・再開するのに失敗したら、
+// すべての子を止めて、失敗した子の番号とエラーを返す（再開したあとの子も止める。止まったまま残さない）
+pub fn start_all_in_jobs(children: &[&Child]) -> Result<Instant, (usize, String)> {
+    start_all_in_jobs_with(children, |_, _| false)
+}
+
+// fail が true を返した子の番号と段階で失敗したことにする（テスト用。本番は常に false）
+pub(crate) fn start_all_in_jobs_with(
+    children: &[&Child],
+    fail: impl Fn(usize, JobStep) -> bool,
+) -> Result<Instant, (usize, String)> {
+    // 作った Job のハンドル。作ったらすぐここに入れ、失敗したときは子を止めたあとで閉じる（途中の失敗で先に閉じると、
+    // Job に入れたあとの子が KILL_ON_JOB_CLOSE で止まり、終了コードが 0 になる。S5d のテストで見つけた）
+    let mut made: Vec<Handle> = Vec::with_capacity(children.len());
+    // それぞれの子のプロセスのハンドルの写し
+    let mut copies: Vec<Handle> = Vec::with_capacity(children.len());
+    let mut start = || {
+        for (index, child) in children.iter().enumerate() {
+            let process = child.as_raw_handle() as HANDLE;
+            made.push(create_job(&|step| fail(index, step)).map_err(|message| (index, message))?);
+            enter_job(&made[index], process, &|step| fail(index, step))
+                .map_err(|message| (index, message))?;
+            copies.push(duplicate_process(process).map_err(|message| (index, message))?);
+        }
+        let pids: Vec<u32> = children.iter().map(|child| child.id()).collect();
+        resume_threads(&pids, &fail)?;
+        Ok(Instant::now())
+    };
+    match start() {
+        Ok(at) => {
+            let mut jobs = jobs();
+            for (child, (job, copy)) in children.iter().zip(made.into_iter().zip(copies)) {
+                jobs.insert(
+                    child.id(),
+                    Job {
+                        job: Some(job),
+                        process: copy,
+                    },
+                );
+            }
+            Ok(at)
+        }
+        Err(error) => {
+            // すべての子を止める。Job を閉じる前に止める（先に Job を閉じると KILL_ON_JOB_CLOSE で止まり、終了コードが 0 に
+            // なる）。Job は、このあと made を捨てるときに閉じる（再開したあとに子が作った孫は、そこで止まる）
+            for child in children {
+                // SAFETY: Child が持つ、まだ開いているプロセスのハンドルを渡す
+                unsafe {
+                    TerminateProcess(child.as_raw_handle() as HANDLE, KILLED_EXIT_CODE);
+                }
+            }
+            drop(copies);
+            drop(made);
+            Err(error)
+        }
+    }
+}
+
+fn last_error(what: &str) -> String {
+    format!("{what}（{}）", std::io::Error::last_os_error())
+}
+
+// Child が持つプロセスのハンドルの写しを作る（使用メモリを読む権限だけ）。Child のハンドルとは別に閉じる
+fn duplicate_process(process: HANDLE) -> Result<Handle, String> {
+    let mut copy: HANDLE = std::ptr::null_mut();
+    // SAFETY: 自分のプロセスの中で、Child が持つ開いているハンドルの写しを作る。書き込み先を渡す
+    let copied = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            process,
+            GetCurrentProcess(),
+            &mut copy,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            0,
+            0,
+        )
+    };
+    if copied == 0 {
+        return Err(last_error("プロセスのハンドルを写せません"));
+    }
+    Ok(Handle(copy))
+}
+
+// プロセスの使用メモリの数（PROCESS_MEMORY_COUNTERS）。読めなければ None
+fn memory_counters(process: &Handle) -> Option<PROCESS_MEMORY_COUNTERS> {
+    // SAFETY: PROCESS_MEMORY_COUNTERS はゼロで初期化してよい C の構造体。cb に大きさを入れてから渡す
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: 開いているプロセスのハンドルと、書き込み先とその大きさを渡す
+    (unsafe { K32GetProcessMemoryInfo(process.0, &mut counters, counters.cb) } != 0)
+        .then_some(counters)
+}
+
+// 動いている子の今の使用メモリ（WorkingSetSize。バイト）。起動したときのハンドルの写しで読む（段階 2 S4）。
+// Job に入れていない・読めないなら None
+pub fn working_set(pid: u32) -> Option<u64> {
+    let jobs = jobs();
+    memory_counters(&jobs.get(&pid)?.process).map(|counters| counters.WorkingSetSize as u64)
+}
+
+// KILL_ON_JOB_CLOSE と DIE_ON_UNHANDLED_EXCEPTION を付けた Job を作る。
+// DIE_ON_UNHANDLED_EXCEPTION（段階 2 S5b）：扱われない例外（アクセス違反・0 除算・スタックあふれなど）で落ちたとき、
+// Windows のエラー報告（WER）がプロセスを約 4 秒持ったままにして、サンプルテストで RE ではなく TLE と判定されていた。
+// これを付けると、すぐ（約 0.1 秒）終わる。終了コードは例外のコードのまま（測定で確認）。
+// __fastfail で終わるもの（0xC0000409。C++ の abort・assert・捕まえない例外、Rust の abort）には効かない（測定で確認）
+fn create_job(fail: &impl Fn(JobStep) -> bool) -> Result<Handle, String> {
+    // SAFETY: 名前もセキュリティ属性もない Job を作る。失敗すれば null が返る
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(last_error("Job を作れません"));
+    }
+    let job = Handle(raw);
+    if fail(JobStep::Create) {
+        return Err("Job を作れません（テスト）".to_string());
+    }
+    // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION はゼロで初期化してよい C の構造体
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    // SAFETY: 作った Job と、読む構造体とその大きさを渡す
+    let set = unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if set == 0 {
+        return Err(last_error("Job を設定できません"));
+    }
+    Ok(job)
+}
+
+// 子を Job に入れる（再開はしない）
+fn enter_job(job: &Handle, process: HANDLE, fail: &impl Fn(JobStep) -> bool) -> Result<(), String> {
+    // SAFETY: 作った Job と、Child が持つプロセスのハンドルを渡す
+    if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+        return Err(last_error("Job に入れられません"));
+    }
+    if fail(JobStep::Assign) {
+        return Err("Job に入れられません（テスト）".to_string());
+    }
+    #[cfg(test)]
+    std::thread::sleep(RESUME_DELAY.get());
+    Ok(())
+}
+
+// テスト用（段階 2 S5d）：Job に入れてから再開するまでに、このスレッドで、この時間だけ待つ（Job に入れるのが遅いときにあたる）。
+// スレッドごとの値なので、同時に動くほかのテストには効かない。テストのときだけコンパイルする
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RESUME_DELAY: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+// pids のプロセスのスレッドを、pids の順に再開する。スレッドの一覧は 1 回だけ取る（約 47 ms かかる。S13 の測定）。
+// CREATE_SUSPENDED で起動したばかりなので、スレッドはそれぞれ主スレッドの 1 つだけ（推測）。
+// 標準ライブラリは起動したあと主スレッドのハンドルを閉じるので、スレッドの一覧から探す。
+// 失敗したら、その子の番号とエラーを返す（それより前の子は再開したまま。止めるのは呼ぶ側）
+fn resume_threads(
+    pids: &[u32],
+    fail: &impl Fn(usize, JobStep) -> bool,
+) -> Result<(), (usize, String)> {
+    // SAFETY: 引数は値だけ。失敗すれば INVALID_HANDLE_VALUE が返る
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err((0, last_error("スレッドの一覧を取れません")));
+    }
+    let snapshot = Handle(snapshot);
+    // それぞれの子のスレッドの id
+    let mut threads: Vec<Vec<u32>> = vec![Vec::new(); pids.len()];
+    // SAFETY: THREADENTRY32 はゼロで初期化してよい C の構造体。dwSize に大きさを入れてから渡す
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    // SAFETY: 取った一覧と、書き込み先を渡す
+    let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+    while more {
+        if let Some(index) = pids.iter().position(|pid| *pid == entry.th32OwnerProcessID) {
+            threads[index].push(entry.th32ThreadID);
+        }
+        // SAFETY: 取った一覧と、書き込み先を渡す
+        more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+    }
+    for (index, ids) in threads.iter().enumerate() {
+        if fail(index, JobStep::Resume) {
+            return Err((index, "主スレッドを再開できません（テスト）".to_string()));
+        }
+        if ids.is_empty() {
+            return Err((index, "主スレッドが見つかりません".to_string()));
+        }
+        for id in ids {
+            // SAFETY: 引数は値だけ。失敗すれば null が返る
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, *id) };
+            if thread.is_null() {
+                return Err((index, last_error("主スレッドを開けません")));
+            }
+            let thread = Handle(thread);
+            // SAFETY: 開いたスレッドのハンドルを渡す。失敗すれば u32::MAX が返る
+            if unsafe { ResumeThread(thread.0) } == u32::MAX {
+                return Err((index, last_error("主スレッドを再開できません")));
+            }
+        }
+    }
+    Ok(())
+}
+
+// pid の子の Job の中を、すべて止める（直接の子と孫）。Job が空になるまで待ってから閉じる。
+// 2 回目からは何もしない。Job に入れていない pid なら、作りの誤りなので debug では止め、release では直接の子だけを止める
+pub fn kill_job(pid: u32) {
+    let job = {
+        let mut jobs = jobs();
+        match jobs.get_mut(&pid) {
+            Some(entry) => match entry.job.take() {
+                Some(job) => job,
+                None => return,
+            },
+            None => {
+                drop(jobs);
+                debug_assert!(
+                    false,
+                    "Job に入れていないプロセス（pid {pid}）を止めようとした"
+                );
+                terminate(pid);
+                return;
+            }
+        }
+    };
+    // SAFETY: 開いている Job のハンドルを渡す
+    unsafe {
+        TerminateJobObject(job.0, KILLED_EXIT_CODE);
+    }
+    wait_until_empty(&job);
+}
+
+// Job の中で動いているプロセスが 0 になるまで待つ（最大 JOB_EMPTY_WAIT）。TerminateJobObject は終わるのを待たずに返る（推測）
+fn wait_until_empty(job: &Handle) {
+    let until = Instant::now() + JOB_EMPTY_WAIT;
+    loop {
+        // SAFETY: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION はゼロで初期化してよい C の構造体
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: 開いている Job と、書き込み先とその大きさを渡す
+        let read = unsafe {
+            QueryInformationJobObject(
+                job.0,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 || info.ActiveProcesses == 0 || Instant::now() >= until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// 回収した子の記録を忘れ、最大使用メモリ（PeakWorkingSetSize。バイト）を返す。終わったあとに、起動したときのハンドルの
+// 写しで読む（段階 2 S4）。読めなければ None。kill_job を呼ばずに回収した（作りの誤り）なら、debug では止め、release では
+// Job を閉じる（KILL_ON_JOB_CLOSE で残りが止まる）
+pub fn release_job(pid: u32) -> Option<u64> {
+    let entry = jobs().remove(&pid);
+    debug_assert!(
+        entry.as_ref().is_some_and(|entry| entry.job.is_none()),
+        "kill_job を呼ばずに回収した、または Job に入れていないプロセス（pid {pid}）"
+    );
+    memory_counters(&entry?.process).map(|counters| counters.PeakWorkingSetSize as u64)
+}
+
+// テスト用：pid の Job の記録が残っているか（段階 2 S13）
+#[cfg(test)]
+pub(crate) fn has_job_record(pid: u32) -> bool {
+    jobs().contains_key(&pid)
+}
+
+// テスト用：止めずに Job のハンドルを閉じる（IDE が異常に終わったときにあたる）
+#[cfg(test)]
+pub(crate) fn close_job_without_terminating(pid: u32) {
+    let entry = jobs().remove(&pid);
+    drop(entry);
+}
+
+// ---- 落ちた子のエラー報告を止める（段階 2 S5c。docs/windows-port-plan.md の S5c の行） ----
+//
+// __fastfail（0xC0000409。Rust の abort、C++ の abort・assert・捕まえない例外）で落ちると、Job の
+// DIE_ON_UNHANDLED_EXCEPTION は効かず、Windows のエラー報告（WER）の WerFault.exe が、落ちた子を約 4 秒
+// 持ったままにする（サンプルテストで TLE になっていた）。その WerFault.exe は、落ちた子が親で、Job の外にある（測定）。
+// 子の終わりを待っている間に、親が直接の子の WerFault.exe を探して止めると、子はすぐ 0xC0000409 のまま終わる（測定で
+// 131〜160 ms）。WER のサービス（WerSvc）が起動した WerFault.exe は、親が違うので止めない。
+// 子が終わる前に探すので、子の pid はほかのプロセスに使い回されていない。それでも、前に同じ pid を使っていたプロセスの
+// 子を止めないように、子より前に作られたものは止めない。
+//
+// 見張りは IDE 全体で 1 つのスレッド（S5c の直し）。子ごとに一覧を取ると、テストのように子が同時に多いとき、一覧を取る処理
+// どうしやプロセスを作る処理が待ち合わせになって遅れた（作り直しありで cargo test 全体を 5 回ずつ：子ごとに探すと 1 回、
+// 探さないと 0 回落ちた）。見張る子は CrashReporterWatch で登録・解除する。見張りのスレッドは、最初の登録のときに作られ、
+// 登録がある間だけ CRASH_REPORTER_POLL ごとに一覧を 1 回取る。登録がなくなったら、次の登録まで Condvar で眠る
+// （スレッドは終わらせない。眠っている間は CPU を使わない）
+
+// 一覧を取る間隔。プロセスの一覧を取るのに中央値 約 8 ms かかる（測定）ので、毎回は探さない
+const CRASH_REPORTER_POLL: Duration = Duration::from_millis(100);
+// 子が始まって（登録して）からこの時間は探さない。WerFault.exe は早くても約 120 ms で起動する（測定）ので、すぐ終わる子は
+// 一度も一覧を取らずに済む
+const CRASH_REPORTER_DELAY: Duration = Duration::from_millis(100);
+
+// プロセスの一覧の 1 行
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessEntry {
+    pub pid: u32,
+    pub parent: u32,
+    pub name: String,
+    // 作られた時刻（FILETIME の 100 ナノ秒の数）。読めなければ 0
+    pub created: u64,
+}
+
+// entries のうち、止めてよい WerFault.exe の pid：親が child で、child より前に作られていないもの
+pub(crate) fn crash_reporters_of(
+    entries: &[ProcessEntry],
+    child: u32,
+    child_created: u64,
+) -> Vec<u32> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.parent == child
+                && entry.name.eq_ignore_ascii_case("WerFault.exe")
+                && entry.created >= child_created
+        })
+        .map(|entry| entry.pid)
+        .collect()
+}
+
+// プロセスの作られた時刻（FILETIME の 100 ナノ秒の数）。読めなければ None
+fn created_time(process: HANDLE) -> Option<u64> {
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: 開いているプロセスのハンドルと、書き込み先を渡す
+    let read =
+        unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) };
+    (read != 0)
+        .then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+// 今のプロセスの一覧のうち、名前が WerFault.exe のもの（作られた時刻つき）
+fn crash_reporter_entries() -> Vec<ProcessEntry> {
+    let mut entries = Vec::new();
+    // SAFETY: 引数は値だけ。失敗すれば INVALID_HANDLE_VALUE が返る
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return entries;
+    }
+    let snapshot = Handle(snapshot);
+    // SAFETY: PROCESSENTRY32W はゼロで初期化してよい C の構造体。dwSize に大きさを入れてから渡す
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: 取った一覧と、書き込み先を渡す
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+        let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        if name.eq_ignore_ascii_case("WerFault.exe") {
+            let created = open_process(entry.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION)
+                .and_then(|process| created_time(process.0))
+                .unwrap_or(0);
+            entries.push(ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent: entry.th32ParentProcessID,
+                name,
+                created,
+            });
+        }
+        // SAFETY: 取った一覧と、書き込み先を渡す
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+    entries
+}
+
+// 見張る子：pid → (登録した時刻, 子の作られた時刻)
+type Watched = HashMap<u32, (Instant, u64)>;
+
+// 見張る子の一覧と、登録を見張りのスレッドに知らせる Condvar
+static WATCHED: LazyLock<(Mutex<Watched>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+// 見張りのスレッドを作るのは 1 回だけ
+static WATCHER: Once = Once::new();
+
+fn watched() -> MutexGuard<'static, Watched> {
+    WATCHED.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// 見張りのスレッド。登録がなければ眠り、登録がある間は CRASH_REPORTER_POLL ごとに、登録から CRASH_REPORTER_DELAY
+// たった子について、プロセスの一覧を 1 回だけ取って、親がその子の WerFault.exe を止める
+fn watch_crash_reporters() {
+    loop {
+        {
+            let mut children = watched();
+            while children.is_empty() {
+                children = WATCHED
+                    .1
+                    .wait(children)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        std::thread::sleep(CRASH_REPORTER_POLL);
+        let due: Vec<(u32, u64)> = watched()
+            .iter()
+            .filter(|(_, (since, _))| since.elapsed() >= CRASH_REPORTER_DELAY)
+            .map(|(pid, (_, created))| (*pid, *created))
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        let entries = crash_reporter_entries();
+        for (pid, created) in due {
+            for reporter in crash_reporters_of(&entries, pid, created) {
+                if let Some(process) = open_process(reporter, PROCESS_TERMINATE) {
+                    // SAFETY: 開いたハンドルを渡す。すでに終わっていれば失敗するだけ
+                    unsafe {
+                        TerminateProcess(process.0, 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 子を見張る間だけ持つもの（process.rs の run・run_pair。時間の上限がある実行〔解答・ジャッジ・生成器・愚直解〕だけ。
+// ビルドや構文の確かめは、長く動くうえ IDE が判定するものではないので、見張らない）。作ると登録し、捨てると解除する。
+// 子の作られた時刻は、Job の記録のハンドルの写しで読む（Job に入れていない子なら登録しない）
+pub struct CrashReporterWatch {
+    pid: Option<u32>,
+}
+
+impl CrashReporterWatch {
+    pub fn new(pid: u32) -> Self {
+        let created = {
+            let jobs = jobs();
+            jobs.get(&pid).and_then(|job| created_time(job.process.0))
+        };
+        let Some(created) = created else {
+            return CrashReporterWatch { pid: None };
+        };
+        WATCHER.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("crash-reporter-watch".to_string())
+                .spawn(watch_crash_reporters);
+        });
+        watched().insert(pid, (Instant::now(), created));
+        WATCHED.1.notify_one();
+        CrashReporterWatch { pid: Some(pid) }
+    }
+}
+
+impl Drop for CrashReporterWatch {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            watched().remove(&pid);
+        }
+    }
+}
+
+// ---- 書けるようになるまで待つ（段階 2 S3b。docs/windows-port-plan.md 4.7） ----
+//
+// 止めた直後の前の実行の exe は、Job が空になり、直接の子の終わりを待ったあとでも、10〜40 ms ほど書けないことがある
+// （原因は未確認）。ビルドの前に、書き込みで開けるようになるまで待つ。開いてすぐ閉じるだけで、作らない・切り詰めない・
+// 書かないので、中身も更新日時も変わらない
+
+// ビルドの前に待つ時間の上限（全部の exe で合わせて）
+pub const WRITABLE_WAIT: Duration = Duration::from_secs(2);
+// 試し直す間隔
+const WRITABLE_POLL: Duration = Duration::from_millis(10);
+
+// path を書き込みで開けるようになるまで、最大 limit 待つ（少なくとも 1 回は試す）。
+// 開けた・ない・共有違反とアクセス拒否のほかのエラー（あとのビルドに任せる）なら true。
+// limit を過ぎても共有違反（32）かアクセス拒否（5）なら false
+pub fn wait_until_writable(path: &Path, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(_) => return true,
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(left.min(WRITABLE_POLL));
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+// ---- レジストリ（段階 2 S7。読むだけで、書かない） ----
+
+// 読むキーの根
+#[derive(Debug, Clone, Copy)]
+pub enum RegistryRoot {
+    CurrentUser,
+    LocalMachine,
+}
+
+// root の subkey の value（None なら既定の値）の文字列（REG_SZ）を、64 ビットの見え方で読む。
+// キー・値がない、文字列でない、読めないときは None
+pub fn registry_string(root: RegistryRoot, subkey: &str, value: Option<&str>) -> Option<OsString> {
+    let root = match root {
+        RegistryRoot::CurrentUser => HKEY_CURRENT_USER,
+        RegistryRoot::LocalMachine => HKEY_LOCAL_MACHINE,
+    };
+    let subkey = wide(Path::new(subkey));
+    let value = value.map(|value| wide(Path::new(value)));
+    let value_ptr = value
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    let flags = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY;
+    let mut size: u32 = 0;
+    // SAFETY: 終わりに 0 の付いた UTF-16 の名前（値の名前は null でもよい）と、大きさの書き込み先を渡す。データは受け取らない
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            subkey.as_ptr(),
+            value_ptr,
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS || size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    // SAFETY: 上と同じ名前と、size バイトの書き込み先とその大きさを渡す
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            subkey.as_ptr(),
+            value_ptr,
+            flags,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    Some(OsString::from_wide(&buffer[..length]))
 }
 
 // ---- ファイル ----
@@ -143,15 +778,34 @@ pub fn same_entry(a: &Path, b: &Path) -> bool {
 // 名前の変更で置き換える（fs::rename）。Windows では、同じファイルをほかのスレッド・プロセスが同時に置き換えている・開いていると、
 // 「アクセスが拒否されました」（5）・「共有違反」（32）で失敗する（同時に保存するテストで確認済み）。その間だけ少し待って試し直す
 // （docs/windows-port-plan.md 3.3。待つのは合わせて最大で約 2 秒）
+// 諦めたときのエラーには、試し直した回数とかかった時間を書き足す（段階 2 S10c。同時の保存の失敗の原因を調べる）。
+// 5・32 の試し直しを使い切って諦めたときは、ほかのプログラムが使っている可能性も案内する（段階 2 S10d。IDE の中の
+// 同時の保存は storage::save_lock で 1 つずつにしているので、残るのは IDE の外のものが開いている場合と考える）
 pub fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     const RETRIES: u32 = 100;
     const WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+    let started = Instant::now();
     let mut tries = 0;
     loop {
         match std::fs::rename(from, to) {
             Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) && tries < RETRIES => {
                 tries += 1;
                 std::thread::sleep(WAIT);
+            }
+            Err(error) if tries > 0 => {
+                let gave_up = matches!(error.raw_os_error(), Some(5 | 32));
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}。{tries} 回試し直した（{} ms）{}",
+                        started.elapsed().as_millis(),
+                        if gave_up {
+                            "。ほかのプログラム（ウイルス対策など）が使っている可能性があります"
+                        } else {
+                            ""
+                        }
+                    ),
+                ));
             }
             result => return result,
         }
@@ -230,6 +884,113 @@ mod tests {
         std::fs::hard_link(dir.join("a.txt"), dir.join("hard.txt")).unwrap();
         assert!(same_entry(&dir.join("a.txt"), &dir.join("hard.txt")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // テスト用のフォルダ。捨てるときに消す
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!(
+                "atcoder-studio-writable-{}-{name}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // 段階 2 S5c：止めるのは、親が落ちた子で、子よりあとに作られた WerFault.exe だけ（名前は大文字・小文字を区別しない）
+    #[test]
+    fn picks_only_crash_reporters_started_by_the_child() {
+        let entry = |pid: u32, parent: u32, name: &str, created: u64| ProcessEntry {
+            pid,
+            parent,
+            name: name.to_string(),
+            created,
+        };
+        let entries = [
+            entry(1, 100, "WerFault.exe", 1_500),
+            // サービス（WerSvc）が起動したものは止めない
+            entry(2, 200, "WerFault.exe", 1_500),
+            // 名前が違う
+            entry(3, 100, "notepad.exe", 1_500),
+            entry(4, 100, "werfault.EXE", 1_600),
+            // 子より前に作られた（同じ pid を前に使っていたプロセスの子）
+            entry(5, 100, "WerFault.exe", 900),
+        ];
+        assert_eq!(crash_reporters_of(&entries, 100, 1_000), vec![1, 4]);
+    }
+
+    #[test]
+    fn does_not_wait_for_a_missing_file() {
+        let dir = TempDir::new("missing");
+        let started = Instant::now();
+        assert!(wait_until_writable(
+            &dir.0.join("none.exe"),
+            Duration::from_secs(2)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn waits_while_another_handle_denies_writing() {
+        // 共有を許さずに開いている間は書けない。limit まで待って false。閉じればすぐ true
+        let dir = TempDir::new("held");
+        let path = dir.0.join("main.exe");
+        std::fs::write(&path, b"exe").unwrap();
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap()
+        };
+        let started = Instant::now();
+        let writable = wait_until_writable(&path, Duration::from_millis(300));
+        let waited = started.elapsed();
+        drop(held);
+        assert!(!writable, "開いている間に書けることになった");
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        let started = Instant::now();
+        assert!(wait_until_writable(&path, Duration::from_secs(2)));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(std::fs::read(&path).unwrap(), b"exe");
+    }
+
+    #[test]
+    fn waits_while_the_program_runs_without_changing_it() {
+        // 動いている exe には書けない。止めれば 2 秒のうちに書けるようになる。確かめても中身と更新日時は変わらない
+        let dir = TempDir::new("running");
+        let path = dir.0.join("victim.exe");
+        std::fs::copy(crate::process::test_child_path(), &path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut child = std::process::Command::new(&path)
+            .arg("sleep:30000")
+            .spawn()
+            .unwrap();
+        let while_running = wait_until_writable(&path, Duration::from_millis(300));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let started = Instant::now();
+        let after_stop = wait_until_writable(&path, WRITABLE_WAIT);
+        let waited = started.elapsed();
+        assert!(!while_running, "動いている間に書けることになった");
+        assert!(after_stop, "止めてから {waited:?} たっても書けない");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
     }
 
     #[test]

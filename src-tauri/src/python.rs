@@ -38,10 +38,20 @@ impl Interpreter {
     }
 
     // 探す名前（Homebrew・PATH の中）
+    #[cfg(not(windows))]
     fn names(self) -> &'static [&'static str] {
         match self {
             Interpreter::Cpython => &["python3.13"],
             Interpreter::Pypy => &["pypy3.11", "pypy3"],
+        }
+    }
+
+    // Windows（段階 2 S7）：PATH の中で探す名前。公式の CPython の exe は python.exe だけ（python3.13.exe はない）
+    #[cfg(windows)]
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Interpreter::Cpython => &["python.exe"],
+            Interpreter::Pypy => &["pypy3.11.exe", "pypy3.exe"],
         }
     }
 
@@ -102,6 +112,7 @@ impl Interpreter {
         }
     }
 
+    #[cfg(not(windows))]
     fn hint(self) -> &'static str {
         match self {
             Interpreter::Cpython => {
@@ -109,6 +120,19 @@ impl Interpreter {
             }
             Interpreter::Pypy => {
                 "ジャッジと同じ PyPy（Python 3.11 の版）が要ります。ターミナルで `brew install pypy3.11` を実行して入れてください。別の場所のものを使うときは、settings.json の python.pypy に pypy3 のパスを書いてください"
+            }
+        }
+    }
+
+    // Windows の案内（段階 2 S7）
+    #[cfg(windows)]
+    fn hint(self) -> &'static str {
+        match self {
+            Interpreter::Cpython => {
+                "ジャッジと同じ CPython 3.13 が要ります。python.org の Windows 版の Python 3.13 を入れてください（例：`winget install --id Python.Python.3.13 --scope user`）。別の場所のものを使うときは、settings.json の python.cpython に python.exe のパスを書いてください"
+            }
+            Interpreter::Pypy => {
+                "ジャッジと同じ PyPy（Python 3.11 の版）が要ります。pypy.org から Windows 版の PyPy 3.11 を入れて、settings.json の python.pypy に pypy3.exe のパスを書いてください"
             }
         }
     }
@@ -167,15 +191,18 @@ pub fn find_interpreter(settings: &PythonSettings) -> Result<PathBuf, String> {
             interpreter.hint()
         ));
     }
-    find_in(
+    #[cfg(not(windows))]
+    let found = find_in(
         interpreter.names(),
         std::env::var_os("PATH").as_deref(),
         &[
             PathBuf::from("/opt/homebrew/bin"),
             PathBuf::from("/usr/local/bin"),
         ],
-    )
-    .ok_or_else(|| {
+    );
+    #[cfg(windows)]
+    let found = find_on_windows(interpreter);
+    found.ok_or_else(|| {
         format!(
             "{} が見つかりません。{}",
             interpreter.names().join("・"),
@@ -184,6 +211,87 @@ pub fn find_interpreter(settings: &PythonSettings) -> Result<PathBuf, String> {
     })
 }
 
+// Windows（段階 2 S7。9.1 の追加 11）：処理系を探す。py ランチャーは使わない。
+// CPython は PEP 514 のレジストリ（3.13 だけ。HKCU → HKLM。64 ビットの見え方）→ PATH の python.exe のうち、
+// 版を確かめて最初の CPython 3.13 のもの（PyPy のフォルダにも python.exe があるため）。
+// PyPy は PATH の pypy3.11.exe・pypy3.exe（版は動かす前に run.rs が確かめる。Unix と同じ）
+#[cfg(windows)]
+fn find_on_windows(interpreter: Interpreter) -> Option<PathBuf> {
+    let aliases = std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join(r"Microsoft\WindowsApps"));
+    let candidates = path_candidates(
+        interpreter.names(),
+        std::env::var_os("PATH").as_deref(),
+        aliases.as_deref(),
+    );
+    match interpreter {
+        Interpreter::Cpython => {
+            registry_cpython().or_else(|| first_cpython(&candidates, |path| version(path).ok()))
+        }
+        Interpreter::Pypy => candidates.into_iter().next(),
+    }
+}
+
+// PEP 514 のレジストリの CPython 3.13（InstallPath の ExecutablePath。なければ InstallPath の既定の値の python.exe）
+#[cfg(windows)]
+fn registry_cpython() -> Option<PathBuf> {
+    use crate::win::{RegistryRoot, registry_string};
+    const KEY: &str = r"Software\Python\PythonCore\3.13\InstallPath";
+    [RegistryRoot::CurrentUser, RegistryRoot::LocalMachine]
+        .into_iter()
+        .find_map(|root| {
+            registry_string(root, KEY, Some("ExecutablePath"))
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+                .or_else(|| {
+                    registry_string(root, KEY, None)
+                        .map(|dir| PathBuf::from(dir).join("python.exe"))
+                        .filter(|path| path.is_file())
+                })
+        })
+}
+
+// PATH の中の names（名前の順、同じ名前なら PATH の順）のファイル。相対パスのフォルダは見ない。
+// WindowsApps の実行エイリアスは、動かすと Microsoft Store が開くことがあるので、ここで（版を確かめる前に）除く：
+// aliases のフォルダ（大文字・小文字と末尾の \ を問わない）の中のものと、大きさが 0 のもの・普通のファイルとして読めないもの
+#[cfg(windows)]
+fn path_candidates(
+    names: &[&str],
+    path_var: Option<&OsStr>,
+    aliases: Option<&Path>,
+) -> Vec<PathBuf> {
+    let key = |dir: &Path| dir.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    let alias_key = aliases.map(key);
+    let dirs: Vec<PathBuf> = path_var
+        .map(|paths| std::env::split_paths(paths).collect())
+        .unwrap_or_default();
+    names
+        .iter()
+        .flat_map(|name| dirs.iter().map(move |dir| (dir, dir.join(name))))
+        .filter(|(dir, _)| dir.is_absolute() && alias_key.as_ref() != Some(&key(dir)))
+        .filter(|(_, path)| {
+            std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        })
+        .map(|(_, path)| path)
+        .collect()
+}
+
+// 候補を順に version_of で確かめ、最初の CPython 3.13 を返す
+#[cfg(windows)]
+fn first_cpython(
+    candidates: &[PathBuf],
+    version_of: impl Fn(&Path) -> Option<Version>,
+) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|path| {
+            version_of(path)
+                .is_some_and(|version| check_version(Interpreter::Cpython, &version).is_ok())
+        })
+        .cloned()
+}
+
+#[cfg(any(not(windows), test))]
 fn find_in(names: &[&str], path_var: Option<&OsStr>, brews: &[PathBuf]) -> Option<PathBuf> {
     names.iter().find_map(|name| {
         let in_path = || {
@@ -373,6 +481,8 @@ pub fn imports(interpreter: &Path, source: &Path) -> Result<Vec<Import>, String>
     if let Some(dir) = source.parent() {
         command.current_dir(dir);
     }
+    #[cfg(windows)]
+    command.args(UTF8_MODE);
     command
         .arg("-I")
         .arg("-B")
@@ -401,15 +511,7 @@ pub fn imports(interpreter: &Path, source: &Path) -> Result<Vec<Import>, String>
 // 処理系の標準ライブラリ・site-packages の場所（定義ジャンプの行き先を読み取り専用で開く。D-225）。
 // -I で、今のフォルダ・利用者の site-packages・PYTHON… の環境変数を入れない。読めなければ空
 pub fn library_dirs(interpreter: &Path) -> Vec<PathBuf> {
-    let mut command = crate::process::command(interpreter);
-    command.args([
-        "-I",
-        "-B",
-        "-c",
-        "import sys\nfor p in sys.path:\n    print(p)\n",
-    ]);
-    crate::toolchain::clear_ide_env(&mut command);
-    let Ok(output) = command.output() else {
+    let Ok(output) = library_dirs_command(interpreter).output() else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -420,6 +522,22 @@ pub fn library_dirs(interpreter: &Path) -> Vec<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_dir())
         .collect()
+}
+
+// library_dirs の命令（段階 2 S7 で、引数をテストで確かめるために分けた。中身は前と同じで、Windows だけ -X utf8 を付ける。
+// パスに日本語などがあっても読めるように）
+fn library_dirs_command(interpreter: &Path) -> Command {
+    let mut command = crate::process::command(interpreter);
+    #[cfg(windows)]
+    command.args(UTF8_MODE);
+    command.args([
+        "-I",
+        "-B",
+        "-c",
+        "import sys\nfor p in sys.path:\n    print(p)\n",
+    ]);
+    crate::toolchain::clear_ide_env(&mut command);
+    command
 }
 
 // 提出の前の検査の注意（D-224。止めずに確認のダイアログに出す）。dir はパッケージのディレクトリ
@@ -486,12 +604,35 @@ pub fn version_warning(interpreter: Interpreter, version: &Version) -> Option<St
 pub fn program(interpreter: &Path, script: &str) -> Program {
     Program {
         path: interpreter.to_path_buf(),
+        #[cfg(not(windows))]
         args: ["-E", "-B", "-X", "int_max_str_digits=0", script]
             .iter()
             .map(OsString::from)
             .collect(),
+        // Windows は -X utf8 も付ける（段階 2 S7。UTF8_MODE）
+        #[cfg(windows)]
+        args: [
+            "-E",
+            "-B",
+            "-X",
+            "int_max_str_digits=0",
+            "-X",
+            "utf8",
+            script,
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect(),
+        // Python の処理系は DLL の場所を足さない（段階 2 S8 の dll_dir は C++ だけ）
+        #[cfg(windows)]
+        dll_dir: None,
     }
 }
+
+// Windows（段階 2 S7。4.4）：Python に付ける -X utf8。付けないと、CPython は標準入出力（パイプ）を cp932 で読み書きし、
+// 日本語は化け、cp932 にない文字は UnicodeEncodeError になる。ほかの引数より前に置く
+#[cfg(windows)]
+const UTF8_MODE: [&str; 2] = ["-X", "utf8"];
 
 // 構文を確かめる小さな命令（compile だけで、動かさず、__pycache__ も作らない）。
 // 誤りなら「行<TAB>列<TAB>メッセージ」を 1 行出して 1 で終わる
@@ -499,6 +640,8 @@ const CHECK: &str = "import sys\np = sys.argv[1]\ntry:\n    compile(open(p, 'rb'
 
 pub fn check_command(interpreter: &Path, dir: &Path, script: &str) -> Command {
     let mut command = crate::process::command(interpreter);
+    #[cfg(windows)]
+    command.args(UTF8_MODE);
     command
         .current_dir(dir)
         .args(["-E", "-B", "-c", CHECK, script]);
@@ -549,6 +692,34 @@ pub fn example_names(dir: &Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+// テスト用（段階 2 S7）：PEP 514 のレジストリの CPython 3.13 の ExecutablePath を、reg.exe で読む（読むだけ。HKCU → HKLM、
+// 64 ビットの見え方）。本番の読み方（win::registry_string）とは別の方法で読み、答え合わせに使う。なければ None
+#[cfg(all(test, windows))]
+pub(crate) fn registry_cpython_for_test() -> Option<PathBuf> {
+    let reg = PathBuf::from(std::env::var_os("SystemRoot")?).join(r"System32\reg.exe");
+    ["HKCU", "HKLM"].iter().find_map(|root| {
+        let output = Command::new(&reg)
+            .args([
+                "query",
+                &format!(r"{root}\Software\Python\PythonCore\3.13\InstallPath"),
+                "/v",
+                "ExecutablePath",
+                "/reg:64",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let path = text.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("ExecutablePath")?;
+            Some(PathBuf::from(rest.trim().strip_prefix("REG_SZ")?.trim()))
+        })?;
+        path.is_file().then_some(path)
+    })
 }
 
 #[cfg(test)]
@@ -651,8 +822,215 @@ mod tests {
             ..PythonSettings::default()
         };
         let error = find_interpreter(&settings).unwrap_err();
-        assert!(error.contains("python.pypy") && error.contains("brew install pypy3.11"));
+        assert!(error.contains("python.pypy"));
+        // Windows の案内は下の guides_installation_on_windows
+        #[cfg(not(windows))]
+        assert!(error.contains("brew install pypy3.11"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guides_installation_on_windows() {
+        // 段階 2 S7：Windows の案内は Homebrew ではなく、python.org・pypy.org と settings.json のパス
+        for (interpreter, key, site, exe) in [
+            (
+                Interpreter::Cpython,
+                "python.cpython",
+                "python.org",
+                "python.exe",
+            ),
+            (Interpreter::Pypy, "python.pypy", "pypy.org", "pypy3.exe"),
+        ] {
+            let settings = PythonSettings {
+                interpreter,
+                cpython: r"C:\nonexistent\cpython".to_string(),
+                pypy: r"C:\nonexistent\pypy".to_string(),
+            };
+            let error = find_interpreter(&settings).unwrap_err();
+            assert!(
+                error.contains(key)
+                    && error.contains(site)
+                    && error.contains(exe)
+                    && !error.contains("brew"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_cpython_from_the_registry_on_windows() {
+        // 段階 2 S7：PEP 514 のレジストリ（3.13 の ExecutablePath）にある CPython を見つける。
+        // レジストリの値はテストの中で reg.exe で読む（読むだけ）。キーがない機械では飛ばす
+        let Some(expected) = registry_cpython_for_test() else {
+            eprintln!("レジストリに CPython 3.13 がないので飛ばします");
+            return;
+        };
+        assert_eq!(find_interpreter(&PythonSettings::default()), Ok(expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn passes_utf8_mode_on_windows() {
+        // 段階 2 S7：Windows では -X utf8 を付ける（付けないと、CPython はパイプへ cp932 で出す。4.4）
+        let interpreter = Path::new(r"C:\Python313\python.exe");
+        assert_eq!(
+            program(interpreter, "main.py").args,
+            [
+                "-E",
+                "-B",
+                "-X",
+                "int_max_str_digits=0",
+                "-X",
+                "utf8",
+                "main.py"
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
+        let command = check_command(interpreter, Path::new(r"C:\"), "main.py");
+        let args: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(
+            args[..2],
+            [OsStr::new("-X"), OsStr::new("utf8")],
+            "{args:?}"
+        );
+        let command = library_dirs_command(interpreter);
+        let args: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(
+            args[..2],
+            [OsStr::new("-X"), OsStr::new("utf8")],
+            "{args:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skips_app_execution_aliases_before_checking_versions() {
+        // 段階 2 S7：PATH の python.exe から、WindowsApps の実行エイリアスを、版を確かめる前に除く（動かすと Microsoft Store が
+        // 開くことがあるため）。エイリアスのフォルダの中のもの（中身があっても）と、大きさ 0 のもの（エイリアスと同じ形）を除き、
+        // 残りを順に確かめて、最初の CPython 3.13 を使う（PyPy の python.exe は使わない）
+        let dir = temp_dir("aliases");
+        // 失敗しても片付ける
+        let _cleanup = RemoveOnDrop(dir.clone());
+        let aliases = dir.join("WindowsApps");
+        let (empty, pypy, cpython) = (dir.join("empty"), dir.join("pypy"), dir.join("cpython"));
+        for d in [&aliases, &empty, &pypy, &cpython] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(aliases.join("python.exe"), "alias").unwrap();
+        std::fs::write(empty.join("python.exe"), "").unwrap();
+        std::fs::write(pypy.join("python.exe"), "pypy").unwrap();
+        std::fs::write(cpython.join("python.exe"), "cpython").unwrap();
+        // 大文字にして末尾に \ を付けた、エイリアスのフォルダ（同じフォルダ）。相対パスのフォルダ
+        let aliases_upper = PathBuf::from(format!("{}\\", aliases.display()).to_uppercase());
+        let path_var = std::env::join_paths([
+            aliases.as_path(),
+            aliases_upper.as_path(),
+            empty.as_path(),
+            Path::new("relative"),
+            pypy.as_path(),
+            cpython.as_path(),
+        ])
+        .unwrap();
+        let candidates = path_candidates(&["python.exe"], Some(&path_var), Some(&aliases));
+        assert_eq!(
+            candidates,
+            [pypy.join("python.exe"), cpython.join("python.exe")]
+        );
+        // 版を確かめるのは、残った候補だけ（エイリアスは一度も確かめない）
+        let asked = std::cell::RefCell::new(Vec::new());
+        let version_of = |path: &Path| {
+            asked.borrow_mut().push(path.to_path_buf());
+            match std::fs::read_to_string(path).unwrap().as_str() {
+                "pypy" => parse_version("Python 3.11.13 (x)\n[PyPy 7.3.20 with MSC]\n"),
+                "cpython" => parse_version("Python 3.13.7\n"),
+                other => panic!("確かめてはいけないファイル：{other}"),
+            }
+        };
+        assert_eq!(
+            first_cpython(&candidates, version_of),
+            Some(cpython.join("python.exe"))
+        );
+        assert_eq!(asked.borrow().as_slice(), candidates.as_slice());
+        // CPython 3.13 がなければ使わない
+        assert_eq!(first_cpython(&candidates[..1], version_of), None);
+    }
+
+    // 捨てるときに、一時フォルダを消す（テストが途中で失敗しても残さない。段階 2 S7）
+    #[cfg(windows)]
+    struct RemoveOnDrop(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prints_utf8_with_local_python_on_windows() {
+        // 段階 2 S7：解答の print が、パイプへ UTF-8 で出る（改行は \r\n。S6 で比べる前に直す）
+        let Some(interpreter) = registry_cpython_for_test() else {
+            eprintln!("レジストリに CPython 3.13 がないので飛ばします");
+            return;
+        };
+        let dir = temp_dir("utf8-print");
+        std::fs::write(dir.join("main.py"), "print('あ')\n").unwrap();
+        let program = program(&interpreter, "main.py");
+        let output = Command::new(&program.path)
+            .args(&program.args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(output.stdout, "あ\r\n".as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_syntax_errors_in_utf8_on_windows() {
+        // 段階 2 S7：構文の誤りのメッセージに、日本語などの文字があっても読める
+        let Some(interpreter) = registry_cpython_for_test() else {
+            eprintln!("レジストリに CPython 3.13 がないので飛ばします");
+            return;
+        };
+        let dir = temp_dir("utf8-check");
+        std::fs::write(dir.join("main.py"), "x = 1 ＋ 2\n").unwrap();
+        let output = check_command(&interpreter, &dir, "main.py")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let items = parse_check(&String::from_utf8_lossy(&output.stdout), "main.py");
+        assert!(
+            items
+                .first()
+                .is_some_and(|item| item.message.contains("'＋' (U+FF0B)")),
+            "{items:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_non_ascii_imports_on_windows() {
+        // 段階 2 S7：import の名前に日本語などの文字があっても読める
+        let Some(interpreter) = registry_cpython_for_test() else {
+            eprintln!("レジストリに CPython 3.13 がないので飛ばします");
+            return;
+        };
+        let dir = temp_dir("utf8-imports");
+        std::fs::write(dir.join("main.py"), "import データ\n").unwrap();
+        let names = imports(&interpreter, &dir.join("main.py"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            names,
+            Ok(vec![Import {
+                name: "データ".to_string(),
+                standard: false
+            }])
+        );
     }
 
     #[test]
@@ -691,6 +1069,8 @@ mod tests {
     fn builds_the_run_command() {
         let program = program(Path::new("/opt/homebrew/bin/python3.13"), "main.py");
         assert_eq!(program.path, PathBuf::from("/opt/homebrew/bin/python3.13"));
+        // Windows の引数は passes_utf8_mode_on_windows
+        #[cfg(not(windows))]
         assert_eq!(
             program.args,
             ["-E", "-B", "-X", "int_max_str_digits=0", "main.py"]

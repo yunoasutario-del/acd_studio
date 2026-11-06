@@ -905,7 +905,11 @@ mod tests {
         use std::io::Write;
         child.stdin.take().unwrap().write_all(b"2\n3 4\n").unwrap();
         let out = child.wait_with_output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // MinGW の g++ で作った exe は \r\n を出す（段階 2 S6・S8）
+        #[cfg(windows)]
+        let stdout = stdout.replace("\r\n", "\n");
+        assert_eq!(stdout, "7\n");
     }
 
     #[test]
@@ -1399,10 +1403,6 @@ mod tests {
     // 作ったパッケージを、本物の cargo で読む。上のフォルダのワークスペースとぶつからず、
     // ビルドの置き場所がコンテストのフォルダの target になり、IDE が実行の対象を決められる（AC7a-02・AC7a-09 の一部）
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 2（cargo の出力のパスと、canonicalize が付ける接頭辞の違い）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn cargo_reads_created_packages_under_a_parent_workspace() {
         let root = TempDir::new("cargo");
         std::fs::write(
@@ -1443,10 +1443,20 @@ mod tests {
         let cargo = crate::toolchain::find_cargo().unwrap();
         let metadata: serde_json::Value =
             serde_json::from_str(&crate::toolchain::metadata_json(&cargo, &dir).unwrap()).unwrap();
-        assert_eq!(metadata["workspace_root"].as_str(), dir.to_str());
+        // Windows の canonicalize は `\\?\` を付けるが、cargo の出力には付かない（段階 2 S10）。比べるときは外す
+        // （本番のコードは、cargo の出力の場所も canonicalize してから比べている。toolchain.rs）。Unix では何もしない
+        let plain = |path: &Path| {
+            let text = path.to_string_lossy().into_owned();
+            text.strip_prefix(r"\\?\")
+                .map_or(text.clone(), str::to_string)
+        };
+        assert_eq!(
+            metadata["workspace_root"].as_str(),
+            Some(plain(&dir).as_str())
+        );
         assert_eq!(
             metadata["target_directory"].as_str(),
-            root.0.join("abc999/target").to_str()
+            Some(plain(&root.0.join("abc999/target")).as_str())
         );
         let target = crate::toolchain::resolve_target(
             &root.0,

@@ -2251,7 +2251,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // Windows の Python は print の改行を \r\n で出すので、比べる前に \n に直す（段階 2 S7）
+        #[cfg(windows)]
+        let stdout = stdout.replace("\r\n", "\n");
+        Some(stdout)
     }
 
     // 手で書いた問題文（実際の問題文は使わない）

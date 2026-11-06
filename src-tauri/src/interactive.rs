@@ -139,7 +139,7 @@ pub(crate) fn pair_verdict(result: &PairResult, settings: &TestSettings) -> Verd
 
 fn exit_text(outcome: Outcome) -> String {
     match outcome {
-        Outcome::Exited(code) => format!("終了コード {code}"),
+        Outcome::Exited(code) => crate::run::exit_code_text(code),
         Outcome::Signaled(signal) => format!("シグナル {signal}"),
         Outcome::TimedOut => "時間切れ".to_string(),
         Outcome::OutputLimit(_) => "出力の上限".to_string(),
@@ -604,7 +604,7 @@ mod tests {
         assert!(matches!(
             pair_verdict(&re, &settings),
             Verdict::RuntimeError {
-                outcome: crate::run::RunOutcome::Exited { code: 101 }
+                outcome: crate::run::RunOutcome::Exited { code: 101, .. }
             }
         ));
         let wa = result(
@@ -862,10 +862,6 @@ fn main() {
 
     // ビルドから判定・停止まで、実際のプログラムで確かめる。cargo が要る
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 2（使用メモリの計測。Job Object）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn tests_interactively_with_real_programs() {
         let ws = workspace("e2e");
         let pkg = ws.0.join("pkg");
@@ -1192,8 +1188,13 @@ int main() {
         let cases = run.cases();
         assert_eq!(cases[0]["verdict"]["kind"], "accepted");
         assert_eq!(cases[1]["verdict"]["kind"], "wrongAnswer");
+        // Windows の MinGW の exe は \r\n を出す。やり取りの記録は \r を残したまま（段階 2 S6・S8。既知の問題）
+        #[cfg(not(windows))]
         assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\n");
-        assert!(pkg.join("target/examples/judge").is_file());
+        #[cfg(windows)]
+        assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\r\n");
+        // Windows は target/examples/judge.exe（段階 2 S8）
+        assert!(crate::cpp::example_output_path(&pkg, "judge").is_file());
         let log: String = run
             .events
             .lock()
@@ -1288,7 +1289,11 @@ while True:
             let cases = run.cases();
             assert_eq!(cases[0]["verdict"]["kind"], "accepted");
             assert_eq!(cases[1]["verdict"]["kind"], "wrongAnswer");
+            // Windows の Python は \r\n を出す。やり取りの記録は \r を残したまま（段階 2 S6・S7。既知の問題）
+            #[cfg(not(windows))]
             assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\n");
+            #[cfg(windows)]
+            assert_eq!(cases[0]["interaction"]["turns"][0]["text"], "1 100\r\n");
             let log: String = run
                 .events
                 .lock()

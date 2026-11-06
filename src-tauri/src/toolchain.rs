@@ -178,6 +178,50 @@ pub fn rustc_paths(cargo: &Path, dir: &Path) -> Result<RustcPaths, String> {
     })
 }
 
+// ---- スタックの大きさ（Windows。段階 2 S9。9.1 の 9・追加 6・追加 7） ----
+//
+// Windows の exe の主スレッドのスタックは、既定では Rust（MSVC）が 1 MiB、C++（MinGW）が 2 MiB で、ジャッジでは通る深い再帰が
+// 手元だけで 0xC00000FD で落ちうる。手元のビルドでは 1 GiB を予約する（使った分だけが使用メモリに入る。推測）
+
+// 予約するスタックの大きさ（1 GiB。既定のメモリの上限と同じ）
+#[cfg(windows)]
+pub const STACK_SIZE: u64 = 1 << 30;
+
+// 実行ログに出す 1 行
+#[cfg(windows)]
+pub fn stack_note() -> String {
+    "手元のビルドは、主スレッドのスタックを 1 GiB にしています（Windows だけ。ジャッジとは違う場合があります）".to_string()
+}
+
+// パッケージのディレクトリで解決される rustc のホスト（`rustc -vV` の host。例：x86_64-pc-windows-msvc）。取れなければ None
+#[cfg(windows)]
+pub fn rustc_host(cargo: &Path, dir: &Path) -> Option<String> {
+    let output = cargo_command(&rustc_beside(cargo), dir)
+        .arg("-vV")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_string())
+}
+
+// ホストに合わせた、スタックの大きさのリンクの引数（`cargo rustc … -- -C link-arg=<これ>`）。
+// MSVC のリンカーは /STACK:N、GNU（MinGW の ld）は -Wl,--stack,N（GNU は未確認）。ほかは分からないので付けない（None）
+#[cfg(windows)]
+pub fn rust_stack_link_arg(host: &str) -> Option<String> {
+    if host.ends_with("-windows-msvc") {
+        Some(format!("/STACK:{STACK_SIZE}"))
+    } else if host.ends_with("-windows-gnu") {
+        Some(format!("-Wl,--stack,{STACK_SIZE}"))
+    } else {
+        None
+    }
+}
+
 // rustc の版の文字列（例：rustc 1.89.0 (29483883e 2025-08-04)）がジャッジと同じか
 pub fn same_as_judge(rustc_version: &str) -> bool {
     rustc_version.split_whitespace().nth(1) == Some(JUDGE_VERSION)
@@ -307,6 +351,35 @@ fn target_names(json: &str, dir: &Path, wanted: &str) -> Result<Vec<String>, Str
         .collect())
 }
 
+// ビルドしたものの場所（Windows 移植の段階 2 S3b）：`cargo metadata` の target_directory の下の
+// `<debug か release>/<bin>.exe` と、`<debug か release>/examples/<名前>.exe`。止めた直後のビルドの前に、
+// 書けるようになるまで待つのに使う（docs/windows-port-plan.md 4.7）。読めない JSON なら空（待たない）
+#[cfg(windows)]
+pub fn built_executables(
+    json: &str,
+    release: bool,
+    bin: &str,
+    examples: &[String],
+) -> Vec<PathBuf> {
+    #[derive(Deserialize)]
+    struct TargetDirectory {
+        target_directory: PathBuf,
+    }
+    let Ok(metadata) = serde_json::from_str::<TargetDirectory>(json) else {
+        return Vec::new();
+    };
+    let profile = metadata
+        .target_directory
+        .join(if release { "release" } else { "debug" });
+    std::iter::once(profile.join(exe_name(bin)))
+        .chain(
+            examples
+                .iter()
+                .map(|name| profile.join("examples").join(exe_name(name))),
+        )
+        .collect()
+}
+
 // テストケースのフォルダ（D-106）。dir はパッケージのディレクトリ（canonicalize 済み）
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestDir {
@@ -429,6 +502,53 @@ pub fn package_language(dir: &Path) -> Option<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 段階 2 S9：rustc のホストに合わせたスタックのリンクの引数。MSVC は /STACK、GNU は -Wl,--stack（GNU は未確認）、
+    // ほかは付けない
+    #[cfg(windows)]
+    #[test]
+    fn chooses_the_stack_link_arg_for_the_host() {
+        assert_eq!(
+            rust_stack_link_arg("x86_64-pc-windows-msvc").as_deref(),
+            Some("/STACK:1073741824")
+        );
+        assert_eq!(
+            rust_stack_link_arg("aarch64-pc-windows-msvc").as_deref(),
+            Some("/STACK:1073741824")
+        );
+        assert_eq!(
+            rust_stack_link_arg("x86_64-pc-windows-gnu").as_deref(),
+            Some("-Wl,--stack,1073741824")
+        );
+        assert_eq!(rust_stack_link_arg("x86_64-pc-windows-gnullvm"), None);
+        assert_eq!(rust_stack_link_arg("x86_64-unknown-linux-gnu"), None);
+        assert_eq!(rust_stack_link_arg(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lists_built_executables_from_metadata() {
+        let json = serde_json::json!({
+            "packages": [],
+            "target_directory": "C:\\work\\abc\\target",
+        })
+        .to_string();
+        let examples = vec!["gen".to_string(), "naive-2".to_string()];
+        assert_eq!(
+            built_executables(&json, false, "abc_a", &examples),
+            vec![
+                PathBuf::from(r"C:\work\abc\target\debug\abc_a.exe"),
+                PathBuf::from(r"C:\work\abc\target\debug\examples\gen.exe"),
+                PathBuf::from(r"C:\work\abc\target\debug\examples\naive-2.exe"),
+            ]
+        );
+        assert_eq!(
+            built_executables(&json, true, "abc_a", &[]),
+            vec![PathBuf::from(r"C:\work\abc\target\release\abc_a.exe")]
+        );
+        // 読めない JSON なら、待つものはない
+        assert!(built_executables("{", false, "abc_a", &examples).is_empty());
+    }
 
     #[test]
     fn resolves_cpp_packages() {
