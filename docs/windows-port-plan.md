@@ -923,7 +923,7 @@ S13 の release の確かめ（A6：コンソールの窓。2026-11-05。利用�
 ### 段階 2 の結果（2026-11-05）
 
 ブランチ windows-port-stage2。main からのコミットは、このまとめを入れて 32 個（9545504〜）。origin/windows-port-stage2 には
-S7 の 1df2e10 まで push してあり、そのあとの 16 個（a3da2a4〜このまとめ）はまだ push していない（push は B3 で決める）。
+S7 の 1df2e10 まで push してあり、そのあとの 15 個（a3da2a4〜このまとめ）はまだ push していない（push は B3 で決める）。
 最後の確かめ（Windows、AC 電源、62daae6）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 301 通過・0 失敗・
 23 無視、npm test 9 通過・0 失敗、npm run build 通過。一つひとつの直し方・直す前の失敗・測った値は、上の段階 2 の表の各行と
 コミットのメッセージにある
@@ -954,7 +954,9 @@ push と CI（段階 2 の間に、利用者の許可を得て push したもの
 
 - CI の結果を見たもの（どれも macos-latest・windows-latest とも成功。そのときの報告から）：run 41308130068（d4c1abf）、
   run 41312029609（bc85242）、run 41313266501（5b782ca。macOS の cargo test の段階も成功）、run 41446504987（6c58873）
-- d4c1abf より前の push と、78d1796〜1df2e10（S5〜S7）の push の CI の結果は、まとめの中では確かめていない。push のあとの CI で
+- run 全体の結果だけを見たもの（どれも completed・success。2026-11-06 に公開の API で読んだ。OS ごと・段階ごと・テストごとの結果は
+  見ていない）：run 41583129511（#20。dbd91c8、S5d）、run 41585328789（#21。db1c4e9、S6）、run 41590809129（#22。1df2e10、S7）
+- d4c1abf より前の push と、78d1796〜07939e6（S5〜S5c）を上げた push の CI の結果は、まとめの中では確かめていない。push のあとの CI で
   まとめて確かめる
 - npm test の段階（S10 で ci.yml に足した）は、まだ push していないので、CI ではどちらの OS でも動いたことがない
 
@@ -1013,7 +1015,7 @@ debug の 1 件は S8 で足した）
 
 - **macOS**：
   - S8 からあと（a3da2a4〜）は、CI でまだ一度も動いていない。上の「macOS / Unix の経路を変えた所」を、push のあとの CI で確かめる
-  - d4c1abf より前と S5〜S7 の push の CI の結果は、まとめの中では確かめていない
+  - d4c1abf より前と S5〜S5c の push の CI の結果は、まとめの中では確かめていない。S5d〜S7 の run #20〜22 は、run 全体の結果（成功）だけを見た
   - 手元の Mac での画面の操作は、段階 1 から一度もしていない
   - clippy の警告の有無（CI は `-D warnings` なし）
   - debugs_with_real_lldb_dap（CI では飛ばしている。段階 1 から）
