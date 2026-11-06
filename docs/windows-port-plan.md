@@ -922,8 +922,8 @@ S13 の release の確かめ（A6：コンソールの窓。2026-11-05。利用�
 
 ### 段階 2 の結果（2026-11-05）
 
-ブランチ windows-port-stage2。main からのコミットは、このまとめを入れて 32 個（9545504〜）。origin/windows-port-stage2 には
-S7 の 1df2e10 まで push してあり、そのあとの 15 個（a3da2a4〜このまとめ）はまだ push していない（push は B3 で決める）。
+ブランチ windows-port-stage2。main からのコミットは、e800d5d までで 33 個（9545504〜）。origin/windows-port-stage2 には、
+2026-11-06 に e800d5d まで push した（S7 の 1df2e10 のあとの 16 個〔a3da2a4〜e800d5d〕。--force なし）。
 最後の確かめ（Windows、AC 電源、62daae6）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 301 通過・0 失敗・
 23 無視、npm test 9 通過・0 失敗、npm run build 通過。一つひとつの直し方・直す前の失敗・測った値は、上の段階 2 の表の各行と
 コミットのメッセージにある
@@ -958,10 +958,12 @@ push と CI（段階 2 の間に、利用者の許可を得て push したもの
   見ていない）：run 41583129511（#20。dbd91c8、S5d）、run 41585328789（#21。db1c4e9、S6）、run 41590809129（#22。1df2e10、S7）
 - d4c1abf より前の push と、78d1796〜07939e6（S5〜S5c）を上げた push の CI の結果は、まとめの中では確かめていない。push のあとの CI で
   まとめて確かめる
-- npm test の段階（S10 で ci.yml に足した）は、まだ push していないので、CI ではどちらの OS でも動いたことがない
+- npm test の段階（S10 で ci.yml に足した）は、run #23 で初めて CI で動き、両方の OS で通った
+- 段階 2 の最後の CI：run 42210961555（#23。e800d5d）。macos-latest・windows-latest とも、全部の段階が success（公開の API で確認）。
+  macos-latest のログの中身は、表のあとの「run #23 の macos-latest のログ」にある。windows-latest のログの中身は見ていない
 
 macOS / Unix の経路を変えた所（cfg・属性を付ける以外の変更。コミットのメッセージと `git diff main` で確かめた。手元の Mac では
-何も確かめていない。どれも push のあとの CI の macos-latest で確かめる）
+何も確かめていない。CI の macos-latest で確かめた結果は、表のあとの「run #23 の macos-latest のログ」にある）
 
 | コミット | 変えた所 | Unix の動き | push のあとの CI（macos-latest）で見ること |
 | --- | --- | --- | --- |
@@ -985,7 +987,24 @@ cargo clippy --all-targets・cargo test がビルドする（run 41308130068 か
 process.rs・win.rs の変更は cfg(windows) の中と Windows のテストだけ。Cargo.toml は windows-sys（Windows だけの依存）の feature を
 足しただけ。push のあとの CI では、まずすべての段階（fmt・build・clippy・test・npm test）が通ることを見て、そのあと上の太字の
 3 つ（S10b・その直し・npm test）を確かめる。clippy は `-D warnings` を付けていないので、警告の有無はログを開かないと分からない
-（段階 1 からの未確認）
+
+run #23 の macos-latest のログ（2026-11-06。利用者がログインしたブラウザで見た）
+
+| 探したもの | 結果 |
+| --- | --- |
+| S10b のテスト | `test process::tests::blames_the_side_whose_output_closed_first ... ok` |
+| S10b の直しのテスト | `test process::tests::keeps_the_exit_order_when_output_closes_late ... ok` |
+| 対話テスト（本物のプログラム） | `test interactive::tests::tests_interactively_with_real_programs ... ok` |
+| cargo test の最初の test result | `test result: ok. 296 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.65s` |
+| cargo clippy の warning | 0 件 |
+| npm test | tests 9・pass 9・fail 0。「macOS：今までの文のまま」に ✔ |
+
+「1 filtered out」は debug::tests::debugs_with_real_lldb_dap（ci.yml の `--skip`）。ci.yml の `--skip` はこの 1 つだけで、この名前のテストは
+OS で分けていない。Windows で `cargo test --lib -- --list` を `--skip` のありなしで比べると、消えるのはこの 1 件だけだった（324 件 → 323 件。
+名前の似た debugs_cpp_with_real_lldb_dap は残る）。macOS で一覧を比べてはいない。
+
+ログで分からないこと：g++-15・python3.13 などがないと、テストは「飛ばします」と出して ok で終わり、cargo test はその文を出さない。runner に
+何が入っているかは見ていないので、S7（Python）・S8（C++）の macOS の経路が CI で本当に動いたかは未確認
 
 Windows で飛ばしているテスト（2026-11-05 の時点で 23 件。段階 1 の表〔25 件〕のうち、段階 2 の 3 件は ignore を外した。
 debug の 1 件は S8 で足した）
@@ -1014,10 +1033,9 @@ debug の 1 件は S8 で足した）
 段階 2 のあとも未確認のまま残っていること
 
 - **macOS**：
-  - S8 からあと（a3da2a4〜）は、CI でまだ一度も動いていない。上の「macOS / Unix の経路を変えた所」を、push のあとの CI で確かめる
+  - S7（Python）・S8（C++）の macOS の経路が、CI で本当に動いたか（run #23 は通ったが、g++-15・python3.13 がなければテストは自分で飛ぶ。runner に何が入っているかは見ていない）
   - d4c1abf より前と S5〜S5c の push の CI の結果は、まとめの中では確かめていない。S5d〜S7 の run #20〜22 は、run 全体の結果（成功）だけを見た
-  - 手元の Mac での画面の操作は、段階 1 から一度もしていない
-  - clippy の警告の有無（CI は `-D warnings` なし）
+  - macOS の画面：利用者の手元に Mac がないので、macOS の画面は確かめていない（段階 1 から一度もしていない）。S10b とその直しが変えた対話テストの動きも、CI のテストで確かめただけ。この未確認は PR に書いて merge する（2026-11-06 に利用者が決めた）
   - debugs_with_real_lldb_dap（CI では飛ばしている。段階 1 から）
 - **配り方**：インストーラー（nsis）で入れた exe での動き。段階 1 の release の確かめで exe をどう起動したか
 - **原因が分からないまま手当てしたもの**：
@@ -1214,10 +1232,10 @@ debug の 1 件は S8 で足した）
 - 段階 2 の案で前提にしていたこと（→ 段階 2 ですべて確認済み。この項目は記録として残す）：PeakWorkingSetSize を終わったプロセスのハンドルで読めること（S4）、
   各 NTSTATUS の終了コード（0xC0000005・0xC0000094・0xC00000FD・0xC0000409。S5・S5b）、PATH に g++ がないと MinGW の exe が
   0xC0000135 で落ちること（S8）、`cargo rustc` の `--` の後ろの引数で依存を作り直さないこと（S9）
-- macOS で、段階 2 の S8 からあと（a3da2a4〜）が CI で通ること。S10b とその直し（run_pair の、先に失敗した側の決め方。Unix の動きも
-  変わる）と npm test の段階を、push のあとの CI の macos-latest で見る（「段階 2 の結果」の「macOS / Unix の経路を変えた所」）
+- macOS の S7（Python）・S8（C++）の経路が CI で本当に動いたか（g++-15・python3.13 がなければテストは自分で飛ぶ。runner に何が入っているかは未確認）。
+  段階 2 の全体は run #23（e800d5d）で通り、S10b とその直しのテスト、対話テスト、npm test は macos-latest のログで確認済み（「段階 2 の結果」）
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
-- macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709〕。clippy の警告の有無、debugs_with_real_lldb_dap、画面の操作は macOS の機械で確かめる）
+- macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709。段階 2 は run 42210961555〕。clippy の警告は run 42210961555 のログで 0 件。debugs_with_real_lldb_dap と画面の操作は macOS の機械で確かめる。利用者の手元に Mac がないので、macOS の画面は確かめていない）
 
 不明（調べても分からなかった）
 
