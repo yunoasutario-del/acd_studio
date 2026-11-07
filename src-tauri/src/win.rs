@@ -6,6 +6,7 @@
 // - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる。
 //   止めた直後のビルドの前に、exe が書けるようになるまで待つ（S3b）
 // - 時刻：UNIX 時刻（ミリ秒）を手元の時刻の月・日・時・分にする（Unix の localtime_r にあたる）
+// - 開く：ShellExecuteW で URL・フォルダを既定のアプリで開く（段階 3 T2。渡す前の確かめは open.rs）
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -47,6 +48,26 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+// target を既定のアプリで開く（段階 3 T2）。ShellExecuteW の戻り値をそのまま返す（32 以下は失敗。判定は open.rs）。
+// プログラムも起動できる関数なので、渡すものは open.rs で確かめる
+pub fn shell_open(target: &OsStr) -> isize {
+    let verb = wide(Path::new("open"));
+    let target = wide(Path::new(target));
+    // SAFETY: 終わりに 0 の付いた UTF-16 の文字列を渡す。窓・引数・作業フォルダは指定しない（null）
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        ) as isize
+    }
+}
 
 // 開いたハンドル。捨てるときに閉じる
 struct Handle(HANDLE);

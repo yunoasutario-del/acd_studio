@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(any(not(windows), test))]
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -587,18 +588,10 @@ pub fn load_task_list(
     Ok(tasks)
 }
 
-// 公式の問題ページを、macOS の open コマンドで既定のブラウザで開く（D-110 の代替手段）。
+// 公式の問題ページを既定のブラウザで開く（D-110 の代替手段）。
 // URL は ID を確かめてから IDE が組み立てたもの
 pub fn open_in_browser(id: &ProblemId) -> Result<(), String> {
-    let status = Command::new("/usr/bin/open")
-        .arg(id.url())
-        .status()
-        .map_err(|error| format!("ブラウザを開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ブラウザを開けません".to_string())
-    }
+    crate::open::url(&id.url())
 }
 
 // パッケージごとに選んだ問題（D-117）。アプリのフォルダの problem-choices.json。

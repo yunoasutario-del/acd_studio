@@ -1681,15 +1681,7 @@ pub fn fill_python_input(
 #[tauri::command]
 pub fn open_templates_folder(app: AppHandle) -> Result<(), String> {
     let dir = scaffold::ensure_template_dir(&app_dir(&app)?)?;
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg(&dir)
-        .status()
-        .map_err(|error| format!("テンプレートのフォルダを開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("テンプレートのフォルダを開けません".to_string())
-    }
+    crate::open::folder(&dir, crate::open::TEMPLATES_FAILURE)
 }
 
 // 言語のスニペットのファイルを既定のテキストエディタで開く（Phase 13 作業 2。D-187）。なければ空のもの（{ }）を作る。

@@ -1779,14 +1779,14 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>, key: u64) -> Result<SubmissionVie
 // 公式の提出のページを、既定のブラウザで開く（期間の外・送れなかったときの「コピーして開く」）
 pub fn open_submit_page(contest: &str, task: &str) -> Result<(), String> {
     crate::problem::ProblemId::new(contest, task)?;
-    open_in_browser(&submit_url(contest, task))
+    crate::open::url(&submit_url(contest, task))
 }
 
 // 提出の詳細（id があるとき）か、自分の提出の一覧を、既定のブラウザで開く（「提出結果」・「履歴」の「詳細」「自分の提出」）。
 // URL は、ID を確かめてから IDE が組み立てる（画面から URL は受け取らない）
 pub fn open_submission_page(contest: &str, id: Option<u64>) -> Result<(), String> {
     crate::problem::ProblemId::new(contest, "x")?;
-    open_in_browser(&match id {
+    crate::open::url(&match id {
         Some(id) => detail_url(contest, id),
         None => list_url(contest),
     })
@@ -2005,18 +2005,6 @@ pub fn contest_status(remote: &Remote, app_dir: &Path, contest: &str) -> StatusO
         },
         Err(message) if message == NOT_LOGGED_IN => StatusOutcome::NotLoggedIn,
         Err(message) => StatusOutcome::Failed { message },
-    }
-}
-
-fn open_in_browser(url: &str) -> Result<(), String> {
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg(url)
-        .status()
-        .map_err(|error| format!("ブラウザを開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ブラウザを開けません".to_string())
     }
 }
 
