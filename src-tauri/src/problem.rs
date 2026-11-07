@@ -705,10 +705,11 @@ mod tests {
     fn tells_that_login_is_not_available_on_windows() {
         // 段階 2 S11：Windows では、ログインなしで 404 のとき、Keychain（/usr/bin/security）を見に行かず、
         // ログインしていないときの文に「Windows 版では、まだログインできません」を足して返す（段階 3 でログインを入れるまで）
+        let keychain = TestKeychain::new("login-unavailable");
         let result = with_session_fallback(
             "http://127.0.0.1:9/",
             Err(FetchError::NotFound),
-            &Client::app(),
+            &keychain.client(),
         );
         let Err(message) = result else {
             panic!("{result:?}");

@@ -57,7 +57,87 @@ impl Keychain {
             service: service.to_string(),
         }
     }
+}
 
+// 資格情報マネージャー（Windows。段階 3 T5。docs/windows-port-plan.md 4.1）。
+// CRED_TYPE_GENERIC の項目に REVEL_SESSION の値を置く。値はエラーの文・ログに出さない
+#[cfg(windows)]
+impl Keychain {
+    // Windows のテストのビルドでは、本物の名前（SERVICE）に対する読み書き・削除を、API を呼ぶ前に止める（9.1 の追加 24）。
+    // Keychain::app() を作ること自体は止めない（Remote::app() を使うテストがあるため）
+    #[cfg(test)]
+    fn refuse_the_real_name(&self, operation: &str) {
+        assert!(
+            self.service != SERVICE,
+            "テストから本物の資格情報に触れようとしました（{operation}）"
+        );
+    }
+
+    #[cfg(not(test))]
+    fn refuse_the_real_name(&self, _operation: &str) {}
+
+    // 値は API に直接渡す（外部のコマンドも標準入力も使わない）。置いたあとに読み直して確かめる
+    pub fn save(&self, value: &str) -> Result<(), String> {
+        self.refuse_the_real_name("save");
+        if !valid_cookie_value(value) {
+            return Err("セッションの値に扱えない文字があります".to_string());
+        }
+        // 上限を超える値は、API を呼ぶ前に断る（9.1 の追加 23）
+        if value.len() > crate::win::CREDENTIAL_BLOB_LIMIT {
+            return Err(
+                "セッションの値が長すぎるので、資格情報マネージャーに置けません（上限は 2560 バイト）"
+                    .to_string(),
+            );
+        }
+        crate::win::credential_write(&self.target(), ACCOUNT, value.as_bytes())
+            .map_err(credential_error)?;
+        self.confirm_saved(value)
+    }
+
+    // 置いた値。なければ None。読めない UTF-8・Cookie の値として受け付けない文字を含むものも None（Unix と同じ）
+    pub fn load(&self) -> Result<Option<String>, String> {
+        self.refuse_the_real_name("load");
+        let blob = crate::win::credential_read(&self.target()).map_err(credential_error)?;
+        Ok(blob
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|value| valid_cookie_value(value)))
+    }
+
+    // 置いてあるか（値は写さない）
+    pub fn exists(&self) -> Result<bool, String> {
+        self.refuse_the_real_name("exists");
+        crate::win::credential_exists(&self.target()).map_err(credential_error)
+    }
+
+    // 消す。なかったら false
+    pub fn delete(&self) -> Result<bool, String> {
+        self.refuse_the_real_name("delete");
+        crate::win::credential_delete(&self.target()).map_err(credential_error)
+    }
+
+    // 項目の名前（docs/windows-port-plan.md 4.1）。名前を作るだけで、API は呼ばない
+    fn target(&self) -> String {
+        format!("{}/{ACCOUNT}", self.service)
+    }
+
+    // 書いたあとに読み直して確かめる（Unix の save と同じ）
+    fn confirm_saved(&self, value: &str) -> Result<(), String> {
+        if self.load()?.as_deref() == Some(value) {
+            Ok(())
+        } else {
+            Err("セッションを資格情報マネージャーに置けませんでした".to_string())
+        }
+    }
+}
+
+// 資格情報マネージャーのエラーの文。値は入れず、エラーの番号だけを入れる
+#[cfg(windows)]
+fn credential_error(code: u32) -> String {
+    format!("資格情報マネージャーを使えません（エラー {code}）")
+}
+
+#[cfg(not(windows))]
+impl Keychain {
     fn security() -> Command {
         Command::new("/usr/bin/security")
     }
@@ -561,14 +641,126 @@ pub(crate) mod tests {
     use std::net::TcpListener;
 
     // テストの間だけ使う Keychain の項目。終わったら（失敗しても）消す
-    pub(crate) struct TestKeychain(pub(crate) Keychain);
+    pub(crate) struct TestKeychain(
+        pub(crate) Keychain,
+        // Windows：資格情報を使うテストを 1 つずつ動かす順番（9.1 の追加 32）。Drop で項目を消したあとに返す
+        #[cfg(windows)]
+        #[allow(dead_code)]
+        Turn,
+    );
+
+    // Windows のテストの順番（段階 3 T5）。別の名前の書き込みと重なると、消した項目が戻ることがあるので、
+    // 同じテストのプログラムの中では、資格情報を使うテストを 1 つずつ動かす（別のプログラムとの重なりは防げない）。
+    // 同じスレッドは何回でも取れる（1 つのテストで TestKeychain を 2 つ作るものがあるため）。全部を返したら空く
+    #[cfg(windows)]
+    struct TurnState {
+        holder: Option<std::thread::ThreadId>,
+        count: usize,
+    }
+
+    #[cfg(windows)]
+    struct TurnLock {
+        state: Mutex<TurnState>,
+        free: std::sync::Condvar,
+        limit: std::time::Duration,
+    }
+
+    #[cfg(windows)]
+    static TURN: TurnLock = TurnLock::new(std::time::Duration::from_secs(120));
+
+    #[cfg(windows)]
+    struct Turn(&'static TurnLock);
+
+    #[cfg(windows)]
+    impl TurnLock {
+        const fn new(limit: std::time::Duration) -> Self {
+            TurnLock {
+                state: Mutex::new(TurnState {
+                    holder: None,
+                    count: 0,
+                }),
+                free: std::sync::Condvar::new(),
+                limit,
+            }
+        }
+
+        // 空くまで待つ。同じスレッドが持っていれば待たない。長く待ったら、分かる文で panic する（本来は届かない上限）
+        fn take(&'static self) -> Turn {
+            let me = std::thread::current().id();
+            let started = std::time::Instant::now();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                match state.holder {
+                    None => {
+                        state.holder = Some(me);
+                        state.count = 1;
+                        return Turn(self);
+                    }
+                    Some(holder) if holder == me => {
+                        state.count += 1;
+                        return Turn(self);
+                    }
+                    Some(_) => {
+                        let Some(left) = self.limit.checked_sub(started.elapsed()) else {
+                            // 毒にしないように、Mutex を返してから panic する
+                            drop(state);
+                            panic!(
+                                "資格情報のテストの順番を {:?} 待っても取れません",
+                                self.limit
+                            );
+                        };
+                        state = self
+                            .free
+                            .wait_timeout(state, left)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                }
+            }
+        }
+    }
+
+    // 順番を返す。全部を返したら空く。別のスレッドで返すのは誤りなので、順番を返してから、分かる文で panic する。
+    // panic の最中なら panic しない（panic の最中の panic で、プログラムごと止まるのを避ける）
+    #[cfg(windows)]
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            let wrong_thread = {
+                let mut state = self
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let wrong_thread = state.holder != Some(std::thread::current().id());
+                state.count = state.count.saturating_sub(1);
+                if state.count == 0 {
+                    state.holder = None;
+                    self.0.free.notify_all();
+                }
+                wrong_thread
+            };
+            if wrong_thread && !std::thread::panicking() {
+                panic!("資格情報のテストの順番を、別のスレッドで返そうとしました");
+            }
+        }
+    }
 
     impl TestKeychain {
+        fn item(name: &str) -> Keychain {
+            Keychain::named(&format!("{SERVICE}.test-{name}-{}", std::process::id()))
+        }
+
+        #[cfg(windows)]
         pub(crate) fn new(name: &str) -> Self {
-            TestKeychain(Keychain::named(&format!(
-                "{SERVICE}.test-{name}-{}",
-                std::process::id()
-            )))
+            TestKeychain(Self::item(name), TURN.take())
+        }
+
+        #[cfg(not(windows))]
+        pub(crate) fn new(name: &str) -> Self {
+            TestKeychain(Self::item(name))
         }
 
         pub(crate) fn client(&self) -> Client {
@@ -590,11 +782,300 @@ pub(crate) mod tests {
         }
     }
 
+    // ---- テストの順番（段階 3 T5。9.1 の追加 32）。ここのテストは API を呼ばない（turn_is_held… の TestKeychain は消すだけ） ----
+
+    #[cfg(windows)]
+    fn local_lock(limit: std::time::Duration) -> &'static TurnLock {
+        Box::leak(Box::new(TurnLock::new(limit)))
+    }
+
+    #[cfg(windows)]
+    fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+        match panic.downcast_ref::<&str>() {
+            Some(text) => text.to_string(),
+            None => panic.downcast_ref::<String>().cloned().unwrap_or_default(),
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
+    fn turn_can_be_taken_twice_on_the_same_thread() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let _first = lock.take();
+        let _second = lock.take();
+        assert_eq!(lock.state.lock().unwrap().count, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_makes_other_threads_wait_until_the_last_release() {
+        use std::sync::atomic::AtomicBool;
+        let lock = local_lock(std::time::Duration::from_secs(10));
+        let first = lock.take();
+        let second = lock.take();
+        let taken: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let other = std::thread::spawn(move || {
+            let _turn = lock.take();
+            taken.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!taken.load(Ordering::SeqCst), "持っている間に取れた");
+        drop(first);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!taken.load(Ordering::SeqCst), "1 つ返しただけで取れた");
+        drop(second);
+        other.join().unwrap();
+        assert!(taken.load(Ordering::SeqCst));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_gives_up_after_the_limit_with_a_clear_text() {
+        let lock = local_lock(std::time::Duration::from_millis(50));
+        let _held = lock.take();
+        let waiting = std::thread::spawn(move || drop(lock.take())).join();
+        let text = panic_text(waiting.expect_err("待ちの上限で止まらなかった"));
+        assert!(text.contains("順番を"), "{text}");
+    }
+
+    // 別のスレッドで返すと、順番を返してから、分かる文で panic する
+    #[cfg(windows)]
+    #[test]
+    fn turn_panics_when_released_on_another_thread_and_still_frees_it() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let turn = lock.take();
+        let released = std::thread::spawn(move || drop(turn)).join();
+        let text = panic_text(released.expect_err("別のスレッドで返しても止まらなかった"));
+        assert!(text.contains("別のスレッド"), "{text}");
+        // 空いている：ほかのスレッドが取れる
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    // 別のスレッドで返すのが panic の最中なら、もう panic しない（プログラムごと止まらない）。順番は返す
+    #[cfg(windows)]
+    #[test]
+    fn turn_does_not_panic_again_while_panicking_on_another_thread() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let turn = lock.take();
+        let result = std::thread::spawn(move || {
+            let _turn = turn;
+            panic!("もとの panic");
+        })
+        .join();
+        let panic = result.expect_err("panic のはず");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"もとの panic"));
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_is_freed_when_the_holder_panics() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let result = std::panic::catch_unwind(|| {
+            let _turn = lock.take();
+            panic!("テストの panic");
+        });
+        assert!(result.is_err());
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_works_after_the_mutex_is_poisoned() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let _ = std::panic::catch_unwind(|| {
+            let _state = lock.state.lock().unwrap();
+            panic!("毒にする");
+        });
+        assert!(lock.state.is_poisoned());
+        drop(lock.take());
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    // reports_login_and_failures の形：1 つのテストで TestKeychain を 2 つ作っても止まらず、全部を捨てるまで持つ
+    #[cfg(windows)]
+    #[test]
+    fn turn_is_held_while_test_keychains_live() {
+        let me = std::thread::current().id();
+        let held = || TURN.state.lock().unwrap().holder == Some(me);
+        let first = TestKeychain::new("turn-first");
+        assert!(held());
+        let second = TestKeychain::new("turn-second");
+        assert!(held());
+        drop(first);
+        assert!(held(), "1 つ捨てただけで返した");
+        drop(second);
+        assert!(!held(), "全部捨てても返していない");
+    }
+
+    // 段階 3 T5（9.1 の追加 24）：テストのビルドでは、本物の名前の読み書き・削除は API を呼ぶ前に止まる
+    #[cfg(windows)]
+    #[test]
+    fn refuses_the_real_name_in_test_builds() {
+        fn assert_stops(operation: &str, call: impl FnOnce()) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+            let Err(panic) = result else {
+                panic!("{operation} が止まらなかった");
+            };
+            let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(text.contains("本物の資格情報"), "{operation}：{text}");
+        }
+        for real in [Keychain::named(SERVICE), Keychain::app()] {
+            assert_stops("load", || drop(real.load()));
+            assert_stops("exists", || drop(real.exists()));
+            assert_stops("save", || drop(real.save("fake-value")));
+            assert_stops("delete", || drop(real.delete()));
+        }
+        // 作るだけなら止まらない（submit.rs の never_reads_the_status_faster_than_once_a_second が Remote::app() を使う）
+        let _ = Client::app();
+    }
+
+    // 段階 3 T5：テストのビルドでは、win.rs の層でも .test- のない名前には API を呼ばない。
+    // 書く関数は、この確かめが効かなくなったときに項目が残らないように、ここでは呼ばない（同じ関数で止めている）
+    #[cfg(windows)]
+    #[test]
+    fn win_layer_refuses_names_without_test_mark() {
+        const NAME: &str = "atcoder-studio-guard-check/none";
+        for call in [
+            (|| {
+                let _ = crate::win::credential_read(NAME);
+            }) as fn(),
+            || {
+                let _ = crate::win::credential_exists(NAME);
+            },
+            || {
+                let _ = crate::win::credential_delete(NAME);
+            },
+        ] {
+            assert!(std::panic::catch_unwind(call).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_names_follow_the_plan() {
+        // 名前を作るだけで、API は呼ばない
+        assert_eq!(
+            Keychain::app().target(),
+            "io.github.ishigaki892.acdstudio/REVEL_SESSION"
+        );
+        // UserName は REVEL_SESSION（AtCoder の利用者名ではない）。マシンごとに保存する
+        let keychain = TestKeychain::new("names");
+        keychain.0.save("fake-value").unwrap();
+        assert_eq!(
+            crate::win::credential_user_and_persist(&keychain.0.target()),
+            Some(("REVEL_SESSION".to_string(), 2))
+        );
+        assert_eq!(
+            crate::win::credential_read(&keychain.0.target()).unwrap(),
+            Some(b"fake-value".to_vec())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_credentials_are_none_false_false() {
+        let keychain = TestKeychain::new("missing");
+        assert_eq!(keychain.0.load(), Ok(None));
+        assert_eq!(keychain.0.exists(), Ok(false));
+        assert_eq!(keychain.0.delete(), Ok(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_credential_errors_are_err_with_the_number_only() {
+        // 名前が長すぎる（上限は 32767 文字）：ERROR_NOT_FOUND ではないエラーになる
+        let keychain = TestKeychain::new(&"x".repeat(40000));
+        for (operation, result) in [
+            ("load", keychain.0.load().map(|_| ())),
+            ("exists", keychain.0.exists().map(|_| ())),
+            ("delete", keychain.0.delete().map(|_| ())),
+            ("save", keychain.0.save("fake-value")),
+        ] {
+            let message = result.expect_err(operation);
+            assert!(
+                message.starts_with("資格情報マネージャーを使えません（エラー "),
+                "{operation}：{message}"
+            );
+            assert!(!message.contains("fake-value"), "{operation}：{message}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_values_load_as_none() {
+        let keychain = TestKeychain::new("unreadable");
+        let target = keychain.0.target();
+        let values: [&[u8]; 4] = [&[0xff, 0xfe, 0x00], b"a b", b"a;b", b""];
+        for value in values {
+            crate::win::credential_write(&target, ACCOUNT, value).unwrap();
+            assert_eq!(keychain.0.load(), Ok(None), "{value:?}");
+            assert_eq!(keychain.0.exists(), Ok(true), "{value:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writes_up_to_2560_bytes_and_refuses_more_before_calling_the_api() {
+        let at_limit = "a".repeat(2560);
+        let over_limit = "b".repeat(2561);
+        let keychain = TestKeychain::new("limit");
+        // 2561 バイト：API を呼ばないので、項目はできない
+        let refused = keychain.0.save(&over_limit);
+        assert_eq!(
+            refused,
+            Err("セッションの値が長すぎるので、資格情報マネージャーに置けません（上限は 2560 バイト）".to_string())
+        );
+        assert_eq!(keychain.0.exists(), Ok(false));
+        // 2560 バイト：書けて、同じものを読める（長いので assert! で比べる）
+        assert_eq!(keychain.0.save(&at_limit), Ok(()));
+        assert!(keychain.0.load().unwrap().as_deref() == Some(at_limit.as_str()));
+        // 断ったときは、今の値を変えない
+        assert!(keychain.0.save(&over_limit).is_err());
+        assert!(keychain.0.load().unwrap().as_deref() == Some(at_limit.as_str()));
+    }
+
+    // 不正な値は API を呼ぶ前に断る（書いたあとの読み直しでも Err になるので、文と、項目がないことで見分ける）
+    #[cfg(windows)]
+    #[test]
+    fn refuses_invalid_values_before_calling_the_api() {
+        let keychain = TestKeychain::new("invalid");
+        assert_eq!(
+            keychain.0.save("bad value"),
+            Err("セッションの値に扱えない文字があります".to_string())
+        );
+        assert_eq!(keychain.0.exists(), Ok(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_texts_have_no_value_and_no_keychain() {
+        const MARK: &str = "secret-mark";
+        let keychain = TestKeychain::new("texts");
+        // 書いたものと読めたものが違う
+        crate::win::credential_write(&keychain.0.target(), ACCOUNT, b"other").unwrap();
+        let texts = [
+            credential_error(5),
+            keychain.0.save(&format!("{MARK} bad")).unwrap_err(),
+            keychain.0.save(&MARK.repeat(300)).unwrap_err(),
+            keychain.0.confirm_saved(MARK).unwrap_err(),
+        ];
+        assert_eq!(texts[0], "資格情報マネージャーを使えません（エラー 5）");
+        for text in texts {
+            assert!(!text.contains(MARK), "{text}");
+            assert!(!text.contains("Keychain"), "{text}");
+        }
+    }
+
+    #[test]
     fn saves_loads_and_deletes_in_keychain() {
         let keychain = TestKeychain::new("roundtrip");
         assert_eq!(keychain.0.load().unwrap(), None);
