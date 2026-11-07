@@ -20,8 +20,6 @@ use dom_query::Document;
 use serde::{Deserialize, Serialize};
 
 use crate::session::Client;
-// Windows では、ログインして読み直す道を通らないので使わない（段階 2 S11）
-#[cfg_attr(windows, allow(unused_imports))]
 use crate::session::NOT_LOGGED_IN;
 use crate::storage;
 
@@ -117,11 +115,7 @@ fn is_not_found(stderr: &str) -> bool {
     stderr.contains("returned error: 404")
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 const NOT_FOUND_LOGGED_OUT: &str = "ページが見つかりません（404）。開催中のコンテストの問題は、AtCoder にログインしていないと読めません。「提出結果」タブの「ログイン」からログインしてください";
-// Windows（段階 2 S11）：ログイン（Keychain の代わりの資格情報マネージャー）は段階 3 で入れるので、それまではログインを勧めない
-#[cfg(windows)]
-const NOT_FOUND_LOGIN_UNAVAILABLE: &str = "ページが見つかりません（404）。開催中のコンテストの問題は、AtCoder にログインしていないと読めません。Windows 版では、まだログインできません";
 
 // 公開されているページを取得する。ログインなしで 404 なら、ログインしているときだけセッションを付けてもう 1 回読む（D-149）
 fn fetch(url: &str) -> Result<String, String> {
@@ -136,13 +130,6 @@ fn with_session_fallback(
     match first {
         Ok(body) => Ok(body),
         Err(FetchError::Other(error)) => Err(error),
-        // Windows（段階 2 S11）：Keychain（/usr/bin/security）を見に行かず、まだログインできないことを伝える
-        #[cfg(windows)]
-        Err(FetchError::NotFound) => {
-            let _ = (url, client);
-            Err(NOT_FOUND_LOGIN_UNAVAILABLE.to_string())
-        }
-        #[cfg(not(windows))]
         Err(FetchError::NotFound) => {
             if !client.keychain().exists()? {
                 return Err(NOT_FOUND_LOGGED_OUT.to_string());
@@ -688,33 +675,48 @@ mod tests {
         assert_eq!(refused.status.code(), Some(7));
     }
 
+    // 段階 3 T7：Windows の 404 の文に「Keychain」を出さない。ログインしていないときも、切れていたときも、ログインを勧める同じ文にする
     #[cfg(windows)]
     #[test]
-    fn tells_that_login_is_not_available_on_windows() {
-        // 段階 2 S11：Windows では、ログインなしで 404 のとき、Keychain（/usr/bin/security）を見に行かず、
-        // ログインしていないときの文に「Windows 版では、まだログインできません」を足して返す（段階 3 でログインを入れるまで）
-        let keychain = TestKeychain::new("login-unavailable");
-        let result = with_session_fallback(
-            "http://127.0.0.1:9/",
-            Err(FetchError::NotFound),
-            &keychain.client(),
-        );
+    fn tells_to_log_in_without_keychain_on_windows() {
+        let keychain = TestKeychain::new("not-found-text");
+        let client = keychain.client();
+        // ログインしていない：送らない（127.0.0.1 の 9 番にも届かない）
+        let result =
+            with_session_fallback("http://127.0.0.1:9/", Err(FetchError::NotFound), &client);
         let Err(message) = result else {
             panic!("{result:?}");
         };
         assert!(message.contains("404"), "{message}");
         assert!(
-            message.contains("Windows 版では、まだログインできません"),
+            message.contains("「提出結果」タブの「ログイン」"),
             "{message}"
         );
         assert!(!message.contains("Keychain"), "{message}");
+        assert!(!message.contains("まだログインできません"), "{message}");
+        // ログインが切れていた：同じ文にして、切れた値を残さない
+        keychain.0.save("expired-session").unwrap();
+        let (url, server) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(
+            with_session_fallback(&url, Err(FetchError::NotFound), &client),
+            Err(NOT_FOUND_LOGGED_OUT.to_string())
+        );
+        // 期待する文は接続しなくても同じになるので、接続がなければ止まらずに落ちるようにする
+        let started = Instant::now();
+        while !server.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "サーバーに接続がありませんでした"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server.join().unwrap();
+        assert!(!keychain.0.exists().unwrap());
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn reads_with_the_session_only_after_a_404_when_logged_in() {
         let keychain = TestKeychain::new("problem-fallback");
         let client = keychain.client();
