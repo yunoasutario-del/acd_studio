@@ -29,6 +29,7 @@
 // - alloc:MiB … MiB だけ確保して書き込む（使用メモリを増やす）。確保したものは終わるまで持つ
 // - crash:access-violation・crash:stack-overflow・crash:abort・crash:panic・crash:divide-by-zero（x86_64 だけ）
 // - exit:N
+// - stdio-kinds:パス … 標準入力・標準出力・標準エラーが null か（Windows だけ）を、パスのファイルに `null other null` の形で書く
 //
 // 知らない手順・読めない数は、標準エラーに書いて 120 で終わる
 
@@ -138,9 +139,39 @@ fn main() {
             }
             "crash" => crash(value),
             "exit" => std::process::exit(number(value)),
+            #[cfg(windows)]
+            "stdio-kinds" => stdio_kinds(value),
             other => fail(&format!("知らない手順 {other}")),
         }
     }
+}
+
+// 標準入出力が null か（段階 3 T3）。NUL は文字デバイスで、コンソールではないものとして見分ける。std には見る手段がないので API を宣言する
+#[cfg(windows)]
+fn stdio_kinds(path: &str) {
+    use std::ffi::c_void;
+    const FILE_TYPE_CHAR: u32 = 2;
+    // 順に STD_INPUT_HANDLE・STD_OUTPUT_HANDLE・STD_ERROR_HANDLE
+    const STREAMS: [u32; 3] = [-10i32 as u32, -11i32 as u32, -12i32 as u32];
+    unsafe extern "system" {
+        fn GetStdHandle(id: u32) -> *mut c_void;
+        fn GetFileType(handle: *mut c_void) -> u32;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+    }
+    let kinds: Vec<&str> = STREAMS
+        .iter()
+        .map(|&id| {
+            let mut mode = 0;
+            // SAFETY: 値を渡すだけ。ハンドルは閉じない。mode は書き込める u32
+            let is_null = unsafe {
+                let handle = GetStdHandle(id);
+                GetFileType(handle) == FILE_TYPE_CHAR && GetConsoleMode(handle, &mut mode) == 0
+            };
+            if is_null { "null" } else { "other" }
+        })
+        .collect();
+    std::fs::write(path, kinds.join(" "))
+        .unwrap_or_else(|error| fail(&format!("{path} を作れません：{error}")));
 }
 
 fn fail(message: &str) -> ! {

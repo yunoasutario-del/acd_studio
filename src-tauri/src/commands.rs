@@ -1689,17 +1689,7 @@ pub fn open_templates_folder(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn open_snippets_file(language: Language, app: AppHandle) -> Result<(), String> {
     let path = snippets::ensure_file(&app_dir(&app)?, language)?;
-    let name = snippets::file_name(language);
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .map_err(|error| format!("{name} を開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{name} を開けません"))
-    }
+    crate::open::text_file(&path, snippets::file_name(language))
 }
 
 // VS Code の言語のスニペット（rust.json・cpp.json）を、言語のファイルに写す（D-187・D-213）。押したときだけ。
@@ -1927,7 +1917,7 @@ pub async fn save_settings(
     Ok(SaveSettingsOutcome::Saved)
 }
 
-// settings.json を、macOS の open コマンドで既定のテキストエディタで開く（D-159）。なければ既定の内容で作る
+// settings.json をテキストエディタで開く（D-159）。なければ既定の内容で作る
 #[tauri::command]
 pub fn open_settings_file(app: AppHandle) -> Result<(), String> {
     ensure_primary(&app)?;
@@ -1936,16 +1926,7 @@ pub fn open_settings_file(app: AppHandle) -> Result<(), String> {
     if !path.exists() {
         storage::write_default_settings(&dir)?;
     }
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .map_err(|error| format!("settings.json を開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("settings.json を開けません".to_string())
-    }
+    crate::open::text_file(&path, "settings.json")
 }
 
 // レイアウト・開いているタブを保存する（作業 6）。作業領域のパスは Rust 側が持っているものを使う
