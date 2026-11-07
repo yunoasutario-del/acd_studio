@@ -1700,11 +1700,8 @@ pub async fn import_vscode_snippets(
     app: AppHandle,
 ) -> Result<snippets::Imported, String> {
     let dir = app_dir(&app)?;
-    let home = toolchain::home_dir().ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
-    // Windows の VS Code の場所（%APPDATA%\Code\User\snippets）にするのは段階 3
-    let source = home
-        .join("Library/Application Support/Code/User/snippets")
-        .join(snippets::vscode_file_name(language));
+    // 読む場所は OS で違う（Unix は home の下の Library/Application Support、Windows は %APPDATA%。snippets::vscode_source）
+    let source = snippets::vscode_source(language)?;
     tauri::async_runtime::spawn_blocking(move || {
         snippets::import(&dir, &source, language, |count, problems, exists| {
             let name = snippets::file_name(language);

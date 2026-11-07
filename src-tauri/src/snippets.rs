@@ -9,8 +9,10 @@
 // - 直し方（VS Code → エディタ）：$1 → ${1}、${1:既定} はそのまま、$0 → ${0}、\$ \} \\ → 文字、
 //   選択肢 ${1|a,b|} → ${1:a}、変数（$TM_SELECTED_TEXT など）→ 既定の文字か空、入れ子の欄 → 内側の文字を既定にした 1 つの欄、
 //   変換（${1/…/…/}）→ ${1}、既定の文字の中の { } → 外す（エディタの書き方では書けない）
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -64,13 +66,73 @@ pub fn file_name(language: Language) -> &'static str {
     }
 }
 
-// VS Code の、言語のスニペットのファイルの名前（~/Library/Application Support/Code/User/snippets/ の中）
+// VS Code の、言語のスニペットのファイルの名前（フォルダは vscode_source）
 pub fn vscode_file_name(language: Language) -> &'static str {
     match language {
         Language::Rust => "rust.json",
         Language::Cpp => "cpp.json",
         Language::Python => "python.json",
     }
+}
+
+// VS Code の言語のスニペットのファイルの場所（Unix）：home の下の Library/Application Support/Code/User/snippets
+#[cfg(any(not(windows), test))]
+fn unix_vscode_source(home: Option<PathBuf>, language: Language) -> Result<PathBuf, String> {
+    let home = home.ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
+    Ok(home
+        .join("Library/Application Support/Code/User/snippets")
+        .join(vscode_file_name(language)))
+}
+
+#[cfg(not(windows))]
+pub fn vscode_source(language: Language) -> Result<PathBuf, String> {
+    unix_vscode_source(crate::toolchain::home_dir(), language)
+}
+
+// VS Code の言語のスニペットのファイルの場所（Windows）：%APPDATA%\Code\User\snippets（段階 3 T4）。
+// 環境の値は引数で受け取り、絶対パスのときだけ使う（空の値・相対パスは、作業フォルダの下を指しうるので断る）
+#[cfg(windows)]
+fn windows_vscode_source(appdata: Option<&OsStr>, language: Language) -> Result<PathBuf, String> {
+    let appdata = appdata
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            "VS Code のスニペットの場所が分かりません（環境変数 APPDATA が空か、絶対パスではありません）"
+                .to_string()
+        })?;
+    Ok(appdata
+        .join(r"Code\User\snippets")
+        .join(vscode_file_name(language)))
+}
+
+#[cfg(windows)]
+pub fn vscode_source(language: Language) -> Result<PathBuf, String> {
+    windows_vscode_source(std::env::var_os("APPDATA").as_deref(), language)
+}
+
+// 見つからないときの文（Unix）
+#[cfg(any(not(windows), test))]
+fn unix_missing_text(language: Language) -> String {
+    format!(
+        "VS Code の {} のスニペット（~/Library/Application Support/Code/User/snippets/{}）が見つかりません",
+        language.label(),
+        vscode_file_name(language)
+    )
+}
+
+#[cfg(not(windows))]
+fn missing_text(language: Language, _source: &Path) -> String {
+    unix_missing_text(language)
+}
+
+// 見つからないときの文（Windows）：実際の場所を出す
+#[cfg(windows)]
+fn missing_text(language: Language, source: &Path) -> String {
+    format!(
+        "VS Code の {} のスニペット（{}）が見つかりません",
+        language.label(),
+        source.display()
+    )
 }
 
 // 言語のスニペットのファイルの場所。Rust で snippets-rust.json がなく、前の snippets.json があれば、名前を変える
@@ -95,13 +157,7 @@ pub fn import(
     language: Language,
     confirm: impl FnOnce(usize, usize, bool) -> bool,
 ) -> Result<Imported, String> {
-    let metadata = fs::metadata(source).map_err(|_| {
-        format!(
-            "VS Code の {} のスニペット（~/Library/Application Support/Code/User/snippets/{}）が見つかりません",
-            language.label(),
-            vscode_file_name(language)
-        )
-    })?;
+    let metadata = fs::metadata(source).map_err(|_| missing_text(language, source))?;
     if metadata.len() > MAX_SIZE {
         return Err("VS Code のスニペットが 1 MB を超えるので、取り込みません".to_string());
     }
@@ -722,7 +778,10 @@ mod tests {
         // C++ の取り込みは cpp.json の案内、退避は snippets-cpp.backup-…
         let missing =
             import(&dir, &dir.join("none.json"), Language::Cpp, |_, _, _| true).unwrap_err();
+        #[cfg(not(windows))]
         assert!(missing.contains("snippets/cpp.json"), "{missing}");
+        #[cfg(windows)]
+        assert_windows_missing_text(&missing, &dir.join("none.json"));
         let source = dir.join("cpp.json");
         fs::write(&source, entry("rep")).unwrap();
         let done = import(&dir, &source, Language::Cpp, |_, _, _| true).unwrap();
@@ -746,7 +805,10 @@ mod tests {
             true
         })
         .unwrap_err();
+        #[cfg(not(windows))]
         assert!(missing.contains("snippets/python.json"), "{missing}");
+        #[cfg(windows)]
+        assert_windows_missing_text(&missing, &dir.join("none.json"));
         let source = dir.join("python.json");
         fs::write(&source, entry("dfs")).unwrap();
         let done = import(&dir, &source, Language::Python, |_, _, _| true).unwrap();
@@ -756,5 +818,142 @@ mod tests {
             ["dfs"]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Unix の経路：場所を組み立てるだけで、ファイルは読まない（Windows のテストでも動く）
+    #[test]
+    fn unix_reads_from_library_application_support() {
+        for (language, name) in [
+            (Language::Rust, "rust.json"),
+            (Language::Cpp, "cpp.json"),
+            (Language::Python, "python.json"),
+        ] {
+            assert_eq!(
+                unix_vscode_source(Some(PathBuf::from("/Users/me")), language).unwrap(),
+                Path::new("/Users/me/Library/Application Support/Code/User/snippets").join(name)
+            );
+        }
+    }
+
+    #[test]
+    fn unix_needs_the_home_folder() {
+        assert_eq!(
+            unix_vscode_source(None, Language::Rust),
+            Err("ホームのフォルダが分かりません".to_string())
+        );
+    }
+
+    #[test]
+    fn unix_missing_text_stays_the_same() {
+        assert_eq!(
+            unix_missing_text(Language::Rust),
+            "VS Code の Rust のスニペット（~/Library/Application Support/Code/User/snippets/rust.json）が見つかりません"
+        );
+        assert_eq!(
+            unix_missing_text(Language::Cpp),
+            "VS Code の C++ のスニペット（~/Library/Application Support/Code/User/snippets/cpp.json）が見つかりません"
+        );
+        assert_eq!(
+            unix_missing_text(Language::Python),
+            "VS Code の Python のスニペット（~/Library/Application Support/Code/User/snippets/python.json）が見つかりません"
+        );
+    }
+
+    // Windows の経路：APPDATA の値は引数で渡し、本物の環境変数は変えない。テストのファイルは一時フォルダに置く。
+    // 本物の %APPDATA%\Code\User\snippets と、IDE のフォルダのスニペットは読まない
+
+    // 実際の場所が分かり、macOS のパスが出ない
+    #[cfg(windows)]
+    fn assert_windows_missing_text(message: &str, source: &Path) {
+        assert!(message.contains(&source.display().to_string()), "{message}");
+        assert!(message.contains("見つかりません"), "{message}");
+        for mac in ["Library", "Application Support", "~/"] {
+            assert!(!message.contains(mac), "{message}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_from_appdata_code_user_snippets() {
+        // 組み立てるだけで読まないので、この場所はなくてよい
+        let appdata = r"C:\Users\me\AppData\Roaming";
+        for (language, name) in [
+            (Language::Rust, "rust.json"),
+            (Language::Cpp, "cpp.json"),
+            (Language::Python, "python.json"),
+        ] {
+            assert_eq!(
+                windows_vscode_source(Some(OsStr::new(appdata)), language),
+                Ok(PathBuf::from(format!(
+                    r"{appdata}\Code\User\snippets\{name}"
+                )))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_empty_and_relative_appdata() {
+        let values = [
+            None,
+            Some(""),
+            Some("."),
+            Some("Roaming"),
+            Some(r"a\b"),
+            Some("C:foo"),
+            Some(r"\foo"),
+        ];
+        for value in values {
+            let result = windows_vscode_source(value.map(OsStr::new), Language::Rust);
+            let message = result.expect_err(&format!("{value:?}"));
+            assert!(message.contains("APPDATA"), "{value:?}：{message}");
+            for wrong in ["Library", "ホーム"] {
+                assert!(!message.contains(wrong), "{value:?}：{message}");
+            }
+        }
+    }
+
+    // 本物の環境変数の値を読むのは APPDATA だけ（場所を組み立てるだけで、ファイルは読まない）
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_uses_the_appdata_variable() {
+        assert_eq!(
+            vscode_source(Language::Cpp),
+            windows_vscode_source(std::env::var_os("APPDATA").as_deref(), Language::Cpp)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_imports_from_a_temporary_appdata() {
+        let base = std::env::temp_dir().join(format!(
+            "atcoder-studio-snippets-appdata-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let appdata = base.join("appdata");
+        let app_dir = base.join("app");
+        let folder = appdata.join(r"Code\User\snippets");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+        let text = "{ \"a\": { \"prefix\": \"rep\", \"body\": \"b\" } }";
+        fs::write(folder.join("cpp.json"), text).unwrap();
+        // ある：一時フォルダの appdata から、一時フォルダの app_dir に写す
+        let source = windows_vscode_source(Some(appdata.as_os_str()), Language::Cpp).unwrap();
+        let done = import(&app_dir, &source, Language::Cpp, |_, _, _| true).unwrap();
+        assert_eq!(done.count, 1);
+        assert_eq!(
+            fs::read_to_string(app_dir.join("snippets-cpp.json")).unwrap(),
+            text
+        );
+        // ない：実際の場所が文に出る
+        let source = windows_vscode_source(Some(appdata.as_os_str()), Language::Python).unwrap();
+        let missing = import(&app_dir, &source, Language::Python, |_, _, _| true).unwrap_err();
+        assert_windows_missing_text(&missing, &source);
+        assert!(
+            missing.starts_with("VS Code の Python のスニペット（"),
+            "{missing}"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 }
