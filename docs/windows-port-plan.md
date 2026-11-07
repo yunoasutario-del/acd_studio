@@ -190,7 +190,7 @@ IDE は窓の Cookie から REVEL_SESSION だけを読む（session.rs:522–537
 | --- | --- | --- | --- |
 | 案 A：windows-sys | CredWriteW・CredReadW・CredDeleteW（`Win32_Security_Credentials`）。CRED_TYPE_GENERIC、TargetName は `io.github.ishigaki892.acdstudio/REVEL_SESSION`、CRED_PERSIST_LOCAL_MACHINE。値は API に直接渡すので、外部コマンドも標準入力も要らない。exists は CredReadW の成否 | 未確認（API の仕様は資料の記述） | 単体テストで、テスト用の TargetName に書いて読んで消す |
 | 案 B：keyring クレート | Windows・macOS・Linux を 1 つの API で扱える。新しい依存（Cargo.lock にない。確認済み）。Windows の機能を features で有効にする必要がある（推測）。macOS 側を置き換えるかは別の判断 | 未確認 | 選んだ場合に、案 A と同じ単体テストを行う |
-| 値の大きさ | CredentialBlob の上限は CRED_MAX_CREDENTIAL_BLOB_SIZE（5×512 = 2560 バイト）と思われるが、valid_cookie_value（session.rs:38–44）は 4096 バイトまで許す | 上限：未確認、実際の REVEL_SESSION の長さ：不明 | ログインして値の長さを記録する（値そのものは記録しない）。上限を超える値は保存の前に断る |
+| 値の大きさ | CredentialBlob の上限は CRED_MAX_CREDENTIAL_BLOB_SIZE（windows-sys 0.61.2 の定数で 2560 バイト）。valid_cookie_value（session.rs:38–44）は 4096 バイトまで許す | 定数：確認済み（2026-11-06）、実際の動き：未確認、実際の REVEL_SESSION の長さ：不明 | ログインして値の長さを記録する（値そのものは記録しない）。上限を超える値は保存の前に断る（9.1 の追加 23） |
 | 他のプログラムからの読み出し | 同じ利用者の権限で動くプログラムは確認なしに読める（macOS の限界〔session.rs:9〕と同じ） | 推測（未確認） | 別のプロセス（PowerShell から CredRead を呼ぶ小さなスクリプト）で、確認なしに読めるかを試す |
 | ログインの窓の incognito | WebView2 で InPrivate になり、閉じたあと Cookie・履歴・キャッシュ・パスワードの自動保存がディスクに残らないか。wry 0.57.0 は incognito を WebView2 の `SetIsInPrivateModeEnabled` に渡す（webview2/mod.rs:414。ソースで確認済み）。InPrivate のときにディスクに何が残るかは未確認。パスワードの自動保存は WebView2 の IsPasswordAutosaveEnabled（既定は無効と推測）、フォームの自動入力は IsGeneralAutofillEnabled（既定は有効と推測）で、Tauri からどう設定されるかは不明 | 未確認（自動入力の設定は不明） | 下の「手順 A」 |
 | パスワードが IDE に渡らない | src-tauri/src で password を含むのは security の副コマンド名だけ（session.rs:78・101・121・133。grep で確認済み）。IDE は cookies() から REVEL_SESSION だけを読む（session.rs:523–536） | コード：確認済み／Windows 版：未確認 | 下の「手順 B」 |
@@ -200,7 +200,7 @@ IDE は窓の Cookie から REVEL_SESSION だけを読む（session.rs:522–537
 
 1. WebView2 の利用者データのフォルダは `%LOCALAPPDATA%\io.github.ishigaki892.acdstudio\EBWebView`（段階 1 で起動したときにできた。確認済み）
 2. ログインの前・ログイン中・ログインの窓を閉じたあと・アプリを終えたあとに、フォルダの中のファイル一覧と更新日時を記録する
-3. `Default\Network\Cookies`・`Default\Login Data`・`Default\Web Data`・`Default\History` などに、`atcoder.jp`・`REVEL_SESSION`・利用者名・パスワードの文字列が残っていないかを検索する
+3. `Default\Network\Cookies`・`Default\Login Data`・`Default\Web Data`・`Default\History` などに、`atcoder.jp`・`REVEL_SESSION`・利用者名・パスワードの文字列が残っていないかを検索する。一致した行は出さず、ファイル名と件数だけを出す。利用者名・パスワードの検索は利用者の窓で行う
 4. InPrivate の一時フォルダがどこに作られ、閉じたときに消えるかを見る
 5. もう一度ログインの窓を開き、ログイン済みになっていないことを確かめる
 6. 効いていなかったときの選択肢（利用者が決める）：ログインの窓だけ別の data_directory（一時フォルダ）にして閉じたあと消す／自動入力を切る方法を探す
@@ -208,13 +208,13 @@ IDE は窓の Cookie から REVEL_SESSION だけを読む（session.rs:522–537
 手順 B（パスワードが保存されないことの確かめ方）
 
 1. Windows 版でも「cookies() から REVEL_SESSION だけを読む」形を保ち、src-tauri/src を `password` で検索し直す
-2. ログインのあと `cmdkey /list` で、項目が `io.github.ishigaki892.acdstudio…` の 1 つだけで、利用者名・パスワードの項目がないことを見る
-3. CredReadW で読んだ中身が REVEL_SESSION の値だけで、入力したパスワードを含まないことを、テスト用の小さなプログラムか単体テストで確かめる
-4. 手順 A の検索でもパスワードを探す。実行ログ・history.json・state.json・settings.json にも出ないことを検索する
+2. ログインのあと `cmdkey /list | findstr /i "acdstudio atcoder"`（そのまま出さない。9.1 の追加 29）で、項目が `io.github.ishigaki892.acdstudio…` の 1 つだけであることを見る。全体の一覧は利用者の窓で見て、AtCoder に関わる項目がほかにないことを確かめる。一覧は貼らない
+3. CredReadW で読んだ中身が REVEL_SESSION の値だけで、入力したパスワードを含まないことを、利用者の窓で確かめる（出すのは一致したかどうかだけ。9.1 の追加 25）
+4. 手順 A の検索でもパスワードを探す（利用者の窓で）。ログアウトや値の書き換えの前に、本物の値がリポジトリの変更・実行ログ・history.json・state.json・settings.json に含まれないことを調べる。出すのはファイル名と件数だけ
 
 手順 C（ログアウト・期限切れの確かめ方）
 
-1. 「ログアウト」を押したあと、`cmdkey /list` から項目が消え、画面がログインしていない表示になる
+1. 「ログアウト」を押したあと、`cmdkey /list | findstr /i "acdstudio atcoder"` から項目が消え、画面がログインしていない表示になる
 2. 資格情報マネージャーの値を壊れた値に書き換えて（テスト用の手順）提出結果を読み込み、ログインのページへ移されて項目が消える
 3. 単体テストの serve_once（session.rs:702 以降。302 で /login へ）を Windows でも動かす
 4. Cookie の入れ替えで値が更新されることを、CredReadW の LastWritten で確かめる（cmdkey では見えない）
@@ -1063,17 +1063,66 @@ debug の 1 件は S8 で足した）
 既知の問題（まだ直さない）は「段階 2 の既知の問題」の節にある：WER の ReportArchive の記録、入力の CRLF、対話テストの `\r`、
 証明書の失効の確かめ（Schannel）
 
+段階 2 の merge（2026-11-06）
+
+PR #4 を main に merge した（3a32b0e。2026-11-06 21:12 JST）。CI の結果は次のとおり（公開の API で読んだ。ログの中身は見ていない）。
+
+| run | id | きっかけ | コミット | 結果 |
+| --- | --- | --- | --- | --- |
+| #24 | 42213488199 | push（windows-port-stage2） | 7e56c86 | run 全体が success（OS ごとの結果は見ていない） |
+| #25 | 42215021243 | pull_request（windows-port-stage2） | 7e56c86 | macos-latest・windows-latest とも success。どちらも全 16 段階が success |
+| #26 | 42215919158 | push（main） | 3a32b0e | macos-latest・windows-latest とも success。どちらも全 16 段階が success |
+
 ### 段階 3：ファイル・URL を開く処理、ログイン情報の保存
 
 何を変えるか
-- `/usr/bin/open` の 5 か所を、OS ごとの「開く」関数 1 つにまとめる（ShellExecuteW など。9 章で選んだもの）
+- `/usr/bin/open` の 5 か所（commands.rs 3、problem.rs 1、submit.rs 1）を、OS ごとの「開く」関数にまとめる（新しい open.rs。Windows は ShellExecuteW と、テキストファイルは VS Code・メモ帳）
 - Keychain を資格情報マネージャーに（4.1 で選んだ方式）。`Keychain` の型の形（app・named・save・load・exists・delete）はそのまま
-- VS Code のスニペットの場所、画面の「Finder」「Keychain」の文字
+- session.rs の curl を curl.exe に（段階 5 から前倒しした。9.1 の追加 22）
+- VS Code のスニペットの場所、画面の「Keychain」の文字（「Finder」は画面に出ない。コメントだけ。grep で確認済み）
 
 どう確認するか
 - 問題ページ・提出ページ・提出結果のページがブラウザで開く。テンプレートのフォルダがエクスプローラーで開く。settings.json・スニペットが決めたエディタで開く
 - 4.1 の手順 A・B・C
 - VS Code のスニペットの取り込み
+
+段階 3 は、次のまとまりごとに 1 つずつコミットする（2026-11-06 に決めた順。ブランチは最新の main〔3a32b0e〕から作った windows-port-stage3）。
+進め方は段階 2 と同じ：macOS / Unix の経路は cfg を付ける・場所を移す以外は変えず、変えたときはコミットの報告とメッセージに明記する。手元に Mac がないので、確かめは CI で行う。
+各コミットの前に報告して返事を待つ。コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。テストの時間の余裕は広げない。
+不具合を直すときは、先にテストを書いて失敗を確かめ、直す前の失敗をメッセージに書く。新しい処理は、一時的に外してテストが落ちることも確かめ、戻したことを見せる。
+
+| 順 | まとまり | 何を変えるか | どう確認するか |
+| --- | --- | --- | --- |
+| T1 | 文書 | PR #4 の merge と run #24〜#26 の結果、この表、9.1 の追加 22〜31、4.1 の手順の直し、段階 5 との分担 | — |
+| T2 | URL・フォルダを開く | 新しい open.rs に、問題ページ（problem.rs）・提出のページ（submit.rs）・テンプレートのフォルダ（commands.rs）の 3 か所を移す。**Unix は場所を移すだけで、文は同じ。** Windows は ShellExecuteW。URL は `https://` だけ、フォルダは is_dir のときだけ開く（ShellExecuteW はプログラムも起動できるため） | 先にテストで失敗を確かめる：`https` 以外を断る、ないフォルダを断る、`\\?\` を外す。Unix は open に渡す引数のテストを足し、CI で見る |
+| T3 | テキストファイルを開く | settings.json とスニペットの 2 か所を移す。Windows は 9.1 の追加 28 の順で探し、`\\?\` を外して起動する。標準入出力は null にし、終わるのを待たない（spawn） | 先にテストで失敗を確かめる：一時フォルダで探す順、起動できないときのメモ帳、`\\?\` を外す。起動そのものは T8 で見る |
+| T4 | VS Code のスニペットの場所 | commands.rs:1723-1725（実際に読む場所）と、snippets.rs の見つからないときの文（実際の場所にする）。場所を組み立てる部分はテストできる関数に分ける。Windows は `%APPDATA%\Code\User\snippets`。**Unix は今までと同じ場所を返す形に移すだけ** | 先にテストで失敗を確かめる：場所の組み立てと文。snippets.rs:725 の確かめは OS で分ける |
+| T5 | 資格情報マネージャー | win.rs に CredWriteW・CredReadW・CredDeleteW を足す。session.rs は Unix の `impl Keychain` に cfg(not(windows)) を付け、Windows の `impl` を足す。型の形は変えない。9.1 の追加 23・24 を入れる。problem.rs:718 のテストをテスト用の名前に変える。saves_loads_and_deletes_in_keychain の ignore を外す | 先にテストで失敗を確かめる：書く・読む・消す、2560／2561 バイト、エラーの文に値が出ない。追加 24 の仕組みは外すと落ちることも確かめ、戻したことを見せる。そのあと、絞った一覧（9.1 の追加 29）でテストの項目が残っていないことを見せる |
+| push | T5 までを push（9.1 の追加 27） | 利用者の許可を得てから。push の前に、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる | CI の Windows で資格情報を書けるか（未確認）。macOS が壊れていないか |
+| T6 | session.rs を curl.exe に（9.1 の追加 22） | windows_curl を session.rs に移し、process::command で起動する。Unix は cfg を付けるだけ。session の残り 3 件と submit の 8 件の ignore を外す。落ちるものは 9.1 の追加 26 のとおりに扱う | 先に ignore を外して失敗を確かめる。日本語と CRLF を含む `--config -` の送信は posts_with_session_and_rotates_cookie で見る |
+| T7 | 問題の取得のログイン | problem.rs の「まだログインできません」の分岐・定数・テストを消す。**Unix は cfg を外すだけで、文字は同じ。** reads_with_the_session_only_after_a_404_when_logged_in の ignore を外す | 先に ignore を外して失敗を確かめる |
+| T9 | 4.1 の手順 A・B・C（T8 より先。9.1 の追加 30） | 結果を文書に書く：REVEL_SESSION の長さ（値は書かない）、InPrivate で何が残るか、他のプログラムからの読み出し（同じ利用者の別のプロセスが確認なしに読めるか）、9.1 の 14。効いていなければ、直すコミットを別に足す。画面に「Keychain」の文字が残っていても先に進む | 本物のログイン（利用者が操作）。ログアウトや値の書き換えの前に、下の「T9 で守ること」を行う |
+| T8 | 画面の文字と開く処理の確かめ | SubmissionPanel.tsx:235 を OS で分ける（pythonNote.ts と同じ形で npm test を足す）。画面の確かめの手順はコードと照らしてから出す。提出のページは、提出の処理を始めずに開ける経路があるかをコードで確かめる（未確認）。なければ相談する | ブラウザの 3 種類のページ、エクスプローラー、VS Code とメモ帳、スニペットの取り込み。メモ帳は環境変数を変えて起動して確かめる案（効くかは未確認。先に試す） |
+| T10 | まとめ | 段階 3 の結果、Unix を変えた所の表、残る未確認を書く | push の前に、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる。パスワードとの照合は利用者の窓で行う |
+
+秘密の値について守ること
+- AtCoder の Cookie・パスワードなどの秘密の値を、ログ・テストの出力・計画書・コミットに出さない
+- テストは本物の資格情報に触れない名前で行う。資格情報マネージャーに書くテストは、終わったら自分で消す
+- `cmdkey /list` はそのまま出さない（ほかのサービスの項目名と利用者名が出るため）。`cmdkey /list | findstr /i "acdstudio atcoder"` のように絞る
+- 値を調べるスクリプトは scratchpad に置き、リポジトリに入れない。.ps1 に日本語を書かない（9.1 の追加 25）
+
+T9 で守ること
+- ログアウトや値の書き換えをする前に、本物の値が、リポジトリの変更・実行ログ・history.json・state.json・settings.json に含まれないことを調べる。出すのはファイル名と件数だけで、値は出さない。実行ログがファイルに残るかは、コードで確かめてから調べる（未確認）
+- EBWebView の中を探すときは、一致した行を出さない。ファイル名と件数だけを出す
+- パスワードの照合は利用者の窓で行う。出すのは一致したかどうかだけ
+- 値の書き換えの前に、利用者に聞く（書き換えたあとは、ログインし直しになる）
+
+提出についての注意（段階 3 の版）
+- T6 のあとは、Windows でも提出の処理が動くようになるかもしれない。実際の提出と提出の前の検査は段階 5 まで確かめないので、段階 3 の版では提出しない。ボタンは消さない
+- 提出の処理は、「提出」のボタンのほか、キーの割り当てからも始まる（App.tsx:1231-1235。初期の割り当てはなく、settings.json で割り当てたとき）。確認のダイアログが出たら、利用者は「提出する」を押さない
+- 確認済み：コードは「提出する」「キャンセル」のボタンを指定している（submit.rs:1675-1683）。confirmDialog が true なら省かない（submit.rs:1609-1615）
+- 未確認（段階 5 で確かめる）：Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン
+- ダイアログが出たときに Enter を押すと『提出する』が選ばれるかもしれない（推測。rfd 0.16.0 の nDefaultButton: 0 と、ボタンの並びから。動かしていない）。段階 3 の版では、ダイアログが出ても Enter を押さない
 
 ### 段階 4：LSP（補完・診断）
 
@@ -1090,13 +1139,14 @@ debug の 1 件は S8 で足した）
 ### 段階 5：提出
 
 何を変えるか
-- session.rs の curl を curl.exe に（`--config -`）
+- session.rs の curl を curl.exe に（`--config -`）：ログインにも要るので、段階 3 の T6 に前倒しした（9.1 の追加 22）。段階 5 では、提出の経路で確かめる
 - 提出の時刻の表示（localtime_r の置き換え。段階 1 で済ませていれば確認だけ）
 - 提出の前の検査のうち、OS の違いが出るもの（Python の import の検査〔submit.rs:2527 付近〕など）
 
 どう確認するか
 - session.rs・submit.rs の単体テスト（手元の http の口に送るもの）を Windows で通す
 - 実際に練習用のコンテストの問題へ提出し、判定が提出結果の欄に出るまで追える。Cookie の入れ替えで資格情報が更新される
+- 確認のダイアログ：Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン（『提出する』が選ばれるかもしれない。推測）。どれも段階 3 では未確認のまま（「提出についての注意」の節）
 
 ### 段階 6：デバッグ
 
@@ -1195,6 +1245,16 @@ debug の 1 件は S8 で足した）
 | 追加 19（2026-11-01） | 同時の保存の失敗は、原因を決めきれないので、(2) 同じパスへの保存を IDE の中で 1 つずつにする（Windows だけ）と、(3) 諦めたときに、ほかのプログラム（ウイルス対策など）が使っている可能性を案内する、の両方を S10d で入れる。試し直しの時間を延ばすのは、測った長さを見てから相談する | 段階 2（S10d） |
 | 追加 20（2026-11-02） | RE の表示：i32 で負の終了コード（Windows の例外のコード）だけを 16 進にし、名前の表にあれば名前を添える（表にない値は 16 進だけ）。負でない値は 256 以上も 10 進のまま。名前は Rust で作って画面に送る（画面の側に単体テストの仕組みがないため）。終了コード 3 への C++ の abort・assert の添え書きは、測ると 0xC0000409 だったので S5b でやめた | 段階 2（S5・S5b） |
 | 追加 21（2026-11-02） | 扱われない例外で落ちた解答が約 4 秒かかり、サンプルテストで TLE と判定される件は、Job に JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION を足して直す（S5b）。0xC0000409（__fastfail）には効かないので、別に手当てする（案を相談中）。レジストリや WER の設定は変えない | 段階 2（S5b） |
+| 追加 22（2026-11-06） | session.rs の curl.exe への切り替えを、段階 5 から段階 3 に前倒しする。ログインの流れ（take_session → confirm_session → Client::send）が curl を使い、これがないと 4.1 の手順 A・B・C を確かめられないため。実際の提出と提出の前の検査は段階 5 に残す | 段階 3（T6） |
+| 追加 23（2026-11-06） | 2560 バイトを超える値は、Windows だけ保存の前に断り、分かる文を出す。実際の REVEL_SESSION の長さを測ってから先を考える（複数の項目に分けるのは、要ると分かってから） | 段階 3（T5・T9） |
+| 追加 24（2026-11-06） | Windows のテストのビルドでは、Keychain::app() を呼ぶと panic にする（テストが本物の資格情報に触れたら、落ちて分かる）。Unix は変えない | 段階 3（T5） |
+| 追加 25（2026-11-06） | 本物の値を確かめるスクリプトは scratchpad に置き、リポジトリに入れない。大きさと LastWritten だけを出すものは Claude が動かす。パスワードの照合は利用者の PowerShell の窓で行い（Read-Host -AsSecureString）、出すのは一致したかどうかだけ | 段階 3（T9） |
+| 追加 26（2026-11-06） | curl.exe に切り替えたあとも落ちるテスト：原因が session.rs か資格情報の処理なら段階 3 で別のコミットにして直す。提出の処理が原因なら、理由を段階 5 に書き換えて ignore を残す | 段階 3（T6） |
+| 追加 27（2026-11-06） | T5 のあとに 1 回 push をお願いする（CI の Windows で資格情報を書けるかと、macOS が壊れていないかを早めに確かめる）。その push の前にも、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる | 段階 3（T5 のあと） |
+| 追加 28（2026-11-06） | VS Code の探し方：`%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe` → `%ProgramFiles%\Microsoft VS Code\Code.exe` → PATH の code.cmd の 2 つ上のフォルダの Code.exe。code.cmd は cmd.exe を通して引数の引用が難しくなるので、起動には使わない。起動できなければメモ帳にする。settings.json での指定は足さない（9.1 の 4 の詳しい形） | 段階 3（T3） |
+| 追加 29（2026-11-06） | `cmdkey /list` はそのまま出さず、`cmdkey /list \| findstr /i "acdstudio atcoder"` のように絞る | 段階 3 |
+| 追加 30（2026-11-06） | 順番は T7 → T9（本物のログイン）→ T8。ログインができるか、値の長さがどれくらいかを早めに確かめるため。T9 で画面に「Keychain」の文字が残っていても先に進む | 段階 3 |
+| 追加 31（2026-11-06） | T4 の対象に commands.rs:1723-1725（実際に読む場所）を入れ、場所を組み立てる部分をテストできる形に分ける。Windows では %APPDATA% を使う。T3 でも `\\?\` を外し、起動するときの標準入出力を null にする | 段階 3（T3・T4） |
 
 ---
 
@@ -1235,6 +1295,8 @@ debug の 1 件は S8 で足した）
 - macOS の S7（Python）・S8（C++）の経路が CI で本当に動いたか（g++-15・python3.13 がなければテストは自分で飛ぶ。runner に何が入っているかは未確認）。
   段階 2 の全体は run #23（e800d5d）で通り、S10b とその直しのテスト、対話テスト、npm test は macos-latest のログで確認済み（「段階 2 の結果」）
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
+- 段階 3 で確かめること：ShellExecuteW を COM の初期化なしで呼んで動くか、Turnstile が WebView2 の InPrivate と on_navigation の制限のもとで通るか、cookies() が WebView2 で HttpOnly の Cookie を返すか、CI の Windows で資格情報を書けるか、実行ログがファイルに残るか、提出の処理を始めずに提出のページを開ける経路があるか
+- 段階 5 で確かめること：確認のダイアログの Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン（『提出する』が選ばれるかもしれない。推測。rfd 0.16.0 の nDefaultButton: 0 と、ボタンの並びから。動かしていない）
 - macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709。段階 2 は run 42210961555〕。clippy の警告は run 42210961555 のログで 0 件。debugs_with_real_lldb_dap と画面の操作は macOS の機械で確かめる。利用者の手元に Mac がないので、macOS の画面は確かめていない）
 
 不明（調べても分からなかった）
