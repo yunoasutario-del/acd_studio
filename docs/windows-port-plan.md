@@ -1107,6 +1107,25 @@ PR #4 を main に merge した（3a32b0e。2026-11-06 21:12 JST）。CI の結�
 | T8 | 画面の文字と開く処理の確かめ | SubmissionPanel.tsx:235 を OS で分ける（pythonNote.ts と同じ形で npm test を足す）。画面の確かめの手順はコードと照らしてから出す。提出のページは、提出の処理を始めずに開ける経路があるかをコードで確かめる（未確認）。なければ相談する | ブラウザの 3 種類のページ、エクスプローラー、VS Code とメモ帳、スニペットの取り込み。メモ帳は環境変数を変えて起動して確かめる案（効くかは未確認。先に試す） |
 | T10 | まとめ | 段階 3 の結果、Unix を変えた所の表、残る未確認を書く | push の前に、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる。パスワードとの照合は利用者の窓で行う |
 
+T5 までの push の CI（run 42378818906、866848a、2026-11-07）
+- macos-latest・windows-latest とも success。どちらも全部の段階が success（公開の API で確認）
+- 次は、利用者がログインしたブラウザで見た（ログインなしの API ではログを取れず 403 だった）
+  - macOS の cargo clippy：warning の文字は見えなかった（目視）
+  - macOS の cargo test：304 通過、0 失敗、0 無視、1 除外
+  - Windows の cargo test：345 通過、0 失敗、21 無視、1 除外（CI の --skip で除外する 1 件は、手元では無視に数える。手元の 22 無視と同じ）
+  - saves_loads_and_deletes_in_keychain と stops_a_case_at_the_time_limit：macOS と Windows の両方で ok。CI の Windows でも資格情報を書けた
+
+T6 の結果（2026-11-08）
+- 追加 26 の扱いになる失敗はなかった。session の 3 件と submit の 8 件の ignore をすべて外し、ignore を残したものはない。実際の提出と提出の前の検査は段階 5 のまま
+- 直す前に一度止まった：curl を起動できないと、keeps_the_saved_session_until_the_window_is_logged_in の is_err() が通り、誰も接続しない server.join() で待ち続けた。順番を持ったままなので、ほかの 10 件は順番の待ちで FAILED になった。テストのプログラムを止めたので、テスト用の項目が 1 つ残り、利用者の許可を得て消した。テストの 2 か所を、期待する文と比べる形に直した（テストのコードだけ。macOS でも動く）
+- テストの順番の待ち（lib テストを同時の形で 5 回。AC 電源。計測のコードは一時的に入れて外した）：1 回の最長の待ちは 4944〜5351 ms、1 回の実行で持っていた時間の合計は 5264〜5494 ms。一番長く持つのは curl_failures_do_not_show_the_cookie_value（4172〜4380 ms）。120 秒の上限は変えない。curl の --max-time は 1 回 30 秒なので、通信が止まれば持つ時間は延びる
+- reports_login_and_failures（TestKeychain を 2 つ作る）は 5 回とも止まらずに通った（待ち 1184〜3902 ms、持っていた時間 54〜80 ms）
+- `--nocapture` の出力に、テストの偽の Cookie の値と `REVEL_SESSION=` は 5 回とも 0 件だった
+- 未確認：コンソールの窓が出ないこと（CREATE_NO_WINDOW はテストでは守られていない）。release の画面で確かめる（T8）
+- 止まるおそれ（推測。動かしていない）：problem.rs の windows_curl_reports_404_in_the_same_words の join は、curl.exe が接続できないと待ち続ける
+- 未確認（推測）：curl は既定で .curlrc を読むので、そこに書いた設定（プロキシや通信の記録など）が Cookie の入った要求にも効くかもしれない。今このマシンにはない。Unix の引数も同じ関数なので T6 では変えていない。--disable を付けるかどうかは T10 で利用者が決める
+- 日本語と CRLF を含む --config - の送信は、posts_with_session_and_rotates_cookie で確かめた（Windows で通過）
+
 秘密の値について守ること
 - AtCoder の Cookie・パスワードなどの秘密の値を、ログ・テストの出力・計画書・コミットに出さない
 - テストは本物の資格情報に触れない名前で行う。資格情報マネージャーに書くテストは、終わったら自分で消す
@@ -1167,7 +1186,7 @@ T9 で守ること
 - 提出の前の検査のうち、OS の違いが出るもの（Python の import の検査〔submit.rs:2527 付近〕など）
 
 どう確認するか
-- session.rs・submit.rs の単体テスト（手元の http の口に送るもの）を Windows で通す
+- session.rs・submit.rs の単体テスト（手元の http の口に送るもの）を Windows で通す（段階 3 の T6 で通した）
 - 実際に練習用のコンテストの問題へ提出し、判定が提出結果の欄に出るまで追える。Cookie の入れ替えで資格情報が更新される
 - 確認のダイアログ：Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン（『提出する』が選ばれるかもしれない。推測）。どれも段階 3 では未確認のまま（「提出についての注意」の節）
 

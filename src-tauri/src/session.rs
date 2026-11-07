@@ -385,67 +385,104 @@ impl Client {
         })
     }
 
-    // curl で 1 回送る。設定（Cookie・URL・フォーム）は標準入力から渡す
+    // curl で 1 回送る
     fn send(
         &self,
         url: &str,
         session: Option<&str>,
         form: &[(&str, &str)],
     ) -> Result<(u16, Vec<String>, String), String> {
-        let mut config = String::new();
-        if let Some(session) = session {
-            config.push_str(&format!(
-                "cookie = {}\n",
-                quote_config(&format!("{ACCOUNT}={session}"))
-            ));
-        }
-        config.push_str(&format!("url = {}\n", quote_config(url)));
-        for (key, value) in form {
-            config.push_str(&format!(
-                "data-urlencode = {}\n",
-                quote_config(&format!("{key}={value}"))
-            ));
-        }
-        let mut child = Command::new("/usr/bin/curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--include",
-                // 状態の JSON の URL の `sids[]` を、curl の範囲の書き方として読ませない
-                "--globoff",
-                "--proto",
-                self.proto,
-                "--max-time",
-                "30",
-                "--max-filesize",
-                "8000000",
-                "--config",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("curl を起動できません：{error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "curl に渡せません".to_string())?
-            .write_all(config.as_bytes())
-            .map_err(|error| format!("curl に渡せません：{error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("curl が終わりません：{error}"))?;
-        if !output.status.success() {
-            return Err(curl_failure(
-                "AtCoder につながりません",
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stderr),
-            ));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        Ok(split_response(&text))
+        run_curl(curl_command()?, self.proto, url, session, form)
     }
+}
+
+// 起動する curl
+#[cfg(not(windows))]
+fn curl_command() -> Result<Command, String> {
+    Ok(Command::new("/usr/bin/curl"))
+}
+
+// Windows：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
+#[cfg(windows)]
+fn curl_command() -> Result<Command, String> {
+    Ok(crate::process::command(windows_curl()?))
+}
+
+// Windows（段階 2 S11。段階 3 T6 で problem.rs から移した）：Windows に入っている curl.exe の場所。
+// PATH は探さない（同じ名前の別のプログラムを使わないように）
+#[cfg(windows)]
+pub(crate) fn windows_curl() -> Result<std::path::PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| "curl.exe が見つかりません（SystemRoot が分かりません）".to_string())?;
+    let path = std::path::PathBuf::from(root).join(r"System32\curl.exe");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("curl.exe が見つかりません（{}）", path.display()))
+    }
+}
+
+// curl を 1 回動かす。設定（Cookie・URL・フォーム）は標準入力から渡す。引数には入れない
+fn run_curl(
+    mut curl: Command,
+    proto: &str,
+    url: &str,
+    session: Option<&str>,
+    form: &[(&str, &str)],
+) -> Result<(u16, Vec<String>, String), String> {
+    let mut config = String::new();
+    if let Some(session) = session {
+        config.push_str(&format!(
+            "cookie = {}\n",
+            quote_config(&format!("{ACCOUNT}={session}"))
+        ));
+    }
+    config.push_str(&format!("url = {}\n", quote_config(url)));
+    for (key, value) in form {
+        config.push_str(&format!(
+            "data-urlencode = {}\n",
+            quote_config(&format!("{key}={value}"))
+        ));
+    }
+    let mut child = curl
+        .args([
+            "--silent",
+            "--show-error",
+            "--include",
+            // 状態の JSON の URL の `sids[]` を、curl の範囲の書き方として読ませない
+            "--globoff",
+            "--proto",
+            proto,
+            "--max-time",
+            "30",
+            "--max-filesize",
+            "8000000",
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("curl を起動できません：{error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "curl に渡せません".to_string())?
+        .write_all(config.as_bytes())
+        .map_err(|error| format!("curl に渡せません：{error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("curl が終わりません：{error}"))?;
+    if !output.status.success() {
+        return Err(curl_failure(
+            "AtCoder につながりません",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(split_response(&text))
 }
 
 // ログインのページへの移動か（/login、https://atcoder.jp/login?...）
@@ -1215,10 +1252,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn posts_with_session_and_rotates_cookie() {
         let keychain = TestKeychain::new("post");
         keychain.0.save("old-session").unwrap();
@@ -1263,10 +1296,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn treats_login_redirect_as_logged_out() {
         let keychain = TestKeychain::new("expired");
         keychain.0.save("expired-session").unwrap();
@@ -1288,10 +1317,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn keeps_the_saved_session_until_the_window_is_logged_in() {
         let keychain = TestKeychain::new("confirm");
         keychain.0.save("saved-session").unwrap();
@@ -1300,7 +1325,12 @@ pub(crate) mod tests {
         let (url, server) = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nConnection: close\r\n\r\nvar userScreenName = \"\";\n\n\n\n\n\n",
         );
-        assert!(confirm_session(&client, &url, "anonymous-session").is_err());
+        assert_eq!(
+            confirm_session(&client, &url, "anonymous-session")
+                .err()
+                .as_deref(),
+            Some("ログインしていません。窓でログインしてください")
+        );
         let request = server.join().unwrap();
         assert!(
             request.contains("Cookie: REVEL_SESSION=anonymous-session"),
@@ -1311,7 +1341,12 @@ pub(crate) mod tests {
         let (url, server) = serve_once(
             "HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
-        assert!(confirm_session(&client, &url, "anonymous-session").is_err());
+        assert_eq!(
+            confirm_session(&client, &url, "anonymous-session")
+                .err()
+                .as_deref(),
+            Some("ログインしていません。窓でログインしてください")
+        );
         server.join().unwrap();
         assert_eq!(keychain.0.load().unwrap().as_deref(), Some("saved-session"));
         // ログインしている：窓の値（入れ替えられたら新しい値）を書く
@@ -1326,6 +1361,110 @@ pub(crate) mod tests {
         assert_eq!(keychain.0.load().unwrap().as_deref(), Some("rotated"));
         // 読めない値は送らない
         assert!(confirm_session(&client, &url, "bad value;").is_err());
+    }
+
+    // 段階 3 T6：curl は決まった場所から起動する（Windows では PATH を探さない）
+    #[test]
+    fn starts_curl_from_the_fixed_place() {
+        let curl = curl_command().unwrap();
+        #[cfg(windows)]
+        let expected = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\curl.exe");
+        #[cfg(not(windows))]
+        let expected = std::path::PathBuf::from("/usr/bin/curl");
+        assert_eq!(std::path::Path::new(curl.get_program()), expected);
+    }
+
+    // 段階 3 T6：Cookie は引数に入れず、標準入力の設定だけで渡す。テスト用の子のプログラムを curl の代わりに起動し、
+    // 受け取った引数と標準入力を記録させて見る（資格情報にも通信にも触れない）
+    #[cfg(windows)]
+    #[test]
+    fn passes_the_cookie_only_through_standard_input() {
+        const MARK: &str = "secret-mark-cookie";
+        let path =
+            std::env::temp_dir().join(format!("atcoder-studio-curl-record-{}", std::process::id()));
+        let mut child = Command::new(crate::process::test_child_path());
+        child.arg(format!("record:{}", path.display()));
+        let result = run_curl(
+            child,
+            "=http",
+            "http://127.0.0.1:9/x",
+            Some(MARK),
+            &[("key", "form-value")],
+        );
+        let recorded = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "{result:?}");
+        let recorded = recorded.unwrap();
+        let (args, stdin) = recorded.split_once("\n\n").unwrap();
+        // 引数は、この形だけ（値を含まない）
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "--silent",
+                "--show-error",
+                "--include",
+                "--globoff",
+                "--proto",
+                "=http",
+                "--max-time",
+                "30",
+                "--max-filesize",
+                "8000000",
+                "--config",
+                "-",
+            ]
+        );
+        assert_eq!(
+            stdin,
+            format!(
+                "cookie = \"REVEL_SESSION={MARK}\"\nurl = \"http://127.0.0.1:9/x\"\ndata-urlencode = \"key=form-value\"\n"
+            )
+        );
+    }
+
+    // 段階 3 T6：curl が失敗したときの文に、Cookie の値が出ない（本物の curl を手元の口とつながらない形で動かす）。
+    // curl を起動できないときは、先の確かめで落ちるので、接続を待つ join で止まらない
+    #[test]
+    fn curl_failures_do_not_show_the_cookie_value() {
+        const MARK: &str = "secret-mark-cookie";
+        let keychain = TestKeychain::new("curl-errors");
+        keychain.0.save(MARK).unwrap();
+        let client = keychain.client();
+        // つながらない：手元の口を開いて、すぐ閉じる
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        // 応答を返さずに切る
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer);
+        });
+        let texts = [
+            client.request(&refused, &[]).err().unwrap(),
+            client.request(&silent, &[]).err().unwrap(),
+            // 読めない URL
+            client.request("http://[/", &[]).err().unwrap(),
+            // 許していないプロトコル（テストの Client は http だけ）
+            client.request("https://127.0.0.1:9/", &[]).err().unwrap(),
+            // ログインの確かめの経路（値を保存の前に送る）
+            confirm_session(&client, &refused, MARK).unwrap_err(),
+        ];
+        for text in &texts {
+            // 値が入っていても出力に出さないように、文そのものは出さない
+            assert!(!text.contains(MARK), "エラーの文に値が出ました");
+            assert!(text.contains("curl: ("), "{text}");
+        }
+        server.join().unwrap();
     }
 
     pub(crate) fn decode(text: &str) -> String {

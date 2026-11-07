@@ -175,7 +175,8 @@ fn fetch_public(url: &str) -> Result<String, FetchError> {
     let mut curl = Command::new("/usr/bin/curl");
     // Windows（段階 2 S11）：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
     #[cfg(windows)]
-    let mut curl = crate::process::command(windows_curl().map_err(FetchError::Other)?);
+    let mut curl =
+        crate::process::command(crate::session::windows_curl().map_err(FetchError::Other)?);
     let output = curl
         .args([
             "--silent",
@@ -208,19 +209,6 @@ fn fetch_public(url: &str) -> Result<String, FetchError> {
     }
     String::from_utf8(output.stdout)
         .map_err(|_| FetchError::Other("問題ページを読めません（UTF-8 ではない）".to_string()))
-}
-
-// Windows（段階 2 S11）：Windows に入っている curl.exe の場所。PATH は探さない（同じ名前の別のプログラムを使わないように）
-#[cfg(windows)]
-fn windows_curl() -> Result<PathBuf, String> {
-    let root = std::env::var_os("SystemRoot")
-        .ok_or_else(|| "curl.exe が見つかりません（SystemRoot が分かりません）".to_string())?;
-    let path = PathBuf::from(root).join(r"System32\curl.exe");
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(format!("curl.exe が見つかりません（{}）", path.display()))
-    }
 }
 
 // 空白をまとめて前後を切る

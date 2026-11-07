@@ -30,6 +30,8 @@
 // - crash:access-violation・crash:stack-overflow・crash:abort・crash:panic・crash:divide-by-zero（x86_64 だけ）
 // - exit:N
 // - stdio-kinds:パス … 標準入力・標準出力・標準エラーが null か（Windows だけ）を、パスのファイルに `null other null` の形で書く
+// - record:パス … 最初の手順にする。残りの引数を 1 行に 1 つ、空行、標準入力の全部の順にパスのファイルに書いて 0 で終わる
+//   （残りの引数は手順として読まない。curl の代わりに起動して、渡されたものを見るため。段階 3 T6）
 //
 // 知らない手順・読めない数は、標準エラーに書いて 120 で終わる
 
@@ -141,6 +143,7 @@ fn main() {
             "exit" => std::process::exit(number(value)),
             #[cfg(windows)]
             "stdio-kinds" => stdio_kinds(value),
+            "record" => record(value, &mut input),
             other => fail(&format!("知らない手順 {other}")),
         }
     }
@@ -172,6 +175,22 @@ fn stdio_kinds(path: &str) {
         .collect();
     std::fs::write(path, kinds.join(" "))
         .unwrap_or_else(|error| fail(&format!("{path} を作れません：{error}")));
+}
+
+// 残りの引数と標準入力をファイルに書いて終わる（段階 3 T6）
+fn record(path: &str, input: &mut impl Read) -> ! {
+    let mut text = String::new();
+    for arg in std::env::args().skip(2) {
+        text.push_str(&arg);
+        text.push('\n');
+    }
+    text.push('\n');
+    if let Err(error) = input.read_to_string(&mut text) {
+        fail(&format!("標準入力を読めません：{error}"));
+    }
+    std::fs::write(path, text)
+        .unwrap_or_else(|error| fail(&format!("{path} を作れません：{error}")));
+    std::process::exit(0);
 }
 
 fn fail(message: &str) -> ! {
