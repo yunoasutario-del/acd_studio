@@ -1171,8 +1171,18 @@ pub async fn load_task_list(
 
 // AtCoder のログインの窓を開く（Phase 6 作業 1。D-147・D-148）。開いていれば前に出す。
 // ログインが済んだか・失敗したかは、イベント atcoder-session で main の窓に知らせる
+#[cfg(not(windows))]
 #[tauri::command]
 pub fn atcoder_login(app: AppHandle) -> Result<(), String> {
+    session::open_login_window(&app)
+}
+
+// Windows：同期のコマンドの中で窓を作ると止まる（tauri 2.12.4 の WebviewWindowBuilder::new の Known issues。
+// 段階 3 の T9 で、ログインの窓が真っ白のまま、Rust の側が返事をしなくなった）。
+// async のコマンドにして、IPC の処理とは別のスレッドで窓を作る
+#[cfg(windows)]
+#[tauri::command]
+pub async fn atcoder_login(app: AppHandle) -> Result<(), String> {
     session::open_login_window(&app)
 }
 
