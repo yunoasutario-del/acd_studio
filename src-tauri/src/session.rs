@@ -109,10 +109,15 @@ impl Keychain {
         crate::win::credential_exists(&self.target()).map_err(credential_error)
     }
 
-    // 消す。なかったら false
+    // 消す。なかったら false。消したあとに残っていないかを確かめ、残っていればもう一度消す（段階 3 T5c）
     pub fn delete(&self) -> Result<bool, String> {
         self.refuse_the_real_name("delete");
-        crate::win::credential_delete(&self.target()).map_err(credential_error)
+        let target = self.target();
+        delete_and_confirm(
+            || crate::win::credential_delete(&target),
+            || crate::win::credential_exists(&target),
+            std::thread::sleep,
+        )
     }
 
     // 項目の名前（docs/windows-port-plan.md 4.1）。名前を作るだけで、API は呼ばない
@@ -134,6 +139,42 @@ impl Keychain {
 #[cfg(windows)]
 fn credential_error(code: u32) -> String {
     format!("資格情報マネージャーを使えません（エラー {code}）")
+}
+
+// 消し直しても残っていたときの文（段階 3 T5c）。項目の名前は秘密の値ではない。値とエラーの番号は入れない
+#[cfg(windows)]
+const NOT_DELETED: &str = "セッションを資格情報マネージャーから消せませんでした。もう一度「ログアウト」を押してください。直らないときは、資格情報マネージャーの「Windows 資格情報」の汎用資格情報で io.github.ishigaki892.acdstudio/REVEL_SESSION を消してください";
+
+// 消したあとに残っていないかを見る前の待ち：直後（0）と、その 1 秒後（段階 3 T5c）。
+// 1 秒は、T5b で残った項目を見つけた一番早い時刻（約 1 秒）からの判断で、データから決めた数ではない
+#[cfg(windows)]
+const DELETE_CHECKS: [std::time::Duration; 2] =
+    [std::time::Duration::ZERO, std::time::Duration::from_secs(1)];
+
+// 消して、直後と 1 秒後に残っていないかを見る（T5b で、delete が true を返したあとも項目が残ることがあったため）。
+// 見つかったら 1 回だけ消し直して、すぐに見る。直後に見つかって消し直した場合は、1 秒後の確かめをしない。
+// それでも残っていれば Err(NOT_DELETED)。どちらかの削除で項目を消したら true。
+// 最初の削除が Err なら、待たず、exists も呼ばずに Err。エラーの文はエラーの番号だけ
+#[cfg(windows)]
+fn delete_and_confirm(
+    mut delete: impl FnMut() -> Result<bool, u32>,
+    mut exists: impl FnMut() -> Result<bool, u32>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<bool, String> {
+    let deleted = delete().map_err(credential_error)?;
+    for wait in DELETE_CHECKS {
+        if !wait.is_zero() {
+            sleep(wait);
+        }
+        if exists().map_err(credential_error)? {
+            let deleted_again = delete().map_err(credential_error)?;
+            if exists().map_err(credential_error)? {
+                return Err(NOT_DELETED.to_string());
+            }
+            return Ok(deleted || deleted_again);
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(not(windows))]
@@ -806,8 +847,18 @@ pub(crate) mod tests {
     }
 
     impl Drop for TestKeychain {
+        #[cfg(not(windows))]
         fn drop(&mut self) {
             let _ = self.0.delete();
+        }
+
+        // Windows：消せなかったときは、テスト用の項目の名前だけを出す（値もエラーの文も出さない。panic しない。段階 3 T5c）。
+        // 通ったテストの出力は表示されないので、見えるのはテストが落ちたときと --nocapture のときだけ
+        #[cfg(windows)]
+        fn drop(&mut self) {
+            if self.0.delete().is_err() {
+                eprintln!("テスト用の項目を消せませんでした：{}", self.0.service);
+            }
         }
     }
 
@@ -1109,6 +1160,142 @@ pub(crate) mod tests {
         for text in texts {
             assert!(!text.contains(MARK), "{text}");
             assert!(!text.contains("Keychain"), "{text}");
+        }
+    }
+
+    // 消したあとの確かめ（段階 3 T5c）。資格情報マネージャーには触れない。
+    // 偽の「消す」「あるか見る」「待つ」を渡して、戻り値と、呼ばれた順を見る（待つ関数は記録するだけで、実際には待たない）
+    #[cfg(windows)]
+    mod delete_checks {
+        use super::super::{ACCOUNT, NOT_DELETED, SERVICE, delete_and_confirm};
+
+        fn run(
+            deletes: &[Result<bool, u32>],
+            exists: &[Result<bool, u32>],
+        ) -> (Result<bool, String>, Vec<String>) {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let mut deletes = deletes.iter().copied();
+            let mut exists = exists.iter().copied();
+            let result = delete_and_confirm(
+                || {
+                    calls.borrow_mut().push("delete".to_string());
+                    deletes.next().expect("予定より多く消した")
+                },
+                || {
+                    calls.borrow_mut().push("exists".to_string());
+                    exists.next().expect("予定より多く見た")
+                },
+                |wait| {
+                    calls
+                        .borrow_mut()
+                        .push(format!("sleep {}ms", wait.as_millis()))
+                },
+            );
+            (result, calls.into_inner())
+        }
+
+        fn error(code: u32) -> Result<bool, String> {
+            Err(format!("資格情報マネージャーを使えません（エラー {code}）"))
+        }
+
+        #[test]
+        fn deletes_again_when_the_item_is_still_there_right_after() {
+            // 直後に見つかったら、消し直してすぐに見る。そのあとの 1 秒後の確かめはしない
+            let (result, calls) = run(&[Ok(true), Ok(true)], &[Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(true));
+            assert_eq!(calls, ["delete", "exists", "delete", "exists"]);
+        }
+
+        #[test]
+        fn deletes_again_when_the_item_is_back_after_a_second() {
+            let (result, calls) = run(&[Ok(true), Ok(true)], &[Ok(false), Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(true));
+            assert_eq!(
+                calls,
+                [
+                    "delete",
+                    "exists",
+                    "sleep 1000ms",
+                    "exists",
+                    "delete",
+                    "exists"
+                ]
+            );
+        }
+
+        #[test]
+        fn fails_when_the_item_is_still_there_after_deleting_again() {
+            for (exists, expected_calls) in [
+                (
+                    &[Ok(true), Ok(true)][..],
+                    &["delete", "exists", "delete", "exists"][..],
+                ),
+                (
+                    &[Ok(false), Ok(true), Ok(true)][..],
+                    &[
+                        "delete",
+                        "exists",
+                        "sleep 1000ms",
+                        "exists",
+                        "delete",
+                        "exists",
+                    ][..],
+                ),
+            ] {
+                let (result, calls) = run(&[Ok(true), Ok(true)], exists);
+                assert_eq!(result, Err(NOT_DELETED.to_string()), "{exists:?}");
+                assert_eq!(calls, expected_calls, "{exists:?}");
+            }
+            // 文：項目の名前と、資格情報マネージャーの画面の場所を入れる。Keychain の文字は入れない
+            assert!(NOT_DELETED.contains(&format!("{SERVICE}/{ACCOUNT}")));
+            assert!(NOT_DELETED.contains("「Windows 資格情報」の汎用資格情報"));
+            assert!(!NOT_DELETED.contains("Keychain"));
+        }
+
+        #[test]
+        fn does_not_delete_again_when_the_item_is_gone() {
+            // 最初の削除の戻り値（あったか）をそのまま返す
+            for first in [true, false] {
+                let (result, calls) = run(&[Ok(first)], &[Ok(false), Ok(false)]);
+                assert_eq!(result, Ok(first));
+                assert_eq!(calls, ["delete", "exists", "sleep 1000ms", "exists"]);
+            }
+        }
+
+        #[test]
+        fn returns_true_when_either_delete_removed_the_item() {
+            // 最初の削除が false でも、消し直しが true なら true（どちらかで項目を消したら true）
+            let (result, _) = run(&[Ok(false), Ok(true)], &[Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(true));
+            // 見つかったあと、消し直す前に消えていた（どちらも false）なら false
+            let (result, _) = run(&[Ok(false), Ok(false)], &[Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(false));
+        }
+
+        #[test]
+        fn stops_at_the_first_delete_error() {
+            // 待たず、exists も呼ばずに、エラーの番号だけの文で Err
+            let (result, calls) = run(&[Err(5)], &[]);
+            assert_eq!(result, error(5));
+            assert_eq!(calls, ["delete"]);
+        }
+
+        #[test]
+        fn confirm_errors_are_err_with_the_number_only() {
+            let (result, calls) = run(&[Ok(true)], &[Err(1312)]);
+            assert_eq!(result, error(1312));
+            assert_eq!(calls, ["delete", "exists"]);
+            // 消し直したあとの確かめが Err
+            let (result, calls) = run(&[Ok(true), Ok(true)], &[Ok(true), Err(1312)]);
+            assert_eq!(result, error(1312));
+            assert_eq!(calls, ["delete", "exists", "delete", "exists"]);
+        }
+
+        #[test]
+        fn deleting_again_errors_are_err() {
+            let (result, calls) = run(&[Ok(true), Err(5)], &[Ok(true)]);
+            assert_eq!(result, error(5));
+            assert_eq!(calls, ["delete", "exists", "delete"]);
         }
     }
 
