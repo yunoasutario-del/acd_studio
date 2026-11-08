@@ -1140,6 +1140,15 @@ T7 までの push の CI（run #28、run 42436358152、1fef7e9、2026-11-08）
   - macOS の cargo test：306 通過、0 失敗、0 無視、1 除外。starts_curl_from_the_fixed_place、curl_failures_do_not_show_the_cookie_value、keeps_the_saved_session_until_the_window_is_logged_in、reads_with_the_session_only_after_a_404_when_logged_in は ok
   - Windows の cargo test：360 通過、0 失敗、9 無視、1 除外。tells_to_log_in_without_keychain_on_windows、reads_with_the_session_only_after_a_404_when_logged_in、passes_the_cookie_only_through_standard_input、submits_in_the_contest_period_and_tracks_the_judge は ok
 
+T5c までの push の CI（run #29、run 42474282527、e34aca6、2026-11-08）
+- macos-latest・windows-latest とも success。どちらも全部の段階が success（公開の API で確認）
+- 利用者がログインしたブラウザで見た
+  - macOS の cargo clippy：Compiling と Finished だけで、warning はなかった（目視）
+  - macOS の cargo test：306 通過、0 失敗、0 無視、1 除外（finished in 53.66s）。ほかの test result もすべて ok
+  - Windows の cargo test：368 通過、0 失敗、9 無視、1 除外（finished in 70.27s）。delete_checks の 8 件、saves_loads_and_deletes_in_keychain、stops_a_program_over_the_memory_limit_while_running、stops_a_case_at_the_time_limit を含め、すべて ok
+- CI の Windows の lib のテストは 70.27 秒で、手元（約 42 秒）より長い。手元では順番を持っていた時間の合計が全体の時間とほぼ同じだったので、CI では順番の最長の待ちが手元より長いかもしれない（推測。CI では測っていない）
+- 120 秒の上限との余裕は、T10 で、時間を測るテストが全部と一緒に動かすと落ちやすいことと合わせて、利用者が扱いを決める
+
 秘密の値について守ること
 - AtCoder の Cookie・パスワードなどの秘密の値を、ログ・テストの出力・計画書・コミットに出さない
 - テストは本物の資格情報に触れない名前で行う。資格情報マネージャーに書くテストは、終わったら自分で消す
