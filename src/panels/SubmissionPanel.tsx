@@ -3,6 +3,8 @@
 // その下に、このアプリを起動してから IDE で出した提出を新しい順に並べる（保存しない。履歴は「履歴」タブ）
 import type { ProblemId } from "../ipc/problem";
 import type { SessionView, SubmissionView, SubmitOutcome } from "../ipc/submit";
+import { IS_WINDOWS } from "./logLinks";
+import { logoutTitle } from "./sessionNote";
 
 // 送らなかったときの知らせ。problem は「コードをコピーして公式の提出ページを開く」に使う
 export type SubmitNotice =
@@ -232,7 +234,7 @@ function SubmissionPanel({
             className="case-action"
             title={
               session.loggedIn
-                ? "Keychain のセッションを消します（AtCoder には何も送りません）"
+                ? logoutTitle(IS_WINDOWS)
                 : "AtCoder のログインの窓を開きます（パスワードは IDE に渡りません）"
             }
             onClick={session.loggedIn ? onLogout : onLogin}
