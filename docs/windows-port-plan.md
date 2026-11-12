@@ -1098,7 +1098,7 @@ PR #4 を main に merge した（3a32b0e。2026-11-06 21:12 JST）。CI の結�
 | T1 | 文書 | PR #4 の merge と run #24〜#26 の結果、この表、9.1 の追加 22〜31、4.1 の手順の直し、段階 5 との分担 | — |
 | T2 | URL・フォルダを開く | 新しい open.rs に、問題ページ（problem.rs）・提出のページ（submit.rs）・テンプレートのフォルダ（commands.rs）の 3 か所を移す。**Unix は場所を移すだけで、文は同じ。** Windows は ShellExecuteW。URL は `https://` だけ、フォルダは is_dir のときだけ開く（ShellExecuteW はプログラムも起動できるため） | 先にテストで失敗を確かめる：`https` 以外を断る、ないフォルダを断る、`\\?\` を外す。Unix は open に渡す引数のテストを足し、CI で見る |
 | T3 | テキストファイルを開く | settings.json とスニペットの 2 か所を移す。Windows は 9.1 の追加 28 の順で探し、`\\?\` を外して起動する。標準入出力は null にし、終わるのを待たない（spawn） | 先にテストで失敗を確かめる：一時フォルダで探す順、起動できないときのメモ帳、`\\?\` を外す。起動そのものは T8 で見る |
-| T4 | VS Code のスニペットの場所 | commands.rs:1723-1725（実際に読む場所）と、snippets.rs の見つからないときの文（実際の場所にする）。場所を組み立てる部分はテストできる関数に分ける。Windows は `%APPDATA%\Code\User\snippets`。**Unix は今までと同じ場所を返す形に移すだけ** | 先にテストで失敗を確かめる：場所の組み立てと文。snippets.rs:725 の確かめは OS で分ける |
+| T4 | VS Code のスニペットの場所 | commands.rs:1723-1725（実際に読む場所）と、snippets.rs の見つからないときの文（実際の場所にする）。場所を組み立てる部分はテストできる関数に分ける。Windows は `%APPDATA%\Code\User\snippets`。**Unix は今までと同じ場所を返す形に移すだけ** | 先にテストで失敗を確かめる：場所の組み立てと文。snippets.rs の 725・749 行目（T4 の前の行番号）の確かめは、どちらも OS で分けた（今は `#[cfg(windows)]` と `#[cfg(not(windows))]` の 781〜・808〜 行目付近） |
 | T5 | 資格情報マネージャー | win.rs に CredWriteW・CredReadW・CredDeleteW を足す。session.rs は Unix の `impl Keychain` に cfg(not(windows)) を付け、Windows の `impl` を足す。型の形は変えない。9.1 の追加 23・24 を入れる。problem.rs:718 のテストをテスト用の名前に変える。saves_loads_and_deletes_in_keychain の ignore を外す。テストの順番の仕組み（9.1 の追加 32）を入れる | 先にテストで失敗を確かめる：書く・読む・消す、2560／2561 バイト、エラーの文に値が出ない。追加 24 の仕組みは外すと落ちることも確かめ、戻したことを見せる。そのあと、絞った一覧（9.1 の追加 29）でテストの項目が残っていないことを見せる |
 | push | T5 までを push（9.1 の追加 27） | 利用者の許可を得てから。push の前に、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる | CI の Windows で資格情報を書けるか（未確認）。macOS が壊れていないか |
 | T6 | session.rs を curl.exe に（9.1 の追加 22） | windows_curl を session.rs に移し、process::command で起動する。Unix は cfg を付けるだけ。session の残り 3 件と submit の 8 件の ignore を外す。落ちるものは 9.1 の追加 26 のとおりに扱う。T6 のあとに、テストの順番の実際の待ち時間を測って報告する（9.1 の追加 32） | 先に ignore を外して失敗を確かめる。日本語と CRLF を含む `--config -` の送信は posts_with_session_and_rotates_cookie で見る |
@@ -1125,7 +1125,7 @@ T6 の結果（2026-11-08）
 - `--nocapture` の出力に、テストの偽の Cookie の値と `REVEL_SESSION=` は 5 回とも 0 件だった
 - 未確認：コンソールの窓が出ないこと（CREATE_NO_WINDOW はテストでは守られていない）。release の画面で確かめる（T8）
 - 止まるおそれ（推測。動かしていない）：problem.rs の windows_curl_reports_404_in_the_same_words の join は、curl.exe が接続できないと待ち続ける
-- 未確認（推測）：curl は既定で .curlrc を読むので、そこに書いた設定（プロキシや通信の記録など）が Cookie の入った要求にも効くかもしれない。今このマシンにはない。Unix の引数も同じ関数なので T6 では変えていない。--disable を付けるかどうかは T10 で利用者が決める
+- 未確認（推測）：curl は既定で .curlrc を読むので、そこに書いた設定（プロキシや通信の記録など）が Cookie の入った要求にも効くかもしれない。今このマシンにはない。Unix の引数も同じ関数なので T6 では変えていない。--disable を付けるかどうかは T10 で利用者が決める（→ T10 で、Windows だけ付けた。e67e9f5。「段階 3 の結果」）
 - 日本語と CRLF を含む --config - の送信は、posts_with_session_and_rotates_cookie で確かめた（Windows で通過）
 
 T7 の結果（2026-11-08）
@@ -1147,7 +1147,7 @@ T5c までの push の CI（run #29、run 42474282527、e34aca6、2026-11-08）
   - macOS の cargo test：306 通過、0 失敗、0 無視、1 除外（finished in 53.66s）。ほかの test result もすべて ok
   - Windows の cargo test：368 通過、0 失敗、9 無視、1 除外（finished in 70.27s）。delete_checks の 8 件、saves_loads_and_deletes_in_keychain、stops_a_program_over_the_memory_limit_while_running、stops_a_case_at_the_time_limit を含め、すべて ok
 - CI の Windows の lib のテストは 70.27 秒で、手元（約 42 秒）より長い。手元では順番を持っていた時間の合計が全体の時間とほぼ同じだったので、CI では順番の最長の待ちが手元より長いかもしれない（推測。CI では測っていない）
-- 120 秒の上限との余裕は、T10 で、時間を測るテストが全部と一緒に動かすと落ちやすいことと合わせて、利用者が扱いを決める
+- 120 秒の上限との余裕は、T10 で、時間を測るテストが全部と一緒に動かすと落ちやすいことと合わせて、利用者が扱いを決める（→ 決めたことは 9.1 の追加 36 と「段階 3 の結果」）
 
 ログインの窓の直しまでの push の CI（run #30、run 42481454386、19ab805、2026-11-08）
 - macos-latest・windows-latest とも success。どちらも全部の段階が success（公開の API で確認）
@@ -1387,6 +1387,117 @@ T8 で扱うこと（ログインの窓のメニュー。2026-11-08 に気づい
 - 未確認（段階 5 で確かめる）：Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン
 - ダイアログが出たときに Enter を押すと『提出する』が選ばれるかもしれない（推測。rfd 0.16.0 の nDefaultButton: 0 と、ボタンの並びから。動かしていない）。段階 3 の版では、ダイアログが出ても Enter を押さない
 
+### 段階 3 の結果（2026-11-12）
+
+ブランチ windows-port-stage3（main の 3a32b0e から）。main からのコミットは、e67e9f5 までで 15 個と、このまとめの 1 個。
+origin/windows-port-stage3 には 19ab805 まで push してある。このまとめを書いた時点で、1f08095・a1b5d9c・35aac85・e67e9f5 とこのまとめは
+まだ push していない（push は、秘密の値の調べと利用者の許可のあと。--force なし）。
+最後の確かめ（Windows、AC 電源、e67e9f5 と同じ中身。2026-11-12）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、
+cargo test 370 通過・0 失敗・10 無視（41.82 秒）、npm test 11 通過・0 失敗、npm run build 通過（塊の大きさの警告は前からのもの。
+JS は約 1,370 kB で、T1 のころの記録にも同じ警告がある）。一つひとつの直し方・直す前の失敗・測った値は、上の段階 3 の各節と
+コミットのメッセージにある
+
+コミット（並びはコミットの順）
+
+| 順 | コミット | 入れたもの |
+| --- | --- | --- |
+| T1 | 1ea48ae | この文書（段階 3 の計画、段階 2 の merge と CI の結果） |
+| T2 | 4795218 | URL とフォルダを開く処理を open.rs にまとめ、Windows では ShellExecuteW で開く |
+| T3 | 8e7493a | settings.json とスニペットを開く処理を open.rs に移し、Windows では VS Code かメモ帳で開く |
+| T4 | 44f53e3 | VS Code のスニペットを読む場所を、Windows では %APPDATA% にする |
+| T5 | 866848a | ログインの値を、Windows では資格情報マネージャーに置く。テストの順番の仕組み |
+| T6 | 8ea46d6 | session.rs の curl を、Windows では curl.exe にする。Cookie は標準入力で渡す |
+| T7 | 1fef7e9 | 問題の取得の 404 のあとに、Windows でもログインして読み直す |
+| T5b | a8c4004 | 資格情報の重なりの切り分けの結果と判断（文書） |
+| T5c | e34aca6・b3c2eaa | Windows でセッションを消したあとに確かめ、残っていればもう一度消す。run #29 の結果（文書） |
+| T9 | 19ab805・1f08095 | Windows でログインの窓を async のコマンドから作る。本物のログインの結果（文書） |
+| T8 | a1b5d9c・35aac85 | 「ログアウト」のボタンの説明を Windows の文にする。画面の確かめの結果（文書） |
+| T10 | e67e9f5・このまとめ | Windows の curl.exe に --disable を付ける。このまとめ |
+
+push と CI（どれも利用者の許可を得て push した。中身は上の各節）
+
+| run | id | コミット | 結果 |
+| --- | --- | --- | --- |
+| （番号は控えていない） | 42378818906 | 866848a（T5 まで） | macos-latest・windows-latest とも success |
+| #28 | 42436358152 | 1fef7e9（T7 まで） | 利用者がブラウザで見た。両方の OS で cargo test は 0 失敗 |
+| #29 | 42474282527 | e34aca6（T5c まで） | macos-latest・windows-latest とも success。Windows の lib のテストは 70.27 秒 |
+| #30 | 42481454386 | 19ab805（ログインの窓の直しまで） | macos-latest・windows-latest とも success。Windows の lib のテストは 67.24 秒 |
+
+- 1f08095 からあとの push の CI の結果は、段階 2 のときと同じく、次の段階の最初の文書のコミットで残す。PR を作る前に、利用者がブラウザで CI を見る
+
+T10 で決めたこと（9.1 の追加 36。2026-11-11）
+
+- 時間を測るテスト：コードは変えず、既知の問題として残す。手元で落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する。
+  **CI で 1 回でも落ちたら、2 件を ignore にして CI で 1 件ずつ別に動かす案を考える**（ci.yml は両方の OS で同じなので、その案は Unix の経路も変える）
+  - 今の数字：T5c のあとの全部の cargo test は、T10 の段取りのときまでで 12 回、落ちたのは 3 回（計測の 5 回中 2 回、いつもの確かめの 7 回中 1 回）。
+    T10 のいつもの確かめの 2 回（2026-11-11・11-12）はどちらも通ったので、合わせて 14 回中 3 回。1 件ずつ動かすと 10 回とも通った。
+    CI では run #27 の見込みの 42378818906 から #30 まで、全部が通っている。原因は未確認のまま
+- テストの順番の待ちの上限（120 秒）：変えない。テストは全体が動いている間にしか待てないので、最長の待ちは lib のテストの全体の時間を超えない。
+  CI の Windows は 67〜70 秒なので、120 秒まで少なくとも約 50 秒の余裕がある（CI での実際の待ちは測っていない）。
+  資格情報のテストが 1 つ増えるごとに約 1 秒増える。通信が止まると、curl の --max-time（1 回 30 秒）の分も増える。
+  上限に届いたときは、止まり続けるのではなく、panic する。文は session.rs の「資格情報のテストの順番を {:?} 待っても取れません」
+  （{:?} の所には上限の時間が入る。実際に出る時間の表記は未確認）。
+  **CI の Windows の lib のテストが 100 秒を超えたら、またはこの panic が出たら考え直す**
+
+T10 の --disable（e67e9f5。2026-11-12）
+
+- Windows の curl.exe を起動する Command は、session.rs の windows_curl_command だけが作り、最初の引数に --disable を付ける（--disable は最初の引数でないと効かない）。
+  Cookie を渡す経路（curl_command から run_curl）と、問題の取得（problem.rs の fetch_public の Windows の分岐）の両方が、これを使う。
+  windows_curl は pub(crate) を外し、ほかのファイルから --disable のない curl を作れないようにした
+- テスト（Windows だけ）：最初の引数が --disable であること（fetch_public の経路はこれで守る）と、Cookie を渡す経路で、本物の curl.exe が
+  .curlrc のヘッダーを手元のサーバーに送らないこと（CURL_HOME は、そのテストの Command にだけ渡す。値は偽のもの）。
+  直す前の失敗、外して落ちる確かめ（--disable を消す、--disable を最初でない位置に置く）は、コミットのメッセージにある
+- passes_the_cookie_only_through_standard_input の引数の一覧は変えていない（テスト用の子を run_curl に直接渡すので、--disable は一覧に出ない）
+- 画面の確かめ（2026-11-12。利用者が操作した）：e67e9f5 から作った release の exe（2026-11-12 19:03:04。10,104,832 バイト。
+  `npm run tauri build -- --no-bundle`、AC 電源）を、エクスプローラーから起動した。ログインも提出もしていない。t1 の src/main.rs（結び付いている問題は abc401_a）を開き、
+  問題名の右の「…」→「再取得」を 1 回押した。同じ問題文がまた出て、黒いコンソールの窓は出なかった。ほかに気付いたことはなかった
+- exe の大きさは、作り直す前の exe（2026-11-10 20:18:59 のもの）と同じ 10,104,832 バイトだった。新しい exe の中に `--disable` の文字は 2 か所ある
+  （前の exe は上書きしたので、前の数とは比べていない。どれが今回の分かも見分けていない）
+- このマシンには、.curlrc も _curlrc もない（T10 の段取りのときに確かめた）
+
+macOS / Unix の経路を変えた所（cfg・属性を付ける以外の変更。各コミットの差分のファイルの一覧と照らした。中身の説明は、コミットのメッセージと
+そのときの報告から。どの行も、Unix の動きは同じ見込み。手元の Mac では何も確かめていない。確かめは CI の macos-latest）
+
+| コミット | ファイル | Unix で変えた所 | Unix の動き |
+| --- | --- | --- | --- |
+| 4795218（T2） | problem.rs・submit.rs・commands.rs・open.rs | `/usr/bin/open` の呼び出し（URL 2 か所、フォルダ 1 か所）を open.rs に移した。submit.rs の open_in_browser は消した | 同じ（引数・文は同じ） |
+| 4795218（T2） | lib.rs | `mod open;` を足した | 同じ |
+| 4795218（T2） | trust.rs | without_verbatim を pub(crate) にした | 同じ（中身は同じ） |
+| 8e7493a（T3） | commands.rs・open.rs | テキストファイル（settings.json・スニペット）を開く処理を open.rs に移した | 同じ（`open -t` は同じ） |
+| 44f53e3（T4） | snippets.rs・commands.rs | 場所を組み立てる関数（unix_vscode_source など）に分けた。テストの確かめ 2 か所を OS で分けた | 同じ（場所と文は同じ） |
+| 866848a（T5） | session.rs・problem.rs | Unix の `impl Keychain` に cfg を付けた。TestKeychain::new の形を変えた。problem.rs のテスト 1 件を、テスト用の名前（TestKeychain）で動かす形にした | 同じ（Keychain の処理は同じ。テストの形だけ） |
+| 8ea46d6（T6） | session.rs・problem.rs | `send` の本体を run_curl に移し、起動するものを curl_command に分けた。テスト 2 か所を、期待する文と比べる形にした | 同じ（起動するものと引数は同じ） |
+| 8ea46d6（T6） | examples/test_child.rs | テスト用の手順 record を足した（Unix でもコンパイルされる。テストの補助だけ。使うテストは Windows だけ） | 同じ |
+| 1fef7e9（T7） | problem.rs | with_session_fallback の 404 の腕の cfg を外した | 同じ（処理と文字は同じ） |
+| e34aca6（T5c） | session.rs | テストの TestKeychain の Drop に cfg を付けた | 同じ |
+| 19ab805 | commands.rs | atcoder_login に cfg(not(windows)) を付けた | 同じ（中身は同じ） |
+| a1b5d9c（T8） | SubmissionPanel.tsx・sessionNote.ts | 「ログアウト」のボタンの説明の文を sessionNote.ts に移した。tests/sessionNote.test.ts を足した（npm test は macOS でも動く） | 同じ（文字は同じ） |
+| e67e9f5（T10） | problem.rs・session.rs | Unix の経路は変えていない（足したのは cfg(windows) の中と、説明の行） | 同じ |
+
+ほか（Unix のコードは変えていない）：Cargo.toml は windows-sys（Windows だけの依存）の feature を足しただけ（T2・T5）。win.rs は Windows だけのファイル。
+examples/test_child.rs の stdio-kinds（T3）は cfg(windows) の中。submit.rs の T6 の変更は、Windows のテストの ignore を外しただけ。ci.yml は段階 3 で変えていない
+
+残る未確認（段階 3 のまとめ）
+
+- **段階 5（提出）で確かめるもの**：
+  - 提出のページを画面で開くこと、実際の提出と提出の前の検査
+  - 「ログアウト」のボタンの説明文を画面で見ること（ログイン中にしか出ない）
+  - 壊れた値でログインのページへ移されて項目が消えること、Cookie の入れ替えで項目が書き換わること（本物では確かめていない。単体テストは通っている）
+  - 確認のダイアログ（Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter で選ばれるボタン）
+  - Cookie を渡す経路（--disable の付いた curl.exe）を、本物のログインの画面で確かめること（T10 のテストは手元のサーバーと偽の値。画面で確かめたのは、ログインなしの「再取得」だけ。
+    T9 の本物のログインは --disable を付ける前の exe）
+- **InPrivate（T9 の手順 A）**：値が暗号にされた形で残るか、アプリのフォルダの外の一時の場所、フォームの自動入力の既定値
+- **原因・仕組みが分からないもの**：
+  - テストのあとに消したはずの資格情報の項目が残ることがある仕組み（T5・T5b。T5c で確かめて消し直す形にした）
+  - 時間を測るテストが、全部のテストと一緒に動かすとときどき落ちる原因（上の「T10 で決めたこと」）
+  - settings.json を VS Code で開いたときに 1 回だけ出た注意を、VS Code と Windows のどちらが出したか（T8）
+- **画面で見ていないもの**：「詳細」のボタン（提出がないと出ない）、ログインの窓のメニューの項目を押したときの動き
+- **CI で測っていないもの**：CI の Windows での、テストの順番の実際の待ち時間
+- **macOS**：
+  - macOS の curl には --disable が付かないままで、手元の .curlrc が Cookie の入った要求に効くかもしれない（推測。Unix は変えないと決めた）
+  - macOS の画面と、Keychain を他のプログラムが読めるかどうか（手元に Mac がない）
+- インストーラー（nsis）で入れた exe での動き（段階 3 も、画面の確かめは target\release の exe で行った）
+
 ### 段階 4：LSP（補完・診断）
 
 何を変えるか
@@ -1522,6 +1633,7 @@ T8 で扱うこと（ログインの窓のメニュー。2026-11-08 に気づい
 | 追加 33（2026-11-07） | 本番のコードは T5 では変えない。T7 と T9 の間に T5b を置き、save が前の値に戻るかの切り分けと、ログアウトのあとに読み直してもう一度消す形を足すかの判断をする | 段階 3（T5b） |
 | 追加 34（2026-11-08） | T5b の判断：ログアウトのあとに確かめて、残っていればもう一度消す形を足す（先に案を報告し、決まってから別のコミットでコードを書く）。session.rs:364 の save は今は変えず、T9 のあとにもう一度判断する。session.rs:368 の `let _ =` は今は変えない（詳しくは「段階 3 の既知の問題」の「T5b の切り分け」） | 段階 3（T5b のあと） |
 | 追加 35（2026-11-08） | T5c で決めたこと：Windows の Keychain::delete で、消したあと直後と 1 秒後に確かめ、見つかったら 1 回だけ消し直し、それでも残れば NOT_DELETED の Err にする（1 秒はデータから決めた数ではない）。TestKeychain の Drop は、Windows で Err のときにテスト用の項目の名前だけを出す。時間を測るテストは上限を広げず、落ちた原因は未確認のまま（詳しくは「段階 3 の既知の問題」の「T5c の結果」の節） | 段階 3（T5c） |
+| 追加 36（2026-11-11） | T10 で決めたこと。(1) 時間を測るテスト（stops_a_case_at_the_time_limit・stops_a_program_over_the_memory_limit_while_running）は、コードを変えず、既知の問題として残す。手元で落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する。CI で 1 回でも落ちたら、2 件を ignore にして CI で 1 件ずつ別に動かす案を考える。(2) テストの順番の待ちの上限（120 秒）は変えない。CI の Windows の lib のテストが 100 秒を超えたら、または順番の panic（session.rs の「資格情報のテストの順番を {:?} 待っても取れません」。{:?} の所に実際に出る時間の表記は未確認）が出たら考え直す。(3) curl の --disable は Windows だけ付ける。Unix は変えない | 段階 3（T10） |
 
 ---
 
@@ -1562,7 +1674,9 @@ T8 で扱うこと（ログインの窓のメニュー。2026-11-08 に気づい
 - macOS の S7（Python）・S8（C++）の経路が CI で本当に動いたか（g++-15・python3.13 がなければテストは自分で飛ぶ。runner に何が入っているかは未確認）。
   段階 2 の全体は run #23（e800d5d）で通り、S10b とその直しのテスト、対話テスト、npm test は macos-latest のログで確認済み（「段階 2 の結果」）
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
-- 段階 3 で確かめること：残りなし（ShellExecuteW を COM の初期化なしで呼んで URL とフォルダを開けることは T8 で確認済み。提出の処理を始めずに提出のページを開ける経路がないことは T8 でコードで確認済み。InPrivate と on_navigation の制限のもとでログインが通ること〔Turnstile が出たかは記録していない〕と、cookies() が WebView2 で REVEL_SESSION を返すこと〔HttpOnly かは見ていない〕は T9 で、CI の Windows で資格情報を書けることは run 42378818906 で確認済み。アプリが記録をファイルに書かないことは T9 の前にコードで確認済み）
+- 段階 3 で確かめること：残りなし（ShellExecuteW を COM の初期化なしで呼んで URL とフォルダを開けることは T8 で確認済み。提出の処理を始めずに提出のページを開ける経路がないことは T8 でコードで確認済み。InPrivate と on_navigation の制限のもとでログインが通ること〔Turnstile が出たかは記録していない〕と、cookies() が WebView2 で REVEL_SESSION を返すこと〔HttpOnly かは見ていない〕は T9 で、CI の Windows で資格情報を書けることは run 42378818906 で確認済み。アプリが記録をファイルに書かないことは T9 の前にコードで確認済み）。あとの段階へ残したものは「段階 3 の結果」の「残る未確認」にある
+- curl の .curlrc：Windows の curl.exe は --disable で読まない（段階 3 T10。テストで確認済み）。macOS の curl には付けていない（.curlrc が Cookie の入った要求に効くかは推測のまま）。
+  Cookie を渡す経路を --disable の付いた exe で本物のログインの画面で確かめることは、段階 5
 - テストのあとに消したはずの項目が残ったことがある（原因は未確認。段階 3 T5。T9 の手順 C〔ログアウトで消える〕で、この点も確かめる。分かったことは「段階 3 の既知の問題」の節。T5b でも、重ねた側の項目が delete のあとに残ることを 150 回中 9 回確かめた。仕組みは未確認。T9 では、本物のログアウトのあと、直後・1 分後・起動し直したあとの 3 回とも項目はなかった）
 - 段階 5 で確かめること：確認のダイアログの Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン（『提出する』が選ばれるかもしれない。推測。rfd 0.16.0 の nDefaultButton: 0 と、ボタンの並びから。動かしていない）、提出のページを画面で開くこと、「ログアウト」のボタンの説明文を画面で見ること（ログイン中にしか出ない）
 - macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709。段階 2 は run 42210961555〕。clippy の警告は run 42210961555 のログで 0 件。debugs_with_real_lldb_dap と画面の操作は macOS の機械で確かめる。利用者の手元に Mac がないので、macOS の画面は確かめていない）
