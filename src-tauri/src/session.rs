@@ -446,13 +446,23 @@ fn curl_command() -> Result<Command, String> {
 // Windows：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
 #[cfg(windows)]
 fn curl_command() -> Result<Command, String> {
-    Ok(crate::process::command(windows_curl()?))
+    windows_curl_command()
+}
+
+// Windows の curl.exe を起動する Command（段階 3 T10）。手元の .curlrc（プロキシや通信の記録など）を読まない。
+// --disable は最初の引数でないと効かないので、ほかの引数より先にここで付ける。問題の取得（problem.rs）もこれを使う
+#[cfg(windows)]
+pub(crate) fn windows_curl_command() -> Result<Command, String> {
+    let mut curl = crate::process::command(windows_curl()?);
+    curl.arg("--disable");
+    Ok(curl)
 }
 
 // Windows（段階 2 S11。段階 3 T6 で problem.rs から移した）：Windows に入っている curl.exe の場所。
-// PATH は探さない（同じ名前の別のプログラムを使わないように）
+// PATH は探さない（同じ名前の別のプログラムを使わないように）。
+// 段階 3 T10：ほかのファイルからは windows_curl_command を使う（--disable のない curl を作らないように、pub にしない）
 #[cfg(windows)]
-pub(crate) fn windows_curl() -> Result<std::path::PathBuf, String> {
+fn windows_curl() -> Result<std::path::PathBuf, String> {
     let root = std::env::var_os("SystemRoot")
         .ok_or_else(|| "curl.exe が見つかりません（SystemRoot が分かりません）".to_string())?;
     let path = std::path::PathBuf::from(root).join(r"System32\curl.exe");
@@ -1562,6 +1572,46 @@ pub(crate) mod tests {
         assert_eq!(std::path::Path::new(curl.get_program()), expected);
     }
 
+    // 段階 3 T10：Windows の curl.exe は、手元の .curlrc を読まない。--disable は最初の引数でないと効かない。
+    // 問題の取得（problem.rs の fetch_public）も同じ関数で起動するので、この確かめで守る
+    #[cfg(windows)]
+    #[test]
+    fn disable_curlrc_is_the_first_argument() {
+        let curl = windows_curl_command().unwrap();
+        assert_eq!(
+            curl.get_args().next(),
+            Some(std::ffi::OsStr::new("--disable"))
+        );
+    }
+
+    // 段階 3 T10：Cookie を渡す経路（curl_command から run_curl）で、本物の curl.exe が .curlrc を読まない。
+    // CURL_HOME は、ほかのテストに影響しないように、この Command にだけ渡す。値は偽のもの。通信は手元の口だけ
+    #[cfg(windows)]
+    #[test]
+    fn disable_curlrc_on_the_cookie_path() {
+        let dir =
+            std::env::temp_dir().join(format!("atcoder-studio-curlrc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".curlrc"), "header = \"X-T10-Curlrc: marker\"\n").unwrap();
+        let (url, server) =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let mut curl = curl_command().unwrap();
+        curl.env("CURL_HOME", &dir);
+        let result = run_curl(curl, "=http", &url, Some("fake-value"), &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // curl が応答を受け取っていれば、サーバーは接続を受けて終わっているので、join で待ち続けない
+        assert!(result.is_ok(), "{:?}", result.err());
+        let received = server.join().unwrap();
+        assert!(
+            received.contains("REVEL_SESSION=fake-value"),
+            "Cookie が届いていません"
+        );
+        assert!(
+            !received.contains("X-T10-Curlrc"),
+            ".curlrc の設定が効いています"
+        );
+    }
+
     // 段階 3 T6：Cookie は引数に入れず、標準入力の設定だけで渡す。テスト用の子のプログラムを curl の代わりに起動し、
     // 受け取った引数と標準入力を記録させて見る（資格情報にも通信にも触れない）
     #[cfg(windows)]
@@ -1584,7 +1634,8 @@ pub(crate) mod tests {
         assert!(result.is_ok(), "{result:?}");
         let recorded = recorded.unwrap();
         let (args, stdin) = recorded.split_once("\n\n").unwrap();
-        // 引数は、この形だけ（値を含まない）
+        // 引数は、この形だけ（値を含まない）。--disable は windows_curl_command が先に付けるので、
+        // run_curl が足す引数だけを見るここには出ない（disable_curlrc_is_the_first_argument で見る）
         assert_eq!(
             args.lines().collect::<Vec<_>>(),
             [

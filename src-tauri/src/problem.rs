@@ -160,10 +160,10 @@ fn fetch_public(url: &str) -> Result<String, FetchError> {
     wait_for_interval();
     #[cfg(not(windows))]
     let mut curl = Command::new("/usr/bin/curl");
-    // Windows（段階 2 S11）：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
+    // Windows（段階 2 S11）：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）。
+    // 段階 3 T10：手元の .curlrc を読まないように、最初の引数に --disable が付いた Command を使う
     #[cfg(windows)]
-    let mut curl =
-        crate::process::command(crate::session::windows_curl().map_err(FetchError::Other)?);
+    let mut curl = crate::session::windows_curl_command().map_err(FetchError::Other)?;
     let output = curl
         .args([
             "--silent",
