@@ -6,9 +6,11 @@
 // - ファイル：2 つのパスが同じもの（同じボリュームの同じファイルの番号）か。Unix の dev・ino にあたる。
 //   止めた直後のビルドの前に、exe が書けるようになるまで待つ（S3b）
 // - 時刻：UNIX 時刻（ミリ秒）を手元の時刻の月・日・時・分にする（Unix の localtime_r にあたる）
+// - 開く：ShellExecuteW で URL・フォルダを既定のアプリで開く（段階 3 T2。渡す前の確かめは open.rs）
+// - 資格情報マネージャー：CredWriteW・CredReadW・CredDeleteW（段階 3 T5。値は session.rs が扱い、ここでは値を文字にしない）
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{OsStr, OsString, c_void};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
@@ -17,8 +19,12 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
-    STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, ERROR_NOT_FOUND, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, STILL_ACTIVE, SYSTEMTIME, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Security::Credentials::{
+    CRED_MAX_CREDENTIAL_BLOB_SIZE, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW,
+    CredDeleteW, CredFree, CredReadW, CredWriteW,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
@@ -47,6 +53,26 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+// target を既定のアプリで開く（段階 3 T2）。ShellExecuteW の戻り値をそのまま返す（32 以下は失敗。判定は open.rs）。
+// プログラムも起動できる関数なので、渡すものは open.rs で確かめる
+pub fn shell_open(target: &OsStr) -> isize {
+    let verb = wide(Path::new("open"));
+    let target = wide(Path::new(target));
+    // SAFETY: 終わりに 0 の付いた UTF-16 の文字列を渡す。窓・引数・作業フォルダは指定しない（null）
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        ) as isize
+    }
+}
 
 // 開いたハンドル。捨てるときに閉じる
 struct Handle(HANDLE);
@@ -722,6 +748,138 @@ pub fn registry_string(root: RegistryRoot, subkey: &str, value: Option<&str>) ->
         .position(|unit| *unit == 0)
         .unwrap_or(buffer.len());
     Some(OsString::from_wide(&buffer[..length]))
+}
+
+// ---- 資格情報マネージャー ----
+
+// 値の大きさの上限（バイト）
+pub const CREDENTIAL_BLOB_LIMIT: usize = CRED_MAX_CREDENTIAL_BLOB_SIZE as usize;
+
+// テストのビルドでは、名前に .test- のないものには API を呼ばない（session.rs の refuse_the_real_name の、もう 1 段の守り）
+#[cfg(test)]
+fn refuse_non_test_target(target: &str) {
+    assert!(
+        target.contains(".test-"),
+        "テストから、テスト用でない名前の資格情報に触れようとしました"
+    );
+}
+
+#[cfg(not(test))]
+fn refuse_non_test_target(_target: &str) {}
+
+// CredReadW が返したもの。捨てるときに、失敗の経路も含めて必ず CredFree する
+struct Credential(*mut CREDENTIALW);
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        // SAFETY: CredReadW が返した、まだ解放していないものを 1 回だけ解放する
+        unsafe { CredFree(self.0 as *const c_void) }
+    }
+}
+
+impl Credential {
+    fn blob(&self) -> Vec<u8> {
+        // SAFETY: CredReadW が返したものは、CredFree するまで読める
+        unsafe {
+            let credential = &*self.0;
+            if credential.CredentialBlob.is_null() || credential.CredentialBlobSize == 0 {
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(
+                credential.CredentialBlob,
+                credential.CredentialBlobSize as usize,
+            )
+            .to_vec()
+        }
+    }
+}
+
+// 項目がなければ Ok(None)。ほかのエラーは番号を返す
+fn read_credential(target: &str) -> Result<Option<Credential>, u32> {
+    refuse_non_test_target(target);
+    let name = wide(Path::new(target));
+    let mut found = std::ptr::null_mut();
+    // SAFETY: 終わりに 0 の付いた UTF-16 の名前と、結果の書き込み先を渡す
+    if unsafe { CredReadW(name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut found) } != 0 {
+        return Ok(Some(Credential(found)));
+    }
+    // SAFETY: 引数はない
+    match unsafe { GetLastError() } {
+        ERROR_NOT_FOUND => Ok(None),
+        code => Err(code),
+    }
+}
+
+// target の値を blob にする（なければ作り、あれば置き換える）。エラーは番号だけを返す
+pub fn credential_write(target: &str, user_name: &str, blob: &[u8]) -> Result<(), u32> {
+    refuse_non_test_target(target);
+    let mut name = wide(Path::new(target));
+    let mut user = wide(Path::new(user_name));
+    let credential = CREDENTIALW {
+        Flags: 0,
+        Type: CRED_TYPE_GENERIC,
+        TargetName: name.as_mut_ptr(),
+        Comment: std::ptr::null_mut(),
+        LastWritten: FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        },
+        CredentialBlobSize: blob.len() as u32,
+        // API は読むだけ（CREDENTIALW の形が *mut を求める）
+        CredentialBlob: blob.as_ptr() as *mut u8,
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        AttributeCount: 0,
+        Attributes: std::ptr::null_mut(),
+        TargetAlias: std::ptr::null_mut(),
+        UserName: user.as_mut_ptr(),
+    };
+    // SAFETY: 中のポインタは、この呼び出しの間生きている
+    if unsafe { CredWriteW(&credential, 0) } != 0 {
+        return Ok(());
+    }
+    // SAFETY: 引数はない
+    Err(unsafe { GetLastError() })
+}
+
+// target の値。項目がなければ None
+pub fn credential_read(target: &str) -> Result<Option<Vec<u8>>, u32> {
+    Ok(read_credential(target)?.map(|credential| credential.blob()))
+}
+
+// target があるか。API は値も返すが、写さずにすぐ解放する
+pub fn credential_exists(target: &str) -> Result<bool, u32> {
+    Ok(read_credential(target)?.is_some())
+}
+
+// target を消す。項目がなければ false
+pub fn credential_delete(target: &str) -> Result<bool, u32> {
+    refuse_non_test_target(target);
+    let name = wide(Path::new(target));
+    // SAFETY: 終わりに 0 の付いた UTF-16 の名前を渡す
+    if unsafe { CredDeleteW(name.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0 {
+        return Ok(true);
+    }
+    // SAFETY: 引数はない
+    match unsafe { GetLastError() } {
+        ERROR_NOT_FOUND => Ok(false),
+        code => Err(code),
+    }
+}
+
+// テストだけ：項目の UserName と Persist
+#[cfg(test)]
+pub(crate) fn credential_user_and_persist(target: &str) -> Option<(String, u32)> {
+    let credential = read_credential(target).ok()??;
+    // SAFETY: CredReadW が返したものは、CredFree するまで読める。UserName は終わりに 0 の付いた UTF-16
+    unsafe {
+        let found = &*credential.0;
+        let mut length = 0;
+        while *found.UserName.add(length) != 0 {
+            length += 1;
+        }
+        let user = String::from_utf16_lossy(std::slice::from_raw_parts(found.UserName, length));
+        Some((user, found.Persist))
+    }
 }
 
 // ---- ファイル ----

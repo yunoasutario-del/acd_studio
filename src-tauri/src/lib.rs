@@ -10,6 +10,7 @@ mod interactive;
 mod language;
 mod lsp;
 mod menu;
+mod open;
 mod problem;
 mod process;
 mod python;

@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(any(not(windows), test))]
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -19,8 +20,6 @@ use dom_query::Document;
 use serde::{Deserialize, Serialize};
 
 use crate::session::Client;
-// Windows では、ログインして読み直す道を通らないので使わない（段階 2 S11）
-#[cfg_attr(windows, allow(unused_imports))]
 use crate::session::NOT_LOGGED_IN;
 use crate::storage;
 
@@ -116,11 +115,7 @@ fn is_not_found(stderr: &str) -> bool {
     stderr.contains("returned error: 404")
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 const NOT_FOUND_LOGGED_OUT: &str = "ページが見つかりません（404）。開催中のコンテストの問題は、AtCoder にログインしていないと読めません。「提出結果」タブの「ログイン」からログインしてください";
-// Windows（段階 2 S11）：ログイン（Keychain の代わりの資格情報マネージャー）は段階 3 で入れるので、それまではログインを勧めない
-#[cfg(windows)]
-const NOT_FOUND_LOGIN_UNAVAILABLE: &str = "ページが見つかりません（404）。開催中のコンテストの問題は、AtCoder にログインしていないと読めません。Windows 版では、まだログインできません";
 
 // 公開されているページを取得する。ログインなしで 404 なら、ログインしているときだけセッションを付けてもう 1 回読む（D-149）
 fn fetch(url: &str) -> Result<String, String> {
@@ -135,13 +130,6 @@ fn with_session_fallback(
     match first {
         Ok(body) => Ok(body),
         Err(FetchError::Other(error)) => Err(error),
-        // Windows（段階 2 S11）：Keychain（/usr/bin/security）を見に行かず、まだログインできないことを伝える
-        #[cfg(windows)]
-        Err(FetchError::NotFound) => {
-            let _ = (url, client);
-            Err(NOT_FOUND_LOGIN_UNAVAILABLE.to_string())
-        }
-        #[cfg(not(windows))]
         Err(FetchError::NotFound) => {
             if !client.keychain().exists()? {
                 return Err(NOT_FOUND_LOGGED_OUT.to_string());
@@ -172,9 +160,10 @@ fn fetch_public(url: &str) -> Result<String, FetchError> {
     wait_for_interval();
     #[cfg(not(windows))]
     let mut curl = Command::new("/usr/bin/curl");
-    // Windows（段階 2 S11）：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
+    // Windows（段階 2 S11）：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）。
+    // 段階 3 T10：手元の .curlrc を読まないように、最初の引数に --disable が付いた Command を使う
     #[cfg(windows)]
-    let mut curl = crate::process::command(windows_curl().map_err(FetchError::Other)?);
+    let mut curl = crate::session::windows_curl_command().map_err(FetchError::Other)?;
     let output = curl
         .args([
             "--silent",
@@ -207,19 +196,6 @@ fn fetch_public(url: &str) -> Result<String, FetchError> {
     }
     String::from_utf8(output.stdout)
         .map_err(|_| FetchError::Other("問題ページを読めません（UTF-8 ではない）".to_string()))
-}
-
-// Windows（段階 2 S11）：Windows に入っている curl.exe の場所。PATH は探さない（同じ名前の別のプログラムを使わないように）
-#[cfg(windows)]
-fn windows_curl() -> Result<PathBuf, String> {
-    let root = std::env::var_os("SystemRoot")
-        .ok_or_else(|| "curl.exe が見つかりません（SystemRoot が分かりません）".to_string())?;
-    let path = PathBuf::from(root).join(r"System32\curl.exe");
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(format!("curl.exe が見つかりません（{}）", path.display()))
-    }
 }
 
 // 空白をまとめて前後を切る
@@ -587,18 +563,10 @@ pub fn load_task_list(
     Ok(tasks)
 }
 
-// 公式の問題ページを、macOS の open コマンドで既定のブラウザで開く（D-110 の代替手段）。
+// 公式の問題ページを既定のブラウザで開く（D-110 の代替手段）。
 // URL は ID を確かめてから IDE が組み立てたもの
 pub fn open_in_browser(id: &ProblemId) -> Result<(), String> {
-    let status = Command::new("/usr/bin/open")
-        .arg(id.url())
-        .status()
-        .map_err(|error| format!("ブラウザを開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ブラウザを開けません".to_string())
-    }
+    crate::open::url(&id.url())
 }
 
 // パッケージごとに選んだ問題（D-117）。アプリのフォルダの problem-choices.json。
@@ -707,32 +675,48 @@ mod tests {
         assert_eq!(refused.status.code(), Some(7));
     }
 
+    // 段階 3 T7：Windows の 404 の文に「Keychain」を出さない。ログインしていないときも、切れていたときも、ログインを勧める同じ文にする
     #[cfg(windows)]
     #[test]
-    fn tells_that_login_is_not_available_on_windows() {
-        // 段階 2 S11：Windows では、ログインなしで 404 のとき、Keychain（/usr/bin/security）を見に行かず、
-        // ログインしていないときの文に「Windows 版では、まだログインできません」を足して返す（段階 3 でログインを入れるまで）
-        let result = with_session_fallback(
-            "http://127.0.0.1:9/",
-            Err(FetchError::NotFound),
-            &Client::app(),
-        );
+    fn tells_to_log_in_without_keychain_on_windows() {
+        let keychain = TestKeychain::new("not-found-text");
+        let client = keychain.client();
+        // ログインしていない：送らない（127.0.0.1 の 9 番にも届かない）
+        let result =
+            with_session_fallback("http://127.0.0.1:9/", Err(FetchError::NotFound), &client);
         let Err(message) = result else {
             panic!("{result:?}");
         };
         assert!(message.contains("404"), "{message}");
         assert!(
-            message.contains("Windows 版では、まだログインできません"),
+            message.contains("「提出結果」タブの「ログイン」"),
             "{message}"
         );
         assert!(!message.contains("Keychain"), "{message}");
+        assert!(!message.contains("まだログインできません"), "{message}");
+        // ログインが切れていた：同じ文にして、切れた値を残さない
+        keychain.0.save("expired-session").unwrap();
+        let (url, server) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(
+            with_session_fallback(&url, Err(FetchError::NotFound), &client),
+            Err(NOT_FOUND_LOGGED_OUT.to_string())
+        );
+        // 期待する文は接続しなくても同じになるので、接続がなければ止まらずに落ちるようにする
+        let started = Instant::now();
+        while !server.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "サーバーに接続がありませんでした"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server.join().unwrap();
+        assert!(!keychain.0.exists().unwrap());
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn reads_with_the_session_only_after_a_404_when_logged_in() {
         let keychain = TestKeychain::new("problem-fallback");
         let client = keychain.client();

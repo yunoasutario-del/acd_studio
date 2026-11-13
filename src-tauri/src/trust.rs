@@ -98,7 +98,7 @@ fn display_above(path: &Path, home: Option<&Path>) -> String {
 // Windows（移植の段階 1 C7）：確認の画面に出す形をそろえる。作業領域の中・ホームの下の相対の部分は、ファイル一覧などと同じ `/` 区切り。
 // 作業領域のルートは canonicalize した `\\?\C:\…` の形で、ホーム（home_dir）には `\\?\` がないので、外してから比べ、表示にも出さない
 #[cfg(windows)]
-fn without_verbatim(path: &Path) -> PathBuf {
+pub(crate) fn without_verbatim(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     match text.strip_prefix(r"\\?\") {
         // `\\?\UNC\server\share` は `\\server\share` に戻す

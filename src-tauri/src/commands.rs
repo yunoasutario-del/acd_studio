@@ -1171,8 +1171,18 @@ pub async fn load_task_list(
 
 // AtCoder のログインの窓を開く（Phase 6 作業 1。D-147・D-148）。開いていれば前に出す。
 // ログインが済んだか・失敗したかは、イベント atcoder-session で main の窓に知らせる
+#[cfg(not(windows))]
 #[tauri::command]
 pub fn atcoder_login(app: AppHandle) -> Result<(), String> {
+    session::open_login_window(&app)
+}
+
+// Windows：同期のコマンドの中で窓を作ると止まる（tauri 2.12.4 の WebviewWindowBuilder::new の Known issues。
+// 段階 3 の T9 で、ログインの窓が真っ白のまま、Rust の側が返事をしなくなった）。
+// async のコマンドにして、IPC の処理とは別のスレッドで窓を作る
+#[cfg(windows)]
+#[tauri::command]
+pub async fn atcoder_login(app: AppHandle) -> Result<(), String> {
     session::open_login_window(&app)
 }
 
@@ -1681,15 +1691,7 @@ pub fn fill_python_input(
 #[tauri::command]
 pub fn open_templates_folder(app: AppHandle) -> Result<(), String> {
     let dir = scaffold::ensure_template_dir(&app_dir(&app)?)?;
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg(&dir)
-        .status()
-        .map_err(|error| format!("テンプレートのフォルダを開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("テンプレートのフォルダを開けません".to_string())
-    }
+    crate::open::folder(&dir, crate::open::TEMPLATES_FAILURE)
 }
 
 // 言語のスニペットのファイルを既定のテキストエディタで開く（Phase 13 作業 2。D-187）。なければ空のもの（{ }）を作る。
@@ -1697,17 +1699,7 @@ pub fn open_templates_folder(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn open_snippets_file(language: Language, app: AppHandle) -> Result<(), String> {
     let path = snippets::ensure_file(&app_dir(&app)?, language)?;
-    let name = snippets::file_name(language);
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .map_err(|error| format!("{name} を開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{name} を開けません"))
-    }
+    crate::open::text_file(&path, snippets::file_name(language))
 }
 
 // VS Code の言語のスニペット（rust.json・cpp.json）を、言語のファイルに写す（D-187・D-213）。押したときだけ。
@@ -1718,11 +1710,8 @@ pub async fn import_vscode_snippets(
     app: AppHandle,
 ) -> Result<snippets::Imported, String> {
     let dir = app_dir(&app)?;
-    let home = toolchain::home_dir().ok_or_else(|| "ホームのフォルダが分かりません".to_string())?;
-    // Windows の VS Code の場所（%APPDATA%\Code\User\snippets）にするのは段階 3
-    let source = home
-        .join("Library/Application Support/Code/User/snippets")
-        .join(snippets::vscode_file_name(language));
+    // 読む場所は OS で違う（Unix は home の下の Library/Application Support、Windows は %APPDATA%。snippets::vscode_source）
+    let source = snippets::vscode_source(language)?;
     tauri::async_runtime::spawn_blocking(move || {
         snippets::import(&dir, &source, language, |count, problems, exists| {
             let name = snippets::file_name(language);
@@ -1935,7 +1924,7 @@ pub async fn save_settings(
     Ok(SaveSettingsOutcome::Saved)
 }
 
-// settings.json を、macOS の open コマンドで既定のテキストエディタで開く（D-159）。なければ既定の内容で作る
+// settings.json をテキストエディタで開く（D-159）。なければ既定の内容で作る
 #[tauri::command]
 pub fn open_settings_file(app: AppHandle) -> Result<(), String> {
     ensure_primary(&app)?;
@@ -1944,16 +1933,7 @@ pub fn open_settings_file(app: AppHandle) -> Result<(), String> {
     if !path.exists() {
         storage::write_default_settings(&dir)?;
     }
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .map_err(|error| format!("settings.json を開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("settings.json を開けません".to_string())
-    }
+    crate::open::text_file(&path, "settings.json")
 }
 
 // レイアウト・開いているタブを保存する（作業 6）。作業領域のパスは Rust 側が持っているものを使う

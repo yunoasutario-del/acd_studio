@@ -57,7 +57,128 @@ impl Keychain {
             service: service.to_string(),
         }
     }
+}
 
+// 資格情報マネージャー（Windows。段階 3 T5。docs/windows-port-plan.md 4.1）。
+// CRED_TYPE_GENERIC の項目に REVEL_SESSION の値を置く。値はエラーの文・ログに出さない
+#[cfg(windows)]
+impl Keychain {
+    // Windows のテストのビルドでは、本物の名前（SERVICE）に対する読み書き・削除を、API を呼ぶ前に止める（9.1 の追加 24）。
+    // Keychain::app() を作ること自体は止めない（Remote::app() を使うテストがあるため）
+    #[cfg(test)]
+    fn refuse_the_real_name(&self, operation: &str) {
+        assert!(
+            self.service != SERVICE,
+            "テストから本物の資格情報に触れようとしました（{operation}）"
+        );
+    }
+
+    #[cfg(not(test))]
+    fn refuse_the_real_name(&self, _operation: &str) {}
+
+    // 値は API に直接渡す（外部のコマンドも標準入力も使わない）。置いたあとに読み直して確かめる
+    pub fn save(&self, value: &str) -> Result<(), String> {
+        self.refuse_the_real_name("save");
+        if !valid_cookie_value(value) {
+            return Err("セッションの値に扱えない文字があります".to_string());
+        }
+        // 上限を超える値は、API を呼ぶ前に断る（9.1 の追加 23）
+        if value.len() > crate::win::CREDENTIAL_BLOB_LIMIT {
+            return Err(
+                "セッションの値が長すぎるので、資格情報マネージャーに置けません（上限は 2560 バイト）"
+                    .to_string(),
+            );
+        }
+        crate::win::credential_write(&self.target(), ACCOUNT, value.as_bytes())
+            .map_err(credential_error)?;
+        self.confirm_saved(value)
+    }
+
+    // 置いた値。なければ None。読めない UTF-8・Cookie の値として受け付けない文字を含むものも None（Unix と同じ）
+    pub fn load(&self) -> Result<Option<String>, String> {
+        self.refuse_the_real_name("load");
+        let blob = crate::win::credential_read(&self.target()).map_err(credential_error)?;
+        Ok(blob
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|value| valid_cookie_value(value)))
+    }
+
+    // 置いてあるか（値は写さない）
+    pub fn exists(&self) -> Result<bool, String> {
+        self.refuse_the_real_name("exists");
+        crate::win::credential_exists(&self.target()).map_err(credential_error)
+    }
+
+    // 消す。なかったら false。消したあとに残っていないかを確かめ、残っていればもう一度消す（段階 3 T5c）
+    pub fn delete(&self) -> Result<bool, String> {
+        self.refuse_the_real_name("delete");
+        let target = self.target();
+        delete_and_confirm(
+            || crate::win::credential_delete(&target),
+            || crate::win::credential_exists(&target),
+            std::thread::sleep,
+        )
+    }
+
+    // 項目の名前（docs/windows-port-plan.md 4.1）。名前を作るだけで、API は呼ばない
+    fn target(&self) -> String {
+        format!("{}/{ACCOUNT}", self.service)
+    }
+
+    // 書いたあとに読み直して確かめる（Unix の save と同じ）
+    fn confirm_saved(&self, value: &str) -> Result<(), String> {
+        if self.load()?.as_deref() == Some(value) {
+            Ok(())
+        } else {
+            Err("セッションを資格情報マネージャーに置けませんでした".to_string())
+        }
+    }
+}
+
+// 資格情報マネージャーのエラーの文。値は入れず、エラーの番号だけを入れる
+#[cfg(windows)]
+fn credential_error(code: u32) -> String {
+    format!("資格情報マネージャーを使えません（エラー {code}）")
+}
+
+// 消し直しても残っていたときの文（段階 3 T5c）。項目の名前は秘密の値ではない。値とエラーの番号は入れない
+#[cfg(windows)]
+const NOT_DELETED: &str = "セッションを資格情報マネージャーから消せませんでした。もう一度「ログアウト」を押してください。直らないときは、資格情報マネージャーの「Windows 資格情報」の汎用資格情報で io.github.ishigaki892.acdstudio/REVEL_SESSION を消してください";
+
+// 消したあとに残っていないかを見る前の待ち：直後（0）と、その 1 秒後（段階 3 T5c）。
+// 1 秒は、T5b で残った項目を見つけた一番早い時刻（約 1 秒）からの判断で、データから決めた数ではない
+#[cfg(windows)]
+const DELETE_CHECKS: [std::time::Duration; 2] =
+    [std::time::Duration::ZERO, std::time::Duration::from_secs(1)];
+
+// 消して、直後と 1 秒後に残っていないかを見る（T5b で、delete が true を返したあとも項目が残ることがあったため）。
+// 見つかったら 1 回だけ消し直して、すぐに見る。直後に見つかって消し直した場合は、1 秒後の確かめをしない。
+// それでも残っていれば Err(NOT_DELETED)。どちらかの削除で項目を消したら true。
+// 最初の削除が Err なら、待たず、exists も呼ばずに Err。エラーの文はエラーの番号だけ
+#[cfg(windows)]
+fn delete_and_confirm(
+    mut delete: impl FnMut() -> Result<bool, u32>,
+    mut exists: impl FnMut() -> Result<bool, u32>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<bool, String> {
+    let deleted = delete().map_err(credential_error)?;
+    for wait in DELETE_CHECKS {
+        if !wait.is_zero() {
+            sleep(wait);
+        }
+        if exists().map_err(credential_error)? {
+            let deleted_again = delete().map_err(credential_error)?;
+            if exists().map_err(credential_error)? {
+                return Err(NOT_DELETED.to_string());
+            }
+            return Ok(deleted || deleted_again);
+        }
+    }
+    Ok(deleted)
+}
+
+#[cfg(not(windows))]
+impl Keychain {
     fn security() -> Command {
         Command::new("/usr/bin/security")
     }
@@ -305,67 +426,114 @@ impl Client {
         })
     }
 
-    // curl で 1 回送る。設定（Cookie・URL・フォーム）は標準入力から渡す
+    // curl で 1 回送る
     fn send(
         &self,
         url: &str,
         session: Option<&str>,
         form: &[(&str, &str)],
     ) -> Result<(u16, Vec<String>, String), String> {
-        let mut config = String::new();
-        if let Some(session) = session {
-            config.push_str(&format!(
-                "cookie = {}\n",
-                quote_config(&format!("{ACCOUNT}={session}"))
-            ));
-        }
-        config.push_str(&format!("url = {}\n", quote_config(url)));
-        for (key, value) in form {
-            config.push_str(&format!(
-                "data-urlencode = {}\n",
-                quote_config(&format!("{key}={value}"))
-            ));
-        }
-        let mut child = Command::new("/usr/bin/curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--include",
-                // 状態の JSON の URL の `sids[]` を、curl の範囲の書き方として読ませない
-                "--globoff",
-                "--proto",
-                self.proto,
-                "--max-time",
-                "30",
-                "--max-filesize",
-                "8000000",
-                "--config",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("curl を起動できません：{error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "curl に渡せません".to_string())?
-            .write_all(config.as_bytes())
-            .map_err(|error| format!("curl に渡せません：{error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("curl が終わりません：{error}"))?;
-        if !output.status.success() {
-            return Err(curl_failure(
-                "AtCoder につながりません",
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stderr),
-            ));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        Ok(split_response(&text))
+        run_curl(curl_command()?, self.proto, url, session, form)
     }
+}
+
+// 起動する curl
+#[cfg(not(windows))]
+fn curl_command() -> Result<Command, String> {
+    Ok(Command::new("/usr/bin/curl"))
+}
+
+// Windows：%SystemRoot%\System32\curl.exe（PATH は探さない）。CREATE_NO_WINDOW を付ける（process::command）
+#[cfg(windows)]
+fn curl_command() -> Result<Command, String> {
+    windows_curl_command()
+}
+
+// Windows の curl.exe を起動する Command（段階 3 T10）。手元の .curlrc（プロキシや通信の記録など）を読まない。
+// --disable は最初の引数でないと効かないので、ほかの引数より先にここで付ける。問題の取得（problem.rs）もこれを使う
+#[cfg(windows)]
+pub(crate) fn windows_curl_command() -> Result<Command, String> {
+    let mut curl = crate::process::command(windows_curl()?);
+    curl.arg("--disable");
+    Ok(curl)
+}
+
+// Windows（段階 2 S11。段階 3 T6 で problem.rs から移した）：Windows に入っている curl.exe の場所。
+// PATH は探さない（同じ名前の別のプログラムを使わないように）。
+// 段階 3 T10：ほかのファイルからは windows_curl_command を使う（--disable のない curl を作らないように、pub にしない）
+#[cfg(windows)]
+fn windows_curl() -> Result<std::path::PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| "curl.exe が見つかりません（SystemRoot が分かりません）".to_string())?;
+    let path = std::path::PathBuf::from(root).join(r"System32\curl.exe");
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("curl.exe が見つかりません（{}）", path.display()))
+    }
+}
+
+// curl を 1 回動かす。設定（Cookie・URL・フォーム）は標準入力から渡す。引数には入れない
+fn run_curl(
+    mut curl: Command,
+    proto: &str,
+    url: &str,
+    session: Option<&str>,
+    form: &[(&str, &str)],
+) -> Result<(u16, Vec<String>, String), String> {
+    let mut config = String::new();
+    if let Some(session) = session {
+        config.push_str(&format!(
+            "cookie = {}\n",
+            quote_config(&format!("{ACCOUNT}={session}"))
+        ));
+    }
+    config.push_str(&format!("url = {}\n", quote_config(url)));
+    for (key, value) in form {
+        config.push_str(&format!(
+            "data-urlencode = {}\n",
+            quote_config(&format!("{key}={value}"))
+        ));
+    }
+    let mut child = curl
+        .args([
+            "--silent",
+            "--show-error",
+            "--include",
+            // 状態の JSON の URL の `sids[]` を、curl の範囲の書き方として読ませない
+            "--globoff",
+            "--proto",
+            proto,
+            "--max-time",
+            "30",
+            "--max-filesize",
+            "8000000",
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("curl を起動できません：{error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "curl に渡せません".to_string())?
+        .write_all(config.as_bytes())
+        .map_err(|error| format!("curl に渡せません：{error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("curl が終わりません：{error}"))?;
+    if !output.status.success() {
+        return Err(curl_failure(
+            "AtCoder につながりません",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(split_response(&text))
 }
 
 // ログインのページへの移動か（/login、https://atcoder.jp/login?...）
@@ -561,14 +729,126 @@ pub(crate) mod tests {
     use std::net::TcpListener;
 
     // テストの間だけ使う Keychain の項目。終わったら（失敗しても）消す
-    pub(crate) struct TestKeychain(pub(crate) Keychain);
+    pub(crate) struct TestKeychain(
+        pub(crate) Keychain,
+        // Windows：資格情報を使うテストを 1 つずつ動かす順番（9.1 の追加 32）。Drop で項目を消したあとに返す
+        #[cfg(windows)]
+        #[allow(dead_code)]
+        Turn,
+    );
+
+    // Windows のテストの順番（段階 3 T5）。別の名前の書き込みと重なると、消した項目が戻ることがあるので、
+    // 同じテストのプログラムの中では、資格情報を使うテストを 1 つずつ動かす（別のプログラムとの重なりは防げない）。
+    // 同じスレッドは何回でも取れる（1 つのテストで TestKeychain を 2 つ作るものがあるため）。全部を返したら空く
+    #[cfg(windows)]
+    struct TurnState {
+        holder: Option<std::thread::ThreadId>,
+        count: usize,
+    }
+
+    #[cfg(windows)]
+    struct TurnLock {
+        state: Mutex<TurnState>,
+        free: std::sync::Condvar,
+        limit: std::time::Duration,
+    }
+
+    #[cfg(windows)]
+    static TURN: TurnLock = TurnLock::new(std::time::Duration::from_secs(120));
+
+    #[cfg(windows)]
+    struct Turn(&'static TurnLock);
+
+    #[cfg(windows)]
+    impl TurnLock {
+        const fn new(limit: std::time::Duration) -> Self {
+            TurnLock {
+                state: Mutex::new(TurnState {
+                    holder: None,
+                    count: 0,
+                }),
+                free: std::sync::Condvar::new(),
+                limit,
+            }
+        }
+
+        // 空くまで待つ。同じスレッドが持っていれば待たない。長く待ったら、分かる文で panic する（本来は届かない上限）
+        fn take(&'static self) -> Turn {
+            let me = std::thread::current().id();
+            let started = std::time::Instant::now();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                match state.holder {
+                    None => {
+                        state.holder = Some(me);
+                        state.count = 1;
+                        return Turn(self);
+                    }
+                    Some(holder) if holder == me => {
+                        state.count += 1;
+                        return Turn(self);
+                    }
+                    Some(_) => {
+                        let Some(left) = self.limit.checked_sub(started.elapsed()) else {
+                            // 毒にしないように、Mutex を返してから panic する
+                            drop(state);
+                            panic!(
+                                "資格情報のテストの順番を {:?} 待っても取れません",
+                                self.limit
+                            );
+                        };
+                        state = self
+                            .free
+                            .wait_timeout(state, left)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    }
+                }
+            }
+        }
+    }
+
+    // 順番を返す。全部を返したら空く。別のスレッドで返すのは誤りなので、順番を返してから、分かる文で panic する。
+    // panic の最中なら panic しない（panic の最中の panic で、プログラムごと止まるのを避ける）
+    #[cfg(windows)]
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            let wrong_thread = {
+                let mut state = self
+                    .0
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let wrong_thread = state.holder != Some(std::thread::current().id());
+                state.count = state.count.saturating_sub(1);
+                if state.count == 0 {
+                    state.holder = None;
+                    self.0.free.notify_all();
+                }
+                wrong_thread
+            };
+            if wrong_thread && !std::thread::panicking() {
+                panic!("資格情報のテストの順番を、別のスレッドで返そうとしました");
+            }
+        }
+    }
 
     impl TestKeychain {
+        fn item(name: &str) -> Keychain {
+            Keychain::named(&format!("{SERVICE}.test-{name}-{}", std::process::id()))
+        }
+
+        #[cfg(windows)]
         pub(crate) fn new(name: &str) -> Self {
-            TestKeychain(Keychain::named(&format!(
-                "{SERVICE}.test-{name}-{}",
-                std::process::id()
-            )))
+            TestKeychain(Self::item(name), TURN.take())
+        }
+
+        #[cfg(not(windows))]
+        pub(crate) fn new(name: &str) -> Self {
+            TestKeychain(Self::item(name))
         }
 
         pub(crate) fn client(&self) -> Client {
@@ -577,8 +857,18 @@ pub(crate) mod tests {
     }
 
     impl Drop for TestKeychain {
+        #[cfg(not(windows))]
         fn drop(&mut self) {
             let _ = self.0.delete();
+        }
+
+        // Windows：消せなかったときは、テスト用の項目の名前だけを出す（値もエラーの文も出さない。panic しない。段階 3 T5c）。
+        // 通ったテストの出力は表示されないので、見えるのはテストが落ちたときと --nocapture のときだけ
+        #[cfg(windows)]
+        fn drop(&mut self) {
+            if self.0.delete().is_err() {
+                eprintln!("テスト用の項目を消せませんでした：{}", self.0.service);
+            }
         }
     }
 
@@ -590,11 +880,436 @@ pub(crate) mod tests {
         }
     }
 
+    // ---- テストの順番（段階 3 T5。9.1 の追加 32）。ここのテストは API を呼ばない（turn_is_held… の TestKeychain は消すだけ） ----
+
+    #[cfg(windows)]
+    fn local_lock(limit: std::time::Duration) -> &'static TurnLock {
+        Box::leak(Box::new(TurnLock::new(limit)))
+    }
+
+    #[cfg(windows)]
+    fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+        match panic.downcast_ref::<&str>() {
+            Some(text) => text.to_string(),
+            None => panic.downcast_ref::<String>().cloned().unwrap_or_default(),
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
+    fn turn_can_be_taken_twice_on_the_same_thread() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let _first = lock.take();
+        let _second = lock.take();
+        assert_eq!(lock.state.lock().unwrap().count, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_makes_other_threads_wait_until_the_last_release() {
+        use std::sync::atomic::AtomicBool;
+        let lock = local_lock(std::time::Duration::from_secs(10));
+        let first = lock.take();
+        let second = lock.take();
+        let taken: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let other = std::thread::spawn(move || {
+            let _turn = lock.take();
+            taken.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!taken.load(Ordering::SeqCst), "持っている間に取れた");
+        drop(first);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!taken.load(Ordering::SeqCst), "1 つ返しただけで取れた");
+        drop(second);
+        other.join().unwrap();
+        assert!(taken.load(Ordering::SeqCst));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_gives_up_after_the_limit_with_a_clear_text() {
+        let lock = local_lock(std::time::Duration::from_millis(50));
+        let _held = lock.take();
+        let waiting = std::thread::spawn(move || drop(lock.take())).join();
+        let text = panic_text(waiting.expect_err("待ちの上限で止まらなかった"));
+        assert!(text.contains("順番を"), "{text}");
+    }
+
+    // 別のスレッドで返すと、順番を返してから、分かる文で panic する
+    #[cfg(windows)]
+    #[test]
+    fn turn_panics_when_released_on_another_thread_and_still_frees_it() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let turn = lock.take();
+        let released = std::thread::spawn(move || drop(turn)).join();
+        let text = panic_text(released.expect_err("別のスレッドで返しても止まらなかった"));
+        assert!(text.contains("別のスレッド"), "{text}");
+        // 空いている：ほかのスレッドが取れる
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    // 別のスレッドで返すのが panic の最中なら、もう panic しない（プログラムごと止まらない）。順番は返す
+    #[cfg(windows)]
+    #[test]
+    fn turn_does_not_panic_again_while_panicking_on_another_thread() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let turn = lock.take();
+        let result = std::thread::spawn(move || {
+            let _turn = turn;
+            panic!("もとの panic");
+        })
+        .join();
+        let panic = result.expect_err("panic のはず");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"もとの panic"));
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_is_freed_when_the_holder_panics() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let result = std::panic::catch_unwind(|| {
+            let _turn = lock.take();
+            panic!("テストの panic");
+        });
+        assert!(result.is_err());
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turn_works_after_the_mutex_is_poisoned() {
+        let lock = local_lock(std::time::Duration::from_secs(1));
+        let _ = std::panic::catch_unwind(|| {
+            let _state = lock.state.lock().unwrap();
+            panic!("毒にする");
+        });
+        assert!(lock.state.is_poisoned());
+        drop(lock.take());
+        std::thread::spawn(move || drop(lock.take()))
+            .join()
+            .unwrap();
+    }
+
+    // reports_login_and_failures の形：1 つのテストで TestKeychain を 2 つ作っても止まらず、全部を捨てるまで持つ
+    #[cfg(windows)]
+    #[test]
+    fn turn_is_held_while_test_keychains_live() {
+        let me = std::thread::current().id();
+        let held = || TURN.state.lock().unwrap().holder == Some(me);
+        let first = TestKeychain::new("turn-first");
+        assert!(held());
+        let second = TestKeychain::new("turn-second");
+        assert!(held());
+        drop(first);
+        assert!(held(), "1 つ捨てただけで返した");
+        drop(second);
+        assert!(!held(), "全部捨てても返していない");
+    }
+
+    // 段階 3 T5（9.1 の追加 24）：テストのビルドでは、本物の名前の読み書き・削除は API を呼ぶ前に止まる
+    #[cfg(windows)]
+    #[test]
+    fn refuses_the_real_name_in_test_builds() {
+        fn assert_stops(operation: &str, call: impl FnOnce()) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+            let Err(panic) = result else {
+                panic!("{operation} が止まらなかった");
+            };
+            let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(text.contains("本物の資格情報"), "{operation}：{text}");
+        }
+        for real in [Keychain::named(SERVICE), Keychain::app()] {
+            assert_stops("load", || drop(real.load()));
+            assert_stops("exists", || drop(real.exists()));
+            assert_stops("save", || drop(real.save("fake-value")));
+            assert_stops("delete", || drop(real.delete()));
+        }
+        // 作るだけなら止まらない（submit.rs の never_reads_the_status_faster_than_once_a_second が Remote::app() を使う）
+        let _ = Client::app();
+    }
+
+    // 段階 3 T5：テストのビルドでは、win.rs の層でも .test- のない名前には API を呼ばない。
+    // 書く関数は、この確かめが効かなくなったときに項目が残らないように、ここでは呼ばない（同じ関数で止めている）
+    #[cfg(windows)]
+    #[test]
+    fn win_layer_refuses_names_without_test_mark() {
+        const NAME: &str = "atcoder-studio-guard-check/none";
+        for call in [
+            (|| {
+                let _ = crate::win::credential_read(NAME);
+            }) as fn(),
+            || {
+                let _ = crate::win::credential_exists(NAME);
+            },
+            || {
+                let _ = crate::win::credential_delete(NAME);
+            },
+        ] {
+            assert!(std::panic::catch_unwind(call).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_names_follow_the_plan() {
+        // 名前を作るだけで、API は呼ばない
+        assert_eq!(
+            Keychain::app().target(),
+            "io.github.ishigaki892.acdstudio/REVEL_SESSION"
+        );
+        // UserName は REVEL_SESSION（AtCoder の利用者名ではない）。マシンごとに保存する
+        let keychain = TestKeychain::new("names");
+        keychain.0.save("fake-value").unwrap();
+        assert_eq!(
+            crate::win::credential_user_and_persist(&keychain.0.target()),
+            Some(("REVEL_SESSION".to_string(), 2))
+        );
+        assert_eq!(
+            crate::win::credential_read(&keychain.0.target()).unwrap(),
+            Some(b"fake-value".to_vec())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_credentials_are_none_false_false() {
+        let keychain = TestKeychain::new("missing");
+        assert_eq!(keychain.0.load(), Ok(None));
+        assert_eq!(keychain.0.exists(), Ok(false));
+        assert_eq!(keychain.0.delete(), Ok(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_credential_errors_are_err_with_the_number_only() {
+        // 名前が長すぎる（上限は 32767 文字）：ERROR_NOT_FOUND ではないエラーになる
+        let keychain = TestKeychain::new(&"x".repeat(40000));
+        for (operation, result) in [
+            ("load", keychain.0.load().map(|_| ())),
+            ("exists", keychain.0.exists().map(|_| ())),
+            ("delete", keychain.0.delete().map(|_| ())),
+            ("save", keychain.0.save("fake-value")),
+        ] {
+            let message = result.expect_err(operation);
+            assert!(
+                message.starts_with("資格情報マネージャーを使えません（エラー "),
+                "{operation}：{message}"
+            );
+            assert!(!message.contains("fake-value"), "{operation}：{message}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_values_load_as_none() {
+        let keychain = TestKeychain::new("unreadable");
+        let target = keychain.0.target();
+        let values: [&[u8]; 4] = [&[0xff, 0xfe, 0x00], b"a b", b"a;b", b""];
+        for value in values {
+            crate::win::credential_write(&target, ACCOUNT, value).unwrap();
+            assert_eq!(keychain.0.load(), Ok(None), "{value:?}");
+            assert_eq!(keychain.0.exists(), Ok(true), "{value:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writes_up_to_2560_bytes_and_refuses_more_before_calling_the_api() {
+        let at_limit = "a".repeat(2560);
+        let over_limit = "b".repeat(2561);
+        let keychain = TestKeychain::new("limit");
+        // 2561 バイト：API を呼ばないので、項目はできない
+        let refused = keychain.0.save(&over_limit);
+        assert_eq!(
+            refused,
+            Err("セッションの値が長すぎるので、資格情報マネージャーに置けません（上限は 2560 バイト）".to_string())
+        );
+        assert_eq!(keychain.0.exists(), Ok(false));
+        // 2560 バイト：書けて、同じものを読める（長いので assert! で比べる）
+        assert_eq!(keychain.0.save(&at_limit), Ok(()));
+        assert!(keychain.0.load().unwrap().as_deref() == Some(at_limit.as_str()));
+        // 断ったときは、今の値を変えない
+        assert!(keychain.0.save(&over_limit).is_err());
+        assert!(keychain.0.load().unwrap().as_deref() == Some(at_limit.as_str()));
+    }
+
+    // 不正な値は API を呼ぶ前に断る（書いたあとの読み直しでも Err になるので、文と、項目がないことで見分ける）
+    #[cfg(windows)]
+    #[test]
+    fn refuses_invalid_values_before_calling_the_api() {
+        let keychain = TestKeychain::new("invalid");
+        assert_eq!(
+            keychain.0.save("bad value"),
+            Err("セッションの値に扱えない文字があります".to_string())
+        );
+        assert_eq!(keychain.0.exists(), Ok(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_texts_have_no_value_and_no_keychain() {
+        const MARK: &str = "secret-mark";
+        let keychain = TestKeychain::new("texts");
+        // 書いたものと読めたものが違う
+        crate::win::credential_write(&keychain.0.target(), ACCOUNT, b"other").unwrap();
+        let texts = [
+            credential_error(5),
+            keychain.0.save(&format!("{MARK} bad")).unwrap_err(),
+            keychain.0.save(&MARK.repeat(300)).unwrap_err(),
+            keychain.0.confirm_saved(MARK).unwrap_err(),
+        ];
+        assert_eq!(texts[0], "資格情報マネージャーを使えません（エラー 5）");
+        for text in texts {
+            assert!(!text.contains(MARK), "{text}");
+            assert!(!text.contains("Keychain"), "{text}");
+        }
+    }
+
+    // 消したあとの確かめ（段階 3 T5c）。資格情報マネージャーには触れない。
+    // 偽の「消す」「あるか見る」「待つ」を渡して、戻り値と、呼ばれた順を見る（待つ関数は記録するだけで、実際には待たない）
+    #[cfg(windows)]
+    mod delete_checks {
+        use super::super::{ACCOUNT, NOT_DELETED, SERVICE, delete_and_confirm};
+
+        fn run(
+            deletes: &[Result<bool, u32>],
+            exists: &[Result<bool, u32>],
+        ) -> (Result<bool, String>, Vec<String>) {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let mut deletes = deletes.iter().copied();
+            let mut exists = exists.iter().copied();
+            let result = delete_and_confirm(
+                || {
+                    calls.borrow_mut().push("delete".to_string());
+                    deletes.next().expect("予定より多く消した")
+                },
+                || {
+                    calls.borrow_mut().push("exists".to_string());
+                    exists.next().expect("予定より多く見た")
+                },
+                |wait| {
+                    calls
+                        .borrow_mut()
+                        .push(format!("sleep {}ms", wait.as_millis()))
+                },
+            );
+            (result, calls.into_inner())
+        }
+
+        fn error(code: u32) -> Result<bool, String> {
+            Err(format!("資格情報マネージャーを使えません（エラー {code}）"))
+        }
+
+        #[test]
+        fn deletes_again_when_the_item_is_still_there_right_after() {
+            // 直後に見つかったら、消し直してすぐに見る。そのあとの 1 秒後の確かめはしない
+            let (result, calls) = run(&[Ok(true), Ok(true)], &[Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(true));
+            assert_eq!(calls, ["delete", "exists", "delete", "exists"]);
+        }
+
+        #[test]
+        fn deletes_again_when_the_item_is_back_after_a_second() {
+            let (result, calls) = run(&[Ok(true), Ok(true)], &[Ok(false), Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(true));
+            assert_eq!(
+                calls,
+                [
+                    "delete",
+                    "exists",
+                    "sleep 1000ms",
+                    "exists",
+                    "delete",
+                    "exists"
+                ]
+            );
+        }
+
+        #[test]
+        fn fails_when_the_item_is_still_there_after_deleting_again() {
+            for (exists, expected_calls) in [
+                (
+                    &[Ok(true), Ok(true)][..],
+                    &["delete", "exists", "delete", "exists"][..],
+                ),
+                (
+                    &[Ok(false), Ok(true), Ok(true)][..],
+                    &[
+                        "delete",
+                        "exists",
+                        "sleep 1000ms",
+                        "exists",
+                        "delete",
+                        "exists",
+                    ][..],
+                ),
+            ] {
+                let (result, calls) = run(&[Ok(true), Ok(true)], exists);
+                assert_eq!(result, Err(NOT_DELETED.to_string()), "{exists:?}");
+                assert_eq!(calls, expected_calls, "{exists:?}");
+            }
+            // 文：項目の名前と、資格情報マネージャーの画面の場所を入れる。Keychain の文字は入れない
+            assert!(NOT_DELETED.contains(&format!("{SERVICE}/{ACCOUNT}")));
+            assert!(NOT_DELETED.contains("「Windows 資格情報」の汎用資格情報"));
+            assert!(!NOT_DELETED.contains("Keychain"));
+        }
+
+        #[test]
+        fn does_not_delete_again_when_the_item_is_gone() {
+            // 最初の削除の戻り値（あったか）をそのまま返す
+            for first in [true, false] {
+                let (result, calls) = run(&[Ok(first)], &[Ok(false), Ok(false)]);
+                assert_eq!(result, Ok(first));
+                assert_eq!(calls, ["delete", "exists", "sleep 1000ms", "exists"]);
+            }
+        }
+
+        #[test]
+        fn returns_true_when_either_delete_removed_the_item() {
+            // 最初の削除が false でも、消し直しが true なら true（どちらかで項目を消したら true）
+            let (result, _) = run(&[Ok(false), Ok(true)], &[Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(true));
+            // 見つかったあと、消し直す前に消えていた（どちらも false）なら false
+            let (result, _) = run(&[Ok(false), Ok(false)], &[Ok(true), Ok(false)]);
+            assert_eq!(result, Ok(false));
+        }
+
+        #[test]
+        fn stops_at_the_first_delete_error() {
+            // 待たず、exists も呼ばずに、エラーの番号だけの文で Err
+            let (result, calls) = run(&[Err(5)], &[]);
+            assert_eq!(result, error(5));
+            assert_eq!(calls, ["delete"]);
+        }
+
+        #[test]
+        fn confirm_errors_are_err_with_the_number_only() {
+            let (result, calls) = run(&[Ok(true)], &[Err(1312)]);
+            assert_eq!(result, error(1312));
+            assert_eq!(calls, ["delete", "exists"]);
+            // 消し直したあとの確かめが Err
+            let (result, calls) = run(&[Ok(true), Ok(true)], &[Ok(true), Err(1312)]);
+            assert_eq!(result, error(1312));
+            assert_eq!(calls, ["delete", "exists", "delete", "exists"]);
+        }
+
+        #[test]
+        fn deleting_again_errors_are_err() {
+            let (result, calls) = run(&[Ok(true), Err(5)], &[Ok(true)]);
+            assert_eq!(result, error(5));
+            assert_eq!(calls, ["delete", "exists", "delete"]);
+        }
+    }
+
+    #[test]
     fn saves_loads_and_deletes_in_keychain() {
         let keychain = TestKeychain::new("roundtrip");
         assert_eq!(keychain.0.load().unwrap(), None);
@@ -734,10 +1449,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn posts_with_session_and_rotates_cookie() {
         let keychain = TestKeychain::new("post");
         keychain.0.save("old-session").unwrap();
@@ -782,10 +1493,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn treats_login_redirect_as_logged_out() {
         let keychain = TestKeychain::new("expired");
         keychain.0.save("expired-session").unwrap();
@@ -807,10 +1514,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn keeps_the_saved_session_until_the_window_is_logged_in() {
         let keychain = TestKeychain::new("confirm");
         keychain.0.save("saved-session").unwrap();
@@ -819,7 +1522,12 @@ pub(crate) mod tests {
         let (url, server) = serve_once(
             "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nConnection: close\r\n\r\nvar userScreenName = \"\";\n\n\n\n\n\n",
         );
-        assert!(confirm_session(&client, &url, "anonymous-session").is_err());
+        assert_eq!(
+            confirm_session(&client, &url, "anonymous-session")
+                .err()
+                .as_deref(),
+            Some("ログインしていません。窓でログインしてください")
+        );
         let request = server.join().unwrap();
         assert!(
             request.contains("Cookie: REVEL_SESSION=anonymous-session"),
@@ -830,7 +1538,12 @@ pub(crate) mod tests {
         let (url, server) = serve_once(
             "HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
-        assert!(confirm_session(&client, &url, "anonymous-session").is_err());
+        assert_eq!(
+            confirm_session(&client, &url, "anonymous-session")
+                .err()
+                .as_deref(),
+            Some("ログインしていません。窓でログインしてください")
+        );
         server.join().unwrap();
         assert_eq!(keychain.0.load().unwrap().as_deref(), Some("saved-session"));
         // ログインしている：窓の値（入れ替えられたら新しい値）を書く
@@ -845,6 +1558,151 @@ pub(crate) mod tests {
         assert_eq!(keychain.0.load().unwrap().as_deref(), Some("rotated"));
         // 読めない値は送らない
         assert!(confirm_session(&client, &url, "bad value;").is_err());
+    }
+
+    // 段階 3 T6：curl は決まった場所から起動する（Windows では PATH を探さない）
+    #[test]
+    fn starts_curl_from_the_fixed_place() {
+        let curl = curl_command().unwrap();
+        #[cfg(windows)]
+        let expected = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join(r"System32\curl.exe");
+        #[cfg(not(windows))]
+        let expected = std::path::PathBuf::from("/usr/bin/curl");
+        assert_eq!(std::path::Path::new(curl.get_program()), expected);
+    }
+
+    // 段階 3 T10：Windows の curl.exe は、手元の .curlrc を読まない。--disable は最初の引数でないと効かない。
+    // 問題の取得（problem.rs の fetch_public）も同じ関数で起動するので、この確かめで守る
+    #[cfg(windows)]
+    #[test]
+    fn disable_curlrc_is_the_first_argument() {
+        let curl = windows_curl_command().unwrap();
+        assert_eq!(
+            curl.get_args().next(),
+            Some(std::ffi::OsStr::new("--disable"))
+        );
+    }
+
+    // 段階 3 T10：Cookie を渡す経路（curl_command から run_curl）で、本物の curl.exe が .curlrc を読まない。
+    // CURL_HOME は、ほかのテストに影響しないように、この Command にだけ渡す。値は偽のもの。通信は手元の口だけ
+    #[cfg(windows)]
+    #[test]
+    fn disable_curlrc_on_the_cookie_path() {
+        let dir =
+            std::env::temp_dir().join(format!("atcoder-studio-curlrc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".curlrc"), "header = \"X-T10-Curlrc: marker\"\n").unwrap();
+        let (url, server) =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let mut curl = curl_command().unwrap();
+        curl.env("CURL_HOME", &dir);
+        let result = run_curl(curl, "=http", &url, Some("fake-value"), &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // curl が応答を受け取っていれば、サーバーは接続を受けて終わっているので、join で待ち続けない
+        assert!(result.is_ok(), "{:?}", result.err());
+        let received = server.join().unwrap();
+        assert!(
+            received.contains("REVEL_SESSION=fake-value"),
+            "Cookie が届いていません"
+        );
+        assert!(
+            !received.contains("X-T10-Curlrc"),
+            ".curlrc の設定が効いています"
+        );
+    }
+
+    // 段階 3 T6：Cookie は引数に入れず、標準入力の設定だけで渡す。テスト用の子のプログラムを curl の代わりに起動し、
+    // 受け取った引数と標準入力を記録させて見る（資格情報にも通信にも触れない）
+    #[cfg(windows)]
+    #[test]
+    fn passes_the_cookie_only_through_standard_input() {
+        const MARK: &str = "secret-mark-cookie";
+        let path =
+            std::env::temp_dir().join(format!("atcoder-studio-curl-record-{}", std::process::id()));
+        let mut child = Command::new(crate::process::test_child_path());
+        child.arg(format!("record:{}", path.display()));
+        let result = run_curl(
+            child,
+            "=http",
+            "http://127.0.0.1:9/x",
+            Some(MARK),
+            &[("key", "form-value")],
+        );
+        let recorded = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "{result:?}");
+        let recorded = recorded.unwrap();
+        let (args, stdin) = recorded.split_once("\n\n").unwrap();
+        // 引数は、この形だけ（値を含まない）。--disable は windows_curl_command が先に付けるので、
+        // run_curl が足す引数だけを見るここには出ない（disable_curlrc_is_the_first_argument で見る）
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "--silent",
+                "--show-error",
+                "--include",
+                "--globoff",
+                "--proto",
+                "=http",
+                "--max-time",
+                "30",
+                "--max-filesize",
+                "8000000",
+                "--config",
+                "-",
+            ]
+        );
+        assert_eq!(
+            stdin,
+            format!(
+                "cookie = \"REVEL_SESSION={MARK}\"\nurl = \"http://127.0.0.1:9/x\"\ndata-urlencode = \"key=form-value\"\n"
+            )
+        );
+    }
+
+    // 段階 3 T6：curl が失敗したときの文に、Cookie の値が出ない（本物の curl を手元の口とつながらない形で動かす）。
+    // curl を起動できないときは、先の確かめで落ちるので、接続を待つ join で止まらない
+    #[test]
+    fn curl_failures_do_not_show_the_cookie_value() {
+        const MARK: &str = "secret-mark-cookie";
+        let keychain = TestKeychain::new("curl-errors");
+        keychain.0.save(MARK).unwrap();
+        let client = keychain.client();
+        // つながらない：手元の口を開いて、すぐ閉じる
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        // 応答を返さずに切る
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer);
+        });
+        let texts = [
+            client.request(&refused, &[]).err().unwrap(),
+            client.request(&silent, &[]).err().unwrap(),
+            // 読めない URL
+            client.request("http://[/", &[]).err().unwrap(),
+            // 許していないプロトコル（テストの Client は http だけ）
+            client.request("https://127.0.0.1:9/", &[]).err().unwrap(),
+            // ログインの確かめの経路（値を保存の前に送る）
+            confirm_session(&client, &refused, MARK).unwrap_err(),
+        ];
+        for text in &texts {
+            // 値が入っていても出力に出さないように、文そのものは出さない
+            assert!(!text.contains(MARK), "エラーの文に値が出ました");
+            assert!(text.contains("curl: ("), "{text}");
+        }
+        server.join().unwrap();
     }
 
     pub(crate) fn decode(text: &str) -> String {

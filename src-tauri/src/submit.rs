@@ -1779,14 +1779,14 @@ pub fn refresh<R: Runtime>(app: &AppHandle<R>, key: u64) -> Result<SubmissionVie
 // 公式の提出のページを、既定のブラウザで開く（期間の外・送れなかったときの「コピーして開く」）
 pub fn open_submit_page(contest: &str, task: &str) -> Result<(), String> {
     crate::problem::ProblemId::new(contest, task)?;
-    open_in_browser(&submit_url(contest, task))
+    crate::open::url(&submit_url(contest, task))
 }
 
 // 提出の詳細（id があるとき）か、自分の提出の一覧を、既定のブラウザで開く（「提出結果」・「履歴」の「詳細」「自分の提出」）。
 // URL は、ID を確かめてから IDE が組み立てる（画面から URL は受け取らない）
 pub fn open_submission_page(contest: &str, id: Option<u64>) -> Result<(), String> {
     crate::problem::ProblemId::new(contest, "x")?;
-    open_in_browser(&match id {
+    crate::open::url(&match id {
         Some(id) => detail_url(contest, id),
         None => list_url(contest),
     })
@@ -2005,18 +2005,6 @@ pub fn contest_status(remote: &Remote, app_dir: &Path, contest: &str) -> StatusO
         },
         Err(message) if message == NOT_LOGGED_IN => StatusOutcome::NotLoggedIn,
         Err(message) => StatusOutcome::Failed { message },
-    }
-}
-
-fn open_in_browser(url: &str) -> Result<(), String> {
-    let status = std::process::Command::new("/usr/bin/open")
-        .arg(url)
-        .status()
-        .map_err(|error| format!("ブラウザを開けません：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("ブラウザを開けません".to_string())
     }
 }
 
@@ -2798,10 +2786,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn submits_in_the_contest_period_and_tracks_the_judge() {
         let keychain = TestKeychain::new("submit-flow");
         keychain.0.save("old-session").unwrap();
@@ -2887,10 +2871,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn sends_nothing_when_cancelled_or_out_of_period() {
         let keychain = TestKeychain::new("submit-cancel");
         keychain.0.save("session").unwrap();
@@ -2951,10 +2931,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn refuses_without_login_or_with_turnstile() {
         // ログインしていない（Keychain に値がない）：フォームを読まない
         let keychain = TestKeychain::new("submit-nologin");
@@ -3033,10 +3009,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn reports_a_rejected_submission() {
         let keychain = TestKeychain::new("submit-rejected");
         keychain.0.save("session").unwrap();
@@ -3086,10 +3058,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn stops_tracking_when_the_status_cannot_be_read() {
         let keychain = TestKeychain::new("submit-unreadable");
         keychain.0.save("session").unwrap();
@@ -3440,10 +3408,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn reads_every_page_of_the_contest() {
         let dir = status_app_dir("pages");
         let keychain = TestKeychain::new("status-pages");
@@ -3488,10 +3452,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn stops_at_the_page_limit() {
         let dir = status_app_dir("limit");
         let keychain = TestKeychain::new("status-limit");
@@ -3515,10 +3475,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 3（Keychain を資格情報マネージャーに）と段階 5（curl.exe）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn reports_login_and_failures() {
         let dir = status_app_dir("fail");
         // Keychain にない：読みに行かない
