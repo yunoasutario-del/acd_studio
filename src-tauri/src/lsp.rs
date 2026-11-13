@@ -207,6 +207,12 @@ pub fn refuse_network_root(root: &Path) -> Result<(), String> {
 // rust-analyzer に渡す設定（initializationOptions と workspace/configuration の答え）。
 // 決めるのは linkedProjects（projects のパッケージの Cargo.toml）だけで、ほかは既定値のまま（D-121・D-124・D-171）
 fn settings(projects: &[PathBuf]) -> Value {
+    // Windows（移植の段階 4 T4）：canonicalize が付ける `\\?\` を外してから渡す
+    #[cfg(windows)]
+    let projects: Vec<PathBuf> = projects
+        .iter()
+        .map(|dir| crate::trust::without_verbatim(dir))
+        .collect();
     let linked: Vec<String> = projects
         .iter()
         .map(|dir| dir.join("Cargo.toml").to_string_lossy().into_owned())
@@ -249,6 +255,9 @@ pub fn analyzer_place(root: &Path, package: &Path) -> (PathBuf, Vec<PathBuf>) {
 
 // 画面からの initialize の要求の、場所と設定（options。サーバーごとの initializationOptions）を上書きする（D-123）
 fn override_initialize(message: &mut Value, dir: &Path, options: &Value) {
+    // Windows（移植の段階 4 T4）：rootPath に、canonicalize が付ける `\\?\` を入れない（rootUri は file_uri が外す）
+    #[cfg(windows)]
+    let dir = &crate::trust::without_verbatim(dir);
     let uri = file_uri(dir);
     let name = dir
         .file_name()
@@ -1474,6 +1483,36 @@ mod tests {
         );
         assert_eq!(started.package, "problems/abc001_a");
         assert_eq!(started.root_uri, "file:///C:/ws/problems/abc001_a");
+    }
+
+    // 段階 4 T4：サーバーに渡すパス（initialize の rootPath、rust-analyzer の linkedProjects）に、canonicalize が付ける
+    // `\\?\` を入れない。実際の起動では、場所もパッケージも canonicalize した `\\?\C:\…` の形で来る
+    #[cfg(windows)]
+    #[test]
+    fn passes_paths_without_the_verbatim_prefix_on_windows() {
+        let dir = Path::new(r"\\?\C:\ws\problems\abc001_a");
+        let options = settings(&[dir.to_path_buf()]);
+        let mut message = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } });
+        override_initialize(&mut message, dir, &options);
+        let params = &message["params"];
+        assert_eq!(params["rootPath"], r"C:\ws\problems\abc001_a");
+        assert_eq!(params["rootUri"], "file:///C:/ws/problems/abc001_a");
+        assert_eq!(
+            params["initializationOptions"],
+            json!({ "linkedProjects": [r"C:\ws\problems\abc001_a\Cargo.toml"] })
+        );
+        // workspace/configuration の答えも同じ設定から作る
+        let request = json!({
+            "jsonrpc": "2.0", "id": 7, "method": "workspace/configuration",
+            "params": { "items": [{ "section": "rust-analyzer" }] }
+        });
+        let answer = configuration_answer(&request, &json!({ "rust-analyzer": options }));
+        assert_eq!(
+            answer["result"][0]["linkedProjects"][0],
+            r"C:\ws\problems\abc001_a\Cargo.toml"
+        );
+        // どこにも `\\?\` がない（JSON の文字列に ? が出ない）
+        assert!(!message.to_string().contains('?'), "{message}");
     }
 
     // 段階 4 T2（9.1 の追加 41）：作業領域が UNC（ネットワークの場所）なら、言語サーバーは使えないと知らせる

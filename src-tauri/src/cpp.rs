@@ -370,6 +370,10 @@ fn compilation_database_with(
 ) -> serde_json::Value {
     let mut changes = serde_json::Map::new();
     for package in packages {
+        // Windows（移植の段階 4 T4）：鍵・workingDirectory・-c のファイルに、canonicalize が付ける `\\?\` を入れない
+        // （どれもこの package から作る）
+        #[cfg(windows)]
+        let package = &crate::trust::without_verbatim(package);
         let mut files = vec![package.join(SOURCE)];
         let mut examples: Vec<PathBuf> = std::fs::read_dir(package.join("examples"))
             .map(|entries| {
@@ -934,11 +938,27 @@ compilation terminated.
             Some(Path::new("/app/acl")),
         );
         let changes = database["compilationDatabaseChanges"].as_object().unwrap();
+        #[cfg(not(windows))]
         let main = package.join(SOURCE).to_string_lossy().into_owned();
+        #[cfg(not(windows))]
         let generator = package
             .join("examples/gen.cpp")
             .to_string_lossy()
             .into_owned();
+        // Windows では、鍵・workingDirectory・-c のファイルは `\\?\` を外した形（段階 4 T4）
+        #[cfg(windows)]
+        let (main, generator, package) = {
+            let plain = crate::trust::without_verbatim(&package);
+            (
+                plain.join(SOURCE).to_string_lossy().into_owned(),
+                plain
+                    .join("examples")
+                    .join("gen.cpp")
+                    .to_string_lossy()
+                    .into_owned(),
+                plain,
+            )
+        };
         // 載せるのは main.cpp と examples/*.cpp だけ
         let mut keys: Vec<String> = changes.keys().cloned().collect();
         keys.sort();
@@ -978,6 +998,50 @@ compilation terminated.
         let command: Vec<String> =
             serde_json::from_value(changes[&generator]["compilationCommand"].clone()).unwrap();
         assert_eq!(command.last().unwrap(), &generator);
+    }
+
+    // 段階 4 T4：clangd に渡す命令の鍵・workingDirectory・-c のファイルに、canonicalize が付ける `\\?\` を入れない
+    // （clangd が didOpen の URI から作るパスは `C:\…` の形なので、鍵が一致しないと IDE の命令が使われない。推測）
+    #[cfg(windows)]
+    #[test]
+    fn makes_commands_for_clangd_without_the_verbatim_prefix_on_windows() {
+        let dir = TempDir::new("clangd-win");
+        let package = dir.0.join("abc480_a");
+        std::fs::create_dir_all(package.join("examples")).unwrap();
+        std::fs::write(package.join(SOURCE), "").unwrap();
+        std::fs::write(package.join("examples").join("gen.cpp"), "").unwrap();
+        assert!(package.to_string_lossy().starts_with(r"\\?\"));
+        let plain = crate::trust::without_verbatim(&package);
+        let compiler = Path::new(r"C:\mingw64\bin\g++.exe");
+        let database =
+            compilation_database_with(compiler, std::slice::from_ref(&package), None, None);
+        let changes = database["compilationDatabaseChanges"].as_object().unwrap();
+        let main = plain.join(SOURCE).to_string_lossy().into_owned();
+        let generator = plain
+            .join("examples")
+            .join("gen.cpp")
+            .to_string_lossy()
+            .into_owned();
+        let mut keys: Vec<String> = changes.keys().cloned().collect();
+        keys.sort();
+        assert!(
+            keys == vec![generator.clone(), main.clone()],
+            "鍵に \\\\?\\ が付いている"
+        );
+        for key in [&main, &generator] {
+            assert!(
+                changes[key]["workingDirectory"] == plain.to_string_lossy().as_ref(),
+                "workingDirectory に \\\\?\\ が付いている"
+            );
+            let command: Vec<String> =
+                serde_json::from_value(changes[key]["compilationCommand"].clone()).unwrap();
+            assert!(
+                command[command.len() - 2..] == ["-c".to_string(), key.clone()],
+                "-c のファイルに \\\\?\\ が付いている"
+            );
+        }
+        // どこにも `\\?\` がない（JSON の文字列に ? が出ない）
+        assert!(!database.to_string().contains('?'));
     }
 
     #[test]
