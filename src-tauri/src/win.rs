@@ -470,6 +470,41 @@ pub(crate) fn has_job_record(pid: u32) -> bool {
     jobs().contains_key(&pid)
 }
 
+// テスト用のジャンクション（段階 4 T2 で lsp.rs のテストに作り、T3 で sources.rs のテストからも使うためにここへ移した）。
+// 管理者は要らない（段階 1 で確認済み）。link と target は一時フォルダの中だけ。
+// テストが落ちても残らないように、Drop でジャンクションそのものだけを remove_dir で消す（指す先の中身はたどらない）
+#[cfg(test)]
+pub(crate) struct TestJunction(std::path::PathBuf);
+
+#[cfg(test)]
+impl TestJunction {
+    pub(crate) fn new(link: &std::path::Path, target: &std::path::Path) -> TestJunction {
+        use std::os::windows::process::CommandExt;
+        let link = crate::trust::without_verbatim(link);
+        let target = crate::trust::without_verbatim(target);
+        let _ = std::fs::remove_dir(&link);
+        let status = crate::process::command("cmd")
+            .raw_arg(format!(
+                r#"/C mklink /J "{}" "{}""#,
+                link.display(),
+                target.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ジャンクションを作れない");
+        TestJunction(link)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestJunction {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 // テスト用：止めずに Job のハンドルを閉じる（IDE が異常に終わったときにあたる）
 #[cfg(test)]
 pub(crate) fn close_job_without_terminating(pid: u32) {

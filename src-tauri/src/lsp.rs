@@ -1488,39 +1488,9 @@ mod tests {
         assert!(refuse_network_root(Path::new(r"C:\ws")).is_ok());
     }
 
-    // テストのジャンクション（管理者は要らない。段階 1 で確認済み）。link と target は一時フォルダの中だけ。
-    // テストが落ちても残らないように、Drop でジャンクションそのものだけを remove_dir で消す（指す先の中身はたどらない）
+    // テストのジャンクションは win.rs の TestJunction（段階 4 T3 で移した）
     #[cfg(windows)]
-    struct Junction(PathBuf);
-
-    #[cfg(windows)]
-    impl Junction {
-        fn new(link: &Path, target: &Path) -> Junction {
-            use std::os::windows::process::CommandExt;
-            let link = crate::trust::without_verbatim(link);
-            let target = crate::trust::without_verbatim(target);
-            let _ = std::fs::remove_dir(&link);
-            let status = crate::process::command("cmd")
-                .raw_arg(format!(
-                    r#"/C mklink /J "{}" "{}""#,
-                    link.display(),
-                    target.display()
-                ))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "ジャンクションを作れない");
-            Junction(link)
-        }
-    }
-
-    #[cfg(windows)]
-    impl Drop for Junction {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir(&self.0);
-        }
-    }
+    use crate::win::TestJunction as Junction;
 
     // file:///C:/… の形の URI の、ドライブ名を小文字にしたもの・`:` を %3A にしたもの
     #[cfg(windows)]
