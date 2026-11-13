@@ -1002,6 +1002,9 @@ pub async fn lsp_start(
 ) -> Result<Option<Started>, String> {
     // 言語サーバーは開いただけでコードを動かすことがあるので、信頼していない作業領域では拒否する（D-128）
     let root = workspace.trusted_root()?;
+    // Windows（移植の段階 4 T2）：ネットワークの場所（UNC）など、ドライブ名のない作業領域では使えないと知らせる
+    #[cfg(windows)]
+    lsp::refuse_network_root(&root)?;
     let file = resolve(&root, &path).map_err(|error| error.to_string())?;
     let extension = file
         .extension()

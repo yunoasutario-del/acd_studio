@@ -326,8 +326,9 @@ fn check_name(name: &str) -> Result<&str, String> {
 // Windows では `\` も区切りで、`C:`・`\` で始まる名前を join すると前の部分が置き換わり、`\\?\` の付いたパスに join すると `..` が
 // その場で解決される（確認済み）。`:` は代替データストリーム、予約名（NUL・CON・COM1 など。拡張子が付いても）は装置を指し、
 // 末尾の `.`・空白は Windows が取り除くので別の名前を指す。どれも断る
+// lsp.rs の path_of_uri（段階 4 T2）も、URI の部分ごとにこれで確かめる
 #[cfg(windows)]
-fn windows_name_ok(name: &str) -> bool {
+pub(crate) fn windows_name_ok(name: &str) -> bool {
     const RESERVED: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
     if name
         .chars()

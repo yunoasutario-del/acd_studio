@@ -148,6 +148,7 @@ impl Decoder {
 // ---- URI と設定 ----
 
 // パスを file: の URI にする。英数字と -._~/ 以外はパーセントエンコードする
+#[cfg(not(windows))]
 pub fn file_uri(path: &Path) -> String {
     let mut uri = String::from("file://");
     for byte in path.to_string_lossy().as_bytes() {
@@ -159,6 +160,48 @@ pub fn file_uri(path: &Path) -> String {
         }
     }
     uri
+}
+
+// Windows（移植の段階 4 T2）：`file:///C:/a%20b/…` の形にする。`\\?\` を外し、ドライブ名は大文字にして、ドライブ名の `:` は
+// 符号にしない（rust-analyzer・clangd が返す形に近い。推測）。区切りの `\` は `/` にし、ほかは Unix と同じ規則で符号にする。
+// ドライブのないパス（UNC など）は、ドライブの部分を付けずに `\` を `/` にして符号にするだけ（path_of_uri はこれを None にする）
+#[cfg(windows)]
+pub fn file_uri(path: &Path) -> String {
+    let plain = crate::trust::without_verbatim(path);
+    let text = plain.to_string_lossy().replace('\\', "/");
+    let mut uri = String::from("file://");
+    let mut rest = text.as_str();
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        uri.push('/');
+        uri.push(bytes[0].to_ascii_uppercase() as char);
+        uri.push(':');
+        rest = &text[2..];
+    }
+    for byte in rest.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(*byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
+}
+
+// Windows（移植の段階 4 T2。9.1 の追加 41）：作業領域がネットワークの場所（UNC）など、ドライブ名のない場所なら、
+// 言語サーバーは使えないと知らせる。file: の URI がドライブ名のない形になり、path_of_uri で読めないため
+#[cfg(windows)]
+pub fn refuse_network_root(root: &Path) -> Result<(), String> {
+    let plain = crate::trust::without_verbatim(root);
+    let bytes = plain.as_os_str().as_encoded_bytes();
+    let on_drive =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    if on_drive {
+        Ok(())
+    } else {
+        Err("ネットワークの場所（\\\\サーバー\\共有 の形）など、ドライブ名のないフォルダでは、言語サーバーは使えません。ドライブ（C: など）の中のフォルダを開いてください".to_string())
+    }
 }
 
 // rust-analyzer に渡す設定（initializationOptions と workspace/configuration の答え）。
@@ -265,6 +308,7 @@ const ALLOWED_METHODS: &[&str] = &[
 ];
 
 // file: の URI をパスにする（file_uri の逆。%XX を戻す）。file: でない、ホスト名がある、などは None
+#[cfg(not(windows))]
 pub(crate) fn path_of_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     if !rest.starts_with('/') {
@@ -286,12 +330,80 @@ pub(crate) fn path_of_uri(uri: &str) -> Option<PathBuf> {
     String::from_utf8(decoded).ok().map(PathBuf::from)
 }
 
+// Windows（移植の段階 4 T2）：`file:///C:/…`・`file:///c%3A/…` の形だけを読み、`C:\…`（`\\?\` なし、ドライブ名は大文字）にする。
+// 次のものは None（計画書の段階 4 T2 の表）：ホスト名がある（UNC を含む）、ドライブ名で始まらない（`file:////?/…` を含む）、
+// %XX を戻すと `\`・`:`・NUL・制御文字・`*?"<>|` がある部分、予約名（NUL・CON・COM1 など。拡張子付きも）・末尾が `.` か空白の部分。
+// `.` と `..` の部分は残す（あるファイルは canonicalize したあとで、まだないファイルは check_uri で部分の形を確かめる。
+// MinGW の標準ヘッダーは `bin/../lib/gcc/…` の形の場所にあり、clangd がその形で返すかもしれないため。推測）。
+// 名前の決まりは workspace.rs の windows_name_ok（段階 1 C5）と同じ
+#[cfg(windows)]
+pub(crate) fn path_of_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let text = String::from_utf8(decoded).ok()?;
+    let head = text.as_bytes();
+    if head.len() < 4 || !head[1].is_ascii_alphabetic() || head[2] != b':' || head[3] != b'/' {
+        return None;
+    }
+    let mut path = PathBuf::from(format!("{}:\\", head[1].to_ascii_uppercase() as char));
+    for part in text[4..].split('/').filter(|part| !part.is_empty()) {
+        if part != "." && part != ".." && !crate::workspace::windows_name_ok(part) {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
+// Windows（移植の段階 4 T2）：まだないファイルが作業領域の中か。部分は Prefix・RootDir・Normal だけ（`.`・`..` は断る。Unix と同じ）。
+// いちばん近い、ある祖先のフォルダを canonicalize し、そこにまだない部分を付け足してから root と比べる
+// （外を指すジャンクションの中の、まだないフォルダの中のファイルを断る。消したフォルダの中のファイルの didClose は通る）
+#[cfg(windows)]
+fn missing_inside(path: &Path, root: &Path) -> bool {
+    use std::path::Component;
+    if !path.components().all(|c| {
+        matches!(
+            c,
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+        )
+    }) {
+        return false;
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(real) = ancestor.canonicalize() {
+            let Ok(missing) = path.strip_prefix(ancestor) else {
+                return false;
+            };
+            return real.join(missing).starts_with(root);
+        }
+    }
+    false
+}
+
 // URI が作業領域（root。canonicalize 済み）の中のファイルか。あるファイルは実際のパス（リンクをたどった先）で、
 // ない（消した後の didClose など）ファイルは、`.`・`..` を含まないことと、root の下にあることで確かめる
 fn check_uri(uri: &str, root: &Path) -> Result<(), String> {
     let path = path_of_uri(uri).ok_or_else(|| format!("file: の URI ではありません：{uri}"))?;
     let inside = match path.canonicalize() {
         Ok(real) => real.starts_with(root),
+        #[cfg(windows)]
+        Err(_) => missing_inside(&path, root),
+        #[cfg(not(windows))]
         Err(_) => {
             path.components().all(|c| {
                 matches!(
@@ -1063,11 +1175,9 @@ mod tests {
         );
     }
 
+    // Unix のパスの例。Windows では overrides_initialize_on_windows（段階 4 T2）
+    #[cfg(unix)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 4（LSP に渡すパスの区切りと URI）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn overrides_initialize_and_answers_configuration() {
         let dir = Path::new("/ws/problems/abc001_a");
         let mut message = json!({
@@ -1162,6 +1272,8 @@ mod tests {
         assert_eq!(text_document["hover"]["contentFormat"][0], "markdown");
     }
 
+    // Unix のパスの例。Windows では reads_file_uris_on_windows（段階 4 T2）
+    #[cfg(unix)]
     #[test]
     fn reads_file_uris() {
         assert_eq!(
@@ -1176,6 +1288,447 @@ mod tests {
         assert_eq!(path_of_uri("https://example.com/a"), None);
         assert_eq!(path_of_uri("file:///a%2"), None);
         assert_eq!(path_of_uri("file:///a%ZZ"), None);
+    }
+
+    // 段階 4 T2：Windows の file: の URI。`\\?\` を外し、ドライブ名は大文字、`:` は符号にしない。
+    // ドライブのないパス（UNC など）は、ドライブの部分を付けずに `\` を `/` にして符号にするだけで、path_of_uri はそれを None にする
+    #[cfg(windows)]
+    #[test]
+    fn makes_file_uris_on_windows() {
+        assert_eq!(
+            file_uri(Path::new(r"\\?\C:\a b\あ")),
+            "file:///C:/a%20b/%E3%81%82"
+        );
+        assert_eq!(file_uri(Path::new(r"c:\x\y.rs")), "file:///C:/x/y.rs");
+        assert_eq!(file_uri(Path::new(r"C:\")), "file:///C:/");
+        for (path, uri) in [
+            (r"\\?\UNC\server\share\a.rs", "file:////server/share/a.rs"),
+            (r"\\server\share\a.rs", "file:////server/share/a.rs"),
+            (r"\x\a.rs", "file:///x/a.rs"),
+            (r"C:a.rs", "file:///C:a.rs"),
+            (r"a\b.rs", "file://a/b.rs"),
+        ] {
+            assert_eq!(file_uri(Path::new(path)), uri, "{path}");
+            assert_eq!(path_of_uri(uri), None, "{uri}");
+        }
+    }
+
+    // 段階 4 T2：Windows の path_of_uri。断るか中と見なすかの表（計画書の段階 4 T2）のとおり
+    #[cfg(windows)]
+    #[test]
+    fn reads_file_uris_on_windows() {
+        for (uri, path) in [
+            (
+                "file:///C:/T/ws/%E6%97%A5%E6%9C%AC%20%E8%AA%9E.rs",
+                r"C:\T\ws\日本 語.rs",
+            ),
+            ("file:///C:/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            ("file:///C%3A/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            ("file:///c%3a/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            ("file:///c:/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            // . と .. は残す（あるファイルは canonicalize のあとで、まだないファイルは要素の形で確かめる）
+            (
+                "file:///C:/T/ws/../out/secret.rs",
+                r"C:\T\ws\..\out\secret.rs",
+            ),
+            (
+                "file:///C:/T/mingw64/bin/../lib/gcc/vector",
+                r"C:\T\mingw64\bin\..\lib\gcc\vector",
+            ),
+            // %2F は区切りになる（Unix と同じ）
+            ("file:///C:/T/ws/a%2Fb.rs", r"C:\T\ws\a\b.rs"),
+            ("file:///C:/", r"C:\"),
+        ] {
+            assert_eq!(path_of_uri(uri), Some(PathBuf::from(path)), "{uri}");
+        }
+        // 小文字のドライブ名の URI からも、文字として C:\… が返る（PathBuf の == はドライブ名の大文字・小文字の違いを
+        // 見分けないようなので、文字列で比べる。外して落ちることの確かめで分かった）
+        for uri in ["file:///c:/T/ws/a.rs", "file:///c%3a/T/ws/a.rs"] {
+            assert_eq!(
+                path_of_uri(uri).unwrap().to_string_lossy(),
+                r"C:\T\ws\a.rs",
+                "{uri}"
+            );
+        }
+        for uri in [
+            // %5C で作る ..（戻すと \ がある）
+            "file:///C:/T/ws/..%5C..%5Cout%5Csecret.rs",
+            // 2 つ目より後ろの部分の :（代替データストリーム）
+            "file:///C:/T/ws/a.rs:x",
+            "file:///C:/T/ws/a%3Ax.rs",
+            "file:///C:/T/C:/a.rs",
+            // \\?\ を URI に入れたもの
+            "file:////?/C:/T/ws/a.rs",
+            "file://%5C%5C%3F%5CC%3A%5CT%5Cws%5Ca.rs",
+            "file:///%5C%5C%3F%5CC%3A%5CT%5Cws%5Ca.rs",
+            // 予約名（拡張子付き・途中の部分も）
+            "file:///C:/T/ws/NUL",
+            "file:///C:/T/ws/nul.txt",
+            "file:///C:/T/ws/con.rs",
+            "file:///C:/T/ws/COM1",
+            "file:///C:/T/ws/COM%C2%B9",
+            "file:///C:/T/ws/CONIN$",
+            "file:///C:/T/ws/NUL/a.rs",
+            // 末尾の . と空白、使えない文字、NUL、制御文字
+            "file:///C:/T/ws/a.rs.",
+            "file:///C:/T/ws/...",
+            "file:///C:/T/ws/a.rs%20",
+            "file:///C:/T/ws/a%3F.rs",
+            "file:///C:/T/ws/a%2A.rs",
+            "file:///C:/T/ws/a%00.rs",
+            "file:///C:/T/ws/a%01.rs",
+            // UNC・ホスト名
+            "file://server/share/a.rs",
+            "file:////server/share/a.rs",
+            "file://localhost/C:/T/ws/a.rs",
+            // ドライブ名がない、: のあとに / がない、古い | の形、英字でないドライブ名
+            "file:///x",
+            "file:///C:",
+            "file:///C:x",
+            "file:///C|/T/a.rs",
+            "file:///1:/T/a.rs",
+            // 壊れた %XX、file: でない
+            "file:///C:/a%2",
+            "file:///C:/a%ZZ",
+            "https://example.com/a",
+        ] {
+            assert_eq!(path_of_uri(uri), None, "{uri}");
+        }
+    }
+
+    // 段階 4 T2：canonicalize は、ドライブ名を大文字で返す（小文字で渡しても）。file_uri もドライブ名を大文字にするので、
+    // 作業領域の URI とそろう。失敗の文には、利用者のフォルダの名前を出さない
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_returns_the_drive_in_upper_case() {
+        let real = std::env::temp_dir().canonicalize().unwrap();
+        let text = real.to_string_lossy().into_owned();
+        let rest = text
+            .strip_prefix(r"\\?\")
+            .expect("canonicalize の結果に \\\\?\\ がない");
+        let drive = rest.chars().next().unwrap();
+        assert!(
+            drive.is_ascii_uppercase(),
+            "ドライブ名が大文字でない：{drive}"
+        );
+        let lower = format!("{}{}", drive.to_ascii_lowercase(), &rest[1..]);
+        assert!(
+            Path::new(&lower).canonicalize().unwrap() == real,
+            "小文字のドライブ名で渡すと、結果が違う"
+        );
+        // 行き帰り：file_uri の URI を path_of_uri で戻すと、`\\?\` を外した同じパスになる
+        let file = real.join("日本 語.rs");
+        assert!(
+            path_of_uri(&file_uri(&file)) == Some(crate::trust::without_verbatim(&file)),
+            "行き帰りで同じパスにならない"
+        );
+    }
+
+    // 段階 4 T2：initialize に入れる場所と、画面に返す rootUri（画面の documentUri はこれに相対パスを足す）
+    #[cfg(windows)]
+    #[test]
+    fn overrides_initialize_on_windows() {
+        let dir = Path::new(r"C:\ws\problems\abc001_a");
+        let mut message = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "rootUri": "file:///elsewhere", "initializationOptions": { "x": 1 }, "capabilities": {} }
+        });
+        override_initialize(&mut message, dir, &settings(&[dir.to_path_buf()]));
+        let params = &message["params"];
+        assert_eq!(params["rootUri"], "file:///C:/ws/problems/abc001_a");
+        assert_eq!(
+            params["workspaceFolders"][0]["uri"],
+            "file:///C:/ws/problems/abc001_a"
+        );
+        assert_eq!(params["workspaceFolders"][0]["name"], "abc001_a");
+        assert_eq!(
+            params["initializationOptions"],
+            json!({ "linkedProjects": [r"C:\ws\problems\abc001_a\Cargo.toml"] })
+        );
+        assert_eq!(
+            params["capabilities"],
+            json!({ "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } })
+        );
+        let request = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "workspace/configuration",
+            "params": { "items": [{ "section": "rust-analyzer" }, { "section": "python" }, { "section": "other" }] }
+        });
+        let answer = configuration_answer(
+            &request,
+            &json!({ "rust-analyzer": settings(&[dir.to_path_buf()]) }),
+        );
+        assert_eq!(
+            answer["result"][0]["linkedProjects"][0],
+            r"C:\ws\problems\abc001_a\Cargo.toml"
+        );
+        assert_eq!(answer["result"][1], Value::Null);
+        let configuration = basedpyright_configuration(Some(Path::new(r"C:\x\python.exe")));
+        let answer = configuration_answer(&request, &configuration);
+        assert_eq!(answer["result"][1]["pythonPath"], r"C:\x\python.exe");
+        // 画面に返す rootUri は `\\?\` を外した形。パッケージは `/` 区切り
+        let started = started(
+            Path::new(r"\\?\C:\ws"),
+            Path::new(r"\\?\C:\ws\problems\abc001_a"),
+            false,
+            "rust-analyzer",
+        );
+        assert_eq!(started.package, "problems/abc001_a");
+        assert_eq!(started.root_uri, "file:///C:/ws/problems/abc001_a");
+    }
+
+    // 段階 4 T2（9.1 の追加 41）：作業領域が UNC（ネットワークの場所）なら、言語サーバーは使えないと知らせる
+    #[cfg(windows)]
+    #[test]
+    fn refuses_a_network_workspace() {
+        for root in [r"\\?\UNC\server\share\ws", r"\\server\share\ws"] {
+            let error = refuse_network_root(Path::new(root)).unwrap_err();
+            assert!(error.contains("ネットワークの場所"), "{error}");
+        }
+        assert!(refuse_network_root(Path::new(r"\\?\C:\ws")).is_ok());
+        assert!(refuse_network_root(Path::new(r"C:\ws")).is_ok());
+    }
+
+    // テストのジャンクション（管理者は要らない。段階 1 で確認済み）。link と target は一時フォルダの中だけ。
+    // テストが落ちても残らないように、Drop でジャンクションそのものだけを remove_dir で消す（指す先の中身はたどらない）
+    #[cfg(windows)]
+    struct Junction(PathBuf);
+
+    #[cfg(windows)]
+    impl Junction {
+        fn new(link: &Path, target: &Path) -> Junction {
+            use std::os::windows::process::CommandExt;
+            let link = crate::trust::without_verbatim(link);
+            let target = crate::trust::without_verbatim(target);
+            let _ = std::fs::remove_dir(&link);
+            let status = crate::process::command("cmd")
+                .raw_arg(format!(
+                    r#"/C mklink /J "{}" "{}""#,
+                    link.display(),
+                    target.display()
+                ))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "ジャンクションを作れない");
+            Junction(link)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Junction {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    // file:///C:/… の形の URI の、ドライブ名を小文字にしたもの・`:` を %3A にしたもの
+    #[cfg(windows)]
+    fn lower_drive(uri: &str) -> String {
+        let (head, tail) = uri.split_at("file:///C".len());
+        format!("{}{tail}", head.to_ascii_lowercase())
+    }
+
+    #[cfg(windows)]
+    fn percent_colon(uri: &str) -> String {
+        let at = "file:///C".len();
+        format!("{}%3A{}", &uri[..at], &uri[at + 1..])
+    }
+
+    // 段階 4 T2 の前の file_uri（`\\?\` を含むパスをそのまま符号にした）の形
+    #[cfg(windows)]
+    fn old_file_uri(path: &Path) -> String {
+        let mut uri = String::from("file://");
+        for byte in path.to_string_lossy().as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    uri.push(*byte as char)
+                }
+                _ => uri.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        uri
+    }
+
+    // checks_messages_against_the_allow_list の Windows 版（段階 4 T2）。リンクはジャンクション（フォルダへのもの）。
+    // 失敗の文には、利用者のフォルダの名前を含む URI を出さず、番号だけを出す
+    #[cfg(windows)]
+    #[test]
+    fn checks_messages_against_the_allow_list_on_windows() {
+        let root = temp_dir("allow-root-win");
+        let outside = temp_dir("allow-outside-win");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(outside.join("secret.rs"), "").unwrap();
+        let link = root.join("link");
+        let _junction = Junction::new(&link, &outside);
+        let inside = file_uri(&root.join("src/main.rs"));
+        let open = |uri: &str, text: &str| {
+            json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                    "params": { "textDocument": { "uri": uri, "languageId": "rust", "version": 0, "text": text } } })
+        };
+        let close = |uri: &str| {
+            json!({ "jsonrpc": "2.0", "method": "textDocument/didClose",
+                    "params": { "textDocument": { "uri": uri } } })
+        };
+        // 通るもの：あるファイル（ドライブ名が小文字・%3A の形も）
+        for (n, uri) in [inside.clone(), lower_drive(&inside), percent_colon(&inside)]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                check_message(&open(uri, "fn main() {}"), &root).is_ok(),
+                "{n}"
+            );
+        }
+        assert!(check_message(&json!({ "jsonrpc": "2.0", "id": 3, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": inside }, "position": { "line": 0, "character": 0 } } }), &root).is_ok());
+        assert!(
+            check_message(
+                &json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 3 } }),
+                &root
+            )
+            .is_ok()
+        );
+        // 通るもの：まだないファイルの didClose（ドライブ名だけ小文字、%3A、消したフォルダの中、フォルダの大文字・小文字の違い）
+        let gone = file_uri(&root.join("src/gone.rs"));
+        let upper = format!("file:///{}", gone["file:///".len()..].to_ascii_uppercase());
+        for (n, uri) in [
+            gone.clone(),
+            lower_drive(&gone),
+            percent_colon(&gone),
+            file_uri(&root.join("deleted/folder/x.rs")),
+            upper,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(check_message(&close(uri), &root).is_ok(), "{n}");
+        }
+        // 通さないもの：許可にない方法
+        for method in [
+            "workspace/executeCommand",
+            "workspace/didChangeConfiguration",
+            "textDocument/rename",
+        ] {
+            let message = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "textDocument": { "uri": inside } } });
+            assert!(check_message(&message, &root).is_err(), "{method}");
+        }
+        // 通さないもの（開く・閉じるの両方で）
+        let rejected = |uri: &str| {
+            check_message(&open(uri, ""), &root).is_err()
+                && check_message(&close(uri), &root).is_err()
+        };
+        let base = file_uri(&root);
+        let out_name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        for (n, uri) in [
+            // 0〜1：外（あるファイル・まだないファイル）
+            file_uri(&outside.join("secret.rs")),
+            file_uri(&outside.join("none.rs")),
+            // 2〜5：外を指すジャンクションの先（あるファイル・まだないファイル・さらに下のまだないフォルダの中・その小文字のドライブ名）
+            file_uri(&link.join("secret.rs")),
+            file_uri(&link.join("none.rs")),
+            file_uri(&link.join("deeper/none/x.rs")),
+            lower_drive(&file_uri(&link.join("deeper/none/x.rs"))),
+            // 6〜8：.. で外に出るもの（あるファイル・まだないファイル）と、.. で中に戻るまだないファイル（今までどおり断る）
+            format!("{base}/../{out_name}/secret.rs"),
+            format!("{base}/../{out_name}/none.rs"),
+            format!("{base}/src/../src/gone.rs"),
+            // 9：%5C で作る ..
+            format!("{base}/src/..%5C..%5C{out_name}%5Csecret.rs"),
+            // 10〜11：2 つ目より後ろの部分の :
+            format!("{inside}:x"),
+            format!("{base}/src/main.rs%3Ax"),
+            // 12〜14：\\?\ を URI に入れたもの
+            format!("file:////?/{}", &inside["file:///".len()..]),
+            old_file_uri(&root.join("src/main.rs")),
+            format!(
+                "file:///{}",
+                &old_file_uri(&root.join("src/main.rs"))["file://".len()..]
+            ),
+            // 15〜18：予約名
+            format!("{base}/src/NUL"),
+            format!("{base}/src/nul.txt"),
+            format!("{base}/src/con.rs"),
+            format!("{base}/src/COM1"),
+            // 19：末尾の .
+            format!("{base}/src/main.rs."),
+            // 20〜22：UNC、ドライブのない URI
+            "file://server/share/src/main.rs".to_string(),
+            "file:////server/share/src/main.rs".to_string(),
+            "file:///src/main.rs".to_string(),
+            // 23：file: でない
+            "untitled:a.rs".to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(rejected(uri), "{n} 番目を通した");
+        }
+        assert!(
+            check_message(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "textDocument/hover", "params": {} }),
+                &root
+            )
+            .is_err()
+        );
+        assert!(check_message(&json!({ "jsonrpc": "2.0", "id": 1 }), &root).is_err());
+        // 本文の大きさ
+        let limit = "a".repeat(MAX_FILE_SIZE as usize);
+        assert!(check_message(&open(&inside, &limit), &root).is_ok());
+        assert!(check_message(&open(&inside, &(limit.clone() + "a")), &root).is_err());
+    }
+
+    // locates_files_inside_the_workspace の Windows 版（段階 4 T2）。リンクはジャンクション
+    #[cfg(windows)]
+    #[test]
+    fn locates_files_inside_the_workspace_on_windows() {
+        let root = temp_dir("locate-root-win");
+        let outside = temp_dir("locate-outside-win");
+        std::fs::create_dir_all(root.join("src/bin")).unwrap();
+        std::fs::write(root.join("src/bin/a.rs"), "").unwrap();
+        std::fs::write(root.join("src/日本 語.rs"), "").unwrap();
+        std::fs::write(outside.join("secret.rs"), "").unwrap();
+        let link = root.join("link");
+        let _junction = Junction::new(&link, &outside);
+        let locate = |uri: &str| locate_in_workspace(&root, uri);
+        let a = file_uri(&root.join("src/bin/a.rs"));
+        // ドライブ名が小文字・%3A の URI も、同じ場所になる
+        for (n, uri) in [a.clone(), lower_drive(&a), percent_colon(&a)]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(locate(uri), Some("src/bin/a.rs".to_string()), "{n}");
+        }
+        assert_eq!(
+            locate(&file_uri(&root.join("src/日本 語.rs"))),
+            Some("src/日本 語.rs".to_string())
+        );
+        // .. を含んでも、中のファイルなら中
+        let base = file_uri(&root);
+        assert_eq!(
+            locate(&format!("{base}/src/../src/bin/a.rs")),
+            Some("src/bin/a.rs".to_string())
+        );
+        // 外、ジャンクションで外を指すもの、フォルダ、ないファイル、.. で外に出るもの、\\?\ を入れた URI、: のあるもの
+        let out_name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        for (n, uri) in [
+            file_uri(&outside.join("secret.rs")),
+            file_uri(&link.join("secret.rs")),
+            file_uri(&root.join("src")),
+            file_uri(&root.join("src/none.rs")),
+            format!("{base}/../{out_name}/secret.rs"),
+            format!("{base}/src/..%5C..%5C..%5C{out_name}%5Csecret.rs"),
+            old_file_uri(&root.join("src/bin/a.rs")),
+            format!("{a}:x"),
+            "untitled:a.rs".to_string(),
+            "https://example.com/a.rs".to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(locate(uri), None, "{n} 番目");
+        }
     }
 
     #[cfg(unix)]
