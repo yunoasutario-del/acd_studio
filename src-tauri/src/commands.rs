@@ -1013,7 +1013,7 @@ pub async fn lsp_start(
         .to_string();
     let cpp = cpp_settings_of(&app);
     let python = lang_settings_of(&app).python;
-    // Windows（移植の段階 4 T6）：settings.json の cpp.clangd（空なら探す）
+    // Windows（移植の段階 4 T6・T7）：settings.json の cpp.clangd・python.basedpyright（空なら探す）
     #[cfg(windows)]
     let lsp_paths = app_dir(&app)
         .map(|dir| storage::lsp_paths(&dir))
@@ -1047,7 +1047,17 @@ pub async fn lsp_start(
             };
             let (dir, projects) = lsp::basedpyright_place(&root, package);
             let interpreter = crate::python::find_interpreter(&python).ok();
-            lsp::basedpyright(dir, projects, interpreter.as_deref())?
+            #[cfg(not(windows))]
+            let launch = lsp::basedpyright(dir, projects, interpreter.as_deref())?;
+            // Windows（移植の段階 4 T7）：settings.json の python.basedpyright（空なら探す）
+            #[cfg(windows)]
+            let launch = lsp::basedpyright(
+                dir,
+                projects,
+                interpreter.as_deref(),
+                &lsp_paths.basedpyright,
+            )?;
+            launch
         } else {
             return Ok(None);
         };
@@ -1094,12 +1104,21 @@ pub fn locate_source(
 pub async fn read_source(uri: String, app: AppHandle) -> Result<ReadOnlySource, String> {
     let cpp = cpp_settings_of(&app);
     let python = lang_settings_of(&app).python;
+    // Windows（移植の段階 4 T7）：settings.json の python.basedpyright（空なら探す）
+    #[cfg(windows)]
+    let lsp_paths = app_dir(&app)
+        .map(|dir| storage::lsp_paths(&dir))
+        .unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let cpp_roots = cpp::find_compiler(&cpp)
             .map(|compiler| cpp::header_dirs(&compiler, cpp.ac_library.as_deref()))
             .unwrap_or_default();
         // Python：basedpyright の typeshed と、設定の処理系の標準ライブラリ・site-packages（D-225）
-        let mut python_roots: Vec<PathBuf> = lsp::basedpyright_typeshed().into_iter().collect();
+        #[cfg(not(windows))]
+        let typeshed = lsp::basedpyright_typeshed();
+        #[cfg(windows)]
+        let typeshed = lsp::basedpyright_typeshed(&lsp_paths.basedpyright);
+        let mut python_roots: Vec<PathBuf> = typeshed.into_iter().collect();
         if let Ok(interpreter) = crate::python::find_interpreter(&python) {
             python_roots.extend(crate::python::library_dirs(&interpreter));
         }

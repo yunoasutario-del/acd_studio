@@ -1037,8 +1037,10 @@ pub fn clangd(
 
 // basedpyright（`brew install basedpyright`）を探す（D-225）。IDE は入れない。
 // 探す順は、Homebrew（/opt/homebrew/bin）、PATH、/usr/local/bin（Python の処理系と同じ）
+#[cfg(not(windows))]
 pub const BASEDPYRIGHT_MISSING: &str = "Python の言語機能には basedpyright が要ります。ターミナルで `brew install basedpyright` を実行して入れてください";
 
+#[cfg(not(windows))]
 fn find_basedpyright() -> Result<PathBuf, String> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
@@ -1067,6 +1069,7 @@ fn basedpyright_configuration(interpreter: Option<&Path>) -> Value {
 }
 
 // basedpyright を dir で、projects の Python のパッケージを扱うように動かす。interpreter は設定の処理系
+#[cfg(not(windows))]
 pub fn basedpyright(
     dir: PathBuf,
     projects: Vec<PathBuf>,
@@ -1089,11 +1092,97 @@ pub fn basedpyright(
 // basedpyright の中の typeshed（標準ライブラリなどの型の情報。定義ジャンプの行き先。D-225）。
 // `basedpyright-langserver` のリンクをたどった先（npm のパッケージの `langserver.index.js`）の隣の
 // `dist/typeshed-fallback`。なければ None
+#[cfg(not(windows))]
 pub fn basedpyright_typeshed() -> Option<PathBuf> {
     let program = find_basedpyright().ok()?.canonicalize().ok()?;
     program
         .parent()?
         .join("dist/typeshed-fallback")
+        .canonicalize()
+        .ok()
+}
+
+// Windows（移植の段階 4 T7）：basedpyright が見つからないときの案内（brew の代わり）
+#[cfg(windows)]
+pub const BASEDPYRIGHT_MISSING: &str = "Python の言語機能には basedpyright が要ります。CPython 3.13 で venv を作り（例：%LOCALAPPDATA%\\Programs\\basedpyright-venv）、その中に `pip install basedpyright` で入れるか、settings.json の python.basedpyright に basedpyright-langserver.exe のパスを書いてください";
+
+// Windows（移植の段階 4 T7。9.1 の追加 38・39）：basedpyright（pip 版の basedpyright-langserver.exe）を探す。
+// configured は settings.json の python.basedpyright（空なら探す）。探す順は、設定 → PATH の basedpyright-langserver.exe →
+// %LOCALAPPDATA%\Programs\basedpyright-venv\Scripts。見つかった場所は覚えない
+#[cfg(windows)]
+fn find_basedpyright(configured: &str) -> Result<PathBuf, String> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let fixed: Vec<PathBuf> = std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join(r"Programs\basedpyright-venv\Scripts"))
+        .into_iter()
+        .collect();
+    find_basedpyright_in(configured, &path_dirs, &fixed)
+}
+
+// 探す場所を全部引数で受け取る（テストで、本物の PATH・%LOCALAPPDATA% を見ないため）
+#[cfg(windows)]
+fn find_basedpyright_in(
+    configured: &str,
+    path_dirs: &[PathBuf],
+    fixed: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if path.is_absolute() && path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "settings.json の python.basedpyright（{configured}）が見つかりません。{BASEDPYRIGHT_MISSING}"
+        ));
+    }
+    path_dirs
+        .iter()
+        .filter(|dir| dir.is_absolute())
+        .chain(fixed)
+        .map(|dir| dir.join("basedpyright-langserver.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| BASEDPYRIGHT_MISSING.to_string())
+}
+
+// Windows（移植の段階 4 T7）：設定の basedpyright（configured。空なら探す）を、dir で、projects の Python のパッケージを
+// 扱うように動かす。interpreter は設定の処理系
+#[cfg(windows)]
+pub fn basedpyright(
+    dir: PathBuf,
+    projects: Vec<PathBuf>,
+    interpreter: Option<&Path>,
+    configured: &str,
+) -> Result<Launch, String> {
+    let program = find_basedpyright(configured)?;
+    let mut command = crate::process::command(program);
+    command.arg("--stdio");
+    toolchain::clear_ide_env(&mut command);
+    Ok(Launch {
+        name: "basedpyright",
+        command,
+        dir,
+        projects,
+        options: Value::Null,
+        configuration: basedpyright_configuration(interpreter),
+    })
+}
+
+// Windows（移植の段階 4 T7）：basedpyright の中の typeshed。pip で venv（か CPython の本体）に入れたときの並び
+// （<venv>\Scripts\basedpyright-langserver.exe と <venv>\Lib\site-packages\basedpyright\dist\typeshed-fallback）から求める。
+// なければ None（pip install --user など、並びが違うときも None。定義の行き先を読み取り専用で開けないだけ）
+#[cfg(windows)]
+pub fn basedpyright_typeshed(configured: &str) -> Option<PathBuf> {
+    pip_typeshed(&find_basedpyright(configured).ok()?)
+}
+
+#[cfg(windows)]
+fn pip_typeshed(program: &Path) -> Option<PathBuf> {
+    program
+        .parent()?
+        .parent()?
+        .join(r"Lib\site-packages\basedpyright\dist\typeshed-fallback")
         .canonicalize()
         .ok()
 }
@@ -1815,6 +1904,109 @@ mod tests {
         assert!(error.contains(r"%LOCALAPPDATA%\Programs"));
         assert!(error.contains("cpp.clangd"));
         assert!(!error.contains("xcode-select"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 段階 4 T7（9.1 の追加 38・39）：Windows で basedpyright を探す順。探す場所は全部一時フォルダの中に作って渡し、本物の
+    // PATH・%LOCALAPPDATA% は見ない
+    #[cfg(windows)]
+    #[test]
+    fn finds_basedpyright_in_order_on_windows() {
+        let base = temp_dir("basedpyright-find");
+        let _ = std::fs::remove_dir_all(&base);
+        let exe = |dir: &str| {
+            let path = base.join(dir).join("basedpyright-langserver.exe");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            path
+        };
+        let configured = exe("custom");
+        let in_path = exe("path-dir");
+        let relative_target = exe("relative-dir");
+        let venv = exe(r"basedpyright-venv\Scripts");
+        let fixed = vec![venv.parent().unwrap().to_path_buf()];
+        let path_dirs = vec![in_path.parent().unwrap().to_path_buf()];
+        // 1. 設定があれば、それだけを使う
+        let text = configured.to_string_lossy().into_owned();
+        assert!(
+            find_basedpyright_in(&text, &path_dirs, &fixed).unwrap() == configured,
+            "設定の basedpyright を使わない"
+        );
+        // 設定のファイルがない・相対パスなら、案内（ほかの場所は探さない）
+        for missing in [
+            base.join(r"none\basedpyright-langserver.exe")
+                .to_string_lossy()
+                .into_owned(),
+            "basedpyright-langserver.exe".to_string(),
+        ] {
+            let error = find_basedpyright_in(&missing, &path_dirs, &fixed).unwrap_err();
+            assert!(
+                error.contains("settings.json の python.basedpyright"),
+                "{error}"
+            );
+            assert!(error.contains(BASEDPYRIGHT_MISSING), "{error}");
+        }
+        // 2. PATH の basedpyright-langserver.exe（相対パスのフォルダは見ない）
+        assert!(
+            find_basedpyright_in("", &path_dirs, &fixed).unwrap() == in_path,
+            "PATH の basedpyright を使わない"
+        );
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        if let Some(relative) = relative_path(&cwd, relative_target.parent().unwrap()) {
+            assert!(relative.join("basedpyright-langserver.exe").is_file());
+            let with_relative = find_basedpyright_in("", &[relative], &fixed);
+            assert!(
+                with_relative
+                    .as_ref()
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok())
+                    != relative_target.canonicalize().ok(),
+                "相対パスの PATH のフォルダを見た"
+            );
+            assert!(
+                with_relative == find_basedpyright_in("", &[], &fixed),
+                "相対パスの PATH のフォルダがあると、結果が変わった"
+            );
+        } else {
+            eprintln!("今いる場所と一時フォルダのドライブが違うので、相対パスの確かめを飛ばします");
+        }
+        // 3. 決まった場所（%LOCALAPPDATA%\Programs\basedpyright-venv\Scripts）
+        assert!(
+            find_basedpyright_in("", &[], &fixed).unwrap() == venv,
+            "決まった場所の basedpyright を使わない"
+        );
+        // どこにもなければ、Windows の案内（brew は出さない）
+        let error = find_basedpyright_in("", &[], &[base.join("none")]).unwrap_err();
+        assert_eq!(error, BASEDPYRIGHT_MISSING);
+        assert!(error.contains(r"%LOCALAPPDATA%\Programs\basedpyright-venv"));
+        assert!(error.contains("pip install basedpyright"));
+        assert!(error.contains("python.basedpyright"));
+        assert!(!error.contains("brew"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 段階 4 T7：pip で venv に入れた basedpyright の typeshed の場所（Scripts の 1 つ上の Lib\site-packages\basedpyright\dist）
+    #[cfg(windows)]
+    #[test]
+    fn finds_the_pip_typeshed_on_windows() {
+        let base = temp_dir("basedpyright-typeshed");
+        let _ = std::fs::remove_dir_all(&base);
+        let program = base.join(r"venv\Scripts\basedpyright-langserver.exe");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, "").unwrap();
+        // typeshed がなければ None
+        assert_eq!(pip_typeshed(&program), None);
+        let typeshed = base.join(r"venv\Lib\site-packages\basedpyright\dist\typeshed-fallback");
+        std::fs::create_dir_all(typeshed.join("stdlib")).unwrap();
+        assert!(
+            pip_typeshed(&program) == typeshed.canonicalize().ok(),
+            "venv の typeshed を求められない"
+        );
+        // 並びが違う（Scripts の 1 つ上に Lib がない。pip install --user など）なら None
+        let elsewhere = base.join(r"user\Python313\Scripts\basedpyright-langserver.exe");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(pip_typeshed(&elsewhere), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3166,7 +3358,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // 手元に basedpyright と CPython 3.13 があるときだけ、本当の basedpyright で確かめる（D-225）
+    // 手元に basedpyright と CPython 3.13 があるときだけ、本当の basedpyright で確かめる（D-225）。
+    // Windows では analyzes_python_with_local_basedpyright_on_windows（段階 4 T7。#[ignore] で、手で動かす）
+    #[cfg(not(windows))]
     #[test]
     fn analyzes_python_with_local_basedpyright() {
         let Ok(interpreter) =
@@ -3487,6 +3681,194 @@ mod tests {
             .map(|(_, name)| name.as_str())
             .collect();
         assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 段階 4 T7：本物の basedpyright（探す順で見つかるもの）と CPython 3.13 で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
+    // cargo test --lib -- --ignored --exact lsp::tests::analyzes_python_with_local_basedpyright_on_windows --nocapture
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、診断の数、子孫の exe の名前と数、かかった時間だけ
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "本物の basedpyright（node）と CPython を使う。手で 1 件だけ動かす（段階 4 T7）"]
+    fn analyzes_python_with_local_basedpyright_on_windows() {
+        let started = Instant::now();
+        let hide = |text: &str| {
+            let mut text = text.to_string();
+            for name in ["LOCALAPPDATA", "USERPROFILE"] {
+                if let Some(value) = std::env::var_os(name) {
+                    text = text.replace(&*value.to_string_lossy(), &format!("%{name}%"));
+                }
+            }
+            text
+        };
+        let interpreter =
+            crate::python::find_interpreter(&crate::python::PythonSettings::default())
+                .expect("CPython 3.13 が見つからない");
+        let program = find_basedpyright("").expect("basedpyright が見つからない");
+        eprintln!("basedpyright：{}", hide(&program.to_string_lossy()));
+        eprintln!("処理系：{}", hide(&interpreter.to_string_lossy()));
+        let typeshed = basedpyright_typeshed("").expect("typeshed が見つからない");
+        eprintln!("typeshed：{}", hide(&typeshed.to_string_lossy()));
+        let root = temp_dir("basedpyright-real-win");
+        let _ = std::fs::remove_dir_all(root.join("abc480"));
+        let package = root.join("abc480").join("abc480_a");
+        std::fs::create_dir_all(&package).unwrap();
+        let source = "import sys\nfrom collections import deque\n\n\ndef main():\n    n = int(input())\n    q = deque()\n    print(n + \"a\")\n\n\nmain()\n";
+        std::fs::write(package.join("main.py"), source).unwrap();
+        let (dir, projects) = basedpyright_place(&root, &package);
+        let launch = basedpyright(dir, projects, Some(&interpreter), "").unwrap();
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        assert!(
+            !control
+                .start(root.clone(), launch, "a".to_string(), sink)
+                .unwrap()
+        );
+        let pid = control.server.lock().unwrap().as_ref().unwrap().child.id();
+        let uri = file_uri(&package.join("main.py"));
+        let wanted = path_of_uri(&uri);
+        let message = |text: String| control.send(&text).unwrap();
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": { "workspace": { "configuration": true } } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "python", "version": 1, "text": source } } }).to_string());
+        let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
+            events.lock().unwrap().iter().find_map(|event| match event {
+                LspEvent::Message { text } => {
+                    serde_json::from_str::<Value>(text).ok().filter(|m| pick(m))
+                }
+                _ => None,
+            })
+        };
+        // 処理系を受け取ってから調べるので、空でない診断が届いてから問い合わせる（60 秒まで待つ）
+        let mut diagnostics = None;
+        for _ in 0..600 {
+            diagnostics = find(&|m| {
+                m["method"] == "textDocument/publishDiagnostics"
+                    && m["params"]["uri"].as_str().and_then(path_of_uri) == wanted
+                    && m["params"]["diagnostics"]
+                        .as_array()
+                        .is_some_and(|list| !list.is_empty())
+            });
+            if diagnostics.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        message(json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 6, "character": 9 } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 3, "method": "textDocument/documentSymbol", "params": { "textDocument": { "uri": uri } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 4, "method": "textDocument/inlayHint", "params": { "textDocument": { "uri": uri }, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 11, "character": 0 } } } }).to_string());
+        let (mut definition, mut symbols, mut hints) = (None, None, None);
+        for _ in 0..600 {
+            definition = find(&|m| m["id"] == 2);
+            symbols = find(&|m| m["id"] == 3);
+            hints = find(&|m| m["id"] == 4);
+            if definition.is_some() && symbols.is_some() && hints.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let diagnostics = diagnostics.expect("診断が届かない");
+        eprintln!(
+            "publishDiagnostics の URI の頭：{}",
+            drive_part(diagnostics["params"]["uri"].as_str().unwrap())
+        );
+        let list = diagnostics["params"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .clone();
+        eprintln!("診断の数：{}", list.len());
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
+        let (mut in_messages, mut in_logs) = (0, 0);
+        for event in events.lock().unwrap().iter() {
+            match event {
+                LspEvent::Message { text } => {
+                    in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Log { text } => {
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Exited { .. } => {}
+            }
+        }
+        eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        let children = crate::win::descendants(pid);
+        let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
+        names.sort();
+        eprintln!("止める前の子孫：{} 個 {names:?}", children.len());
+        control.stop();
+        assert!(!crate::win::has_job_record(pid), "Job の記録が残っている");
+        assert!(!crate::win::is_alive(pid), "basedpyright が残っている");
+        let gone = |child: u32| {
+            (0..100).any(|_| {
+                if crate::win::is_alive(child) {
+                    thread::sleep(Duration::from_millis(20));
+                    false
+                } else {
+                    true
+                }
+            })
+        };
+        let left: Vec<&str> = children
+            .iter()
+            .filter(|(child, _)| !gone(*child))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        // standard の検査：型の誤りは誤り（1）、使っていない import は目立たない印（4）。既定の厳しい検査（2）は出ない
+        let lines: Vec<(u64, u64)> = list
+            .iter()
+            .map(|d| {
+                (
+                    d["range"]["start"]["line"].as_u64().unwrap(),
+                    d["severity"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(lines.contains(&(7, 1)), "型の誤りの診断がない");
+        assert!(lines.contains(&(0, 4)), "使っていない import の印がない");
+        assert!(
+            lines.iter().all(|(_, severity)| *severity != 2),
+            "厳しい検査の警告が出た"
+        );
+        // deque の定義は basedpyright の typeshed にあり、読み取り専用で開ける場所の中
+        let target = definition.expect("定義の答えが届かない")["result"][0]["uri"]
+            .as_str()
+            .expect("定義の答えに場所がない")
+            .to_string();
+        eprintln!("definition の URI の頭：{}", drive_part(&target));
+        let path = path_of_uri(&target).unwrap().canonicalize().unwrap();
+        assert!(path.starts_with(&typeshed), "typeshed の中でない");
+        assert!(
+            crate::sources::read_source(&target, &[], std::slice::from_ref(&typeshed))
+                .expect("読み取り専用で読めない")
+                .content
+                .contains("class deque")
+        );
+        // 記号は入れ子の形。main の中に n・q
+        let symbols = symbols.expect("記号の答えが届かない")["result"].clone();
+        assert_eq!(symbols[0]["name"], "main");
+        let children: Vec<&str> = symbols[0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(children, ["n", "q"]);
+        // インレイヒント（戻り値の型）
+        let hints = hints.expect("インレイヒントが届かない")["result"].to_string();
+        assert!(hints.contains("-> None"), "戻り値の型のヒントがない");
+        // パッケージ・コンテストのフォルダにファイルを作らない
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&package), ["main.py"]);
+        assert_eq!(names(&root.join("abc480")), ["abc480_a"]);
         eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
         let _ = std::fs::remove_dir_all(&root);
     }
