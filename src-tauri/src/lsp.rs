@@ -1272,7 +1272,8 @@ impl LspControl {
         Ok(false)
     }
 
-    #[cfg(all(test, unix))]
+    // 段階 4 T9：Windows の偽のサーバーのテストでも使う（前は cfg(all(test, unix))）
+    #[cfg(test)]
     fn start_with(
         &self,
         command: Command,
@@ -1286,7 +1287,7 @@ impl LspControl {
     }
 
     // パッケージの組が変わったとき（コンテストのフォルダに問題を足したなど）も、起動し直す（D-171）
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn start_with_projects(
         &self,
         command: Command,
@@ -1305,7 +1306,7 @@ impl LspControl {
     }
 
     // 偽のサーバーの単体テスト用：許可リストにない方法（hello・quit など）で偽のサーバーを動かす
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn send_unchecked(&self, text: &str) -> Result<(), String> {
         self.send_checked(text, false)
     }
@@ -2477,6 +2478,261 @@ mod tests {
         control.stop();
     }
 
+    // 段階 4 T9：Windows の偽のサーバー（examples/test_child.rs の lsp-server。perl の偽のサーバーと同じ動き）。
+    // 先に grandchild:<held> で孫を作る（孫は held のファイルを開いたままにし、終わると消える。pid を使わずに、
+    // 孫が残っていないかを held が消えたかで見る。孫は 30 秒で自分で終わる）
+    #[cfg(windows)]
+    fn fake_server_on_windows(ignore_shutdown: bool, held: &Path) -> Command {
+        let mut command = crate::process::command(crate::process::test_child_path());
+        command.arg(format!("grandchild:{}", held.display()));
+        command.arg(if ignore_shutdown {
+            "lsp-server:ignore-shutdown"
+        } else {
+            "lsp-server"
+        });
+        command
+    }
+
+    // 孫の印のファイル（テストごとに別の場所。前の回のものがあれば消す）
+    #[cfg(windows)]
+    fn held_file(name: &str) -> PathBuf {
+        let path = temp_dir(&format!("held-{name}")).join("grandchild.lock");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[cfg(windows)]
+    fn exits(events: &Arc<Mutex<Vec<LspEvent>>>) -> Vec<Option<i32>> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                LspEvent::Exited { code } => Some(*code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // stop を別のスレッドで動かし、limit までに終わらなければ、分かる文で panic する。終わればかかった時間を返す（段階 4 T9）。
+    // panic したときは止まらないスレッドが残るが、テストのプログラムが終われば Job のハンドルが閉じ、偽のサーバーと孫も止まる
+    #[cfg(windows)]
+    fn stop_within(control: &Arc<LspControl>, limit: Duration) -> Duration {
+        let (done, finished) = mpsc::channel();
+        let target = control.clone();
+        let started = Instant::now();
+        thread::spawn(move || {
+            target.stop();
+            let _ = done.send(());
+        });
+        if finished.recv_timeout(limit).is_err() {
+            panic!(
+                "言語サーバーを止める処理が {limit:?} たっても終わらない（サーバーか、その子孫が止まっていない見込み）"
+            );
+        }
+        started.elapsed()
+    }
+
+    // relays_messages_and_stops_gracefully の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn relays_messages_and_stops_gracefully_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("graceful-win");
+        let held = held_file("graceful");
+        assert!(
+            !control
+                .start_with(
+                    fake_server_on_windows(false, &held),
+                    dir.clone(),
+                    dir.clone(),
+                    "a".to_string(),
+                    sink.clone()
+                )
+                .unwrap()
+        );
+        assert!(wait_until(|| held.exists()), "孫ができない");
+        control
+            .send_unchecked(r#"{"jsonrpc":"2.0","id":1,"method":"hello"}"#)
+            .unwrap();
+        // サーバーからの workspace/configuration には Rust 側で答え、画面には送らない
+        control
+            .send_unchecked(r#"{"jsonrpc":"2.0","method":"ask"}"#)
+            .unwrap();
+        assert!(
+            wait_until(|| {
+                events.lock().unwrap().iter().any(|event| matches!(event, LspEvent::Message { text } if text.contains("linkedProjects")))
+            }),
+            "configuration の答えが偽のサーバーに届かない"
+        );
+        // 同じパッケージなら起動し直さない
+        assert!(
+            control
+                .start_with(
+                    fake_server_on_windows(false, &held),
+                    dir.clone(),
+                    dir.clone(),
+                    "a".to_string(),
+                    sink
+                )
+                .unwrap()
+        );
+        let started = Instant::now();
+        control.stop();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "正式な終了で終わっていない（{elapsed:?}）"
+        );
+        let events_now = events.lock().unwrap().clone();
+        assert!(events_now.contains(&LspEvent::Message {
+            text: r#"{"echo":"hello","body":null}"#.to_string()
+        }));
+        assert!(!events_now.iter().any(|event| matches!(event, LspEvent::Message { text } if text.contains("workspace/configuration"))));
+        // 終わったことは 1 回だけ、終了コード 0 で知らせる
+        assert_eq!(exits(&events), vec![Some(0)]);
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+        assert!(control.send("{}").is_err());
+    }
+
+    // keeps_the_order_of_messages の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn keeps_the_order_of_messages_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("order-win");
+        let held = held_file("order");
+        control
+            .start_with(
+                fake_server_on_windows(false, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        for n in 0..200 {
+            control
+                .send_unchecked(&format!(r#"{{"jsonrpc":"2.0","method":"m{n}"}}"#))
+                .unwrap();
+        }
+        let echoed = |events: &[LspEvent]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    LspEvent::Message { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(wait_until(|| echoed(&events.lock().unwrap()).len() == 200));
+        let expected: Vec<String> = (0..200)
+            .map(|n| format!(r#"{{"echo":"m{n}","body":null}}"#))
+            .collect();
+        assert_eq!(echoed(&events.lock().unwrap()), expected);
+        control.stop();
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
+    // kills_server_that_ignores_shutdown の Windows 版（段階 4 T9）。止めたときの終了コードは、Unix ではシグナルなので None、
+    // Windows では TerminateJobObject に渡す KILLED_EXIT_CODE（win.rs）。
+    // 止める処理（Job で止める所）が壊れると、shutdown に答えない偽のサーバーが残り、stop が戻らない。テストが止まらずに
+    // 時間切れまで分からないので、stop_within で上限（STOP_WAIT + 10 秒）を付けて落とす。上限は止まらないときのためだけで、
+    // かかった時間の確かめ（STOP_WAIT 以上・+2 秒未満）は今までどおり
+    #[cfg(windows)]
+    #[test]
+    fn kills_server_that_ignores_shutdown_on_windows() {
+        let control = Arc::new(LspControl::default());
+        let (sink, events) = collector();
+        let dir = temp_dir("ignore-win");
+        let held = held_file("ignore");
+        control
+            .start_with(
+                fake_server_on_windows(true, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        assert!(wait_until(|| held.exists()), "孫ができない");
+        let elapsed = stop_within(&control, STOP_WAIT + Duration::from_secs(10));
+        assert!(
+            elapsed >= STOP_WAIT && elapsed < STOP_WAIT + Duration::from_secs(2),
+            "止めるのにかかった時間：{elapsed:?}"
+        );
+        let codes = exits(&events);
+        eprintln!("止めたときの Exited の code：{codes:?}");
+        assert_eq!(
+            codes,
+            vec![Some(crate::win::KILLED_EXIT_CODE as i32)],
+            "止めたときの Exited の code"
+        );
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
+    // reports_server_that_exits_by_itself の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn reports_server_that_exits_by_itself_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("quit-win");
+        let held = held_file("quit");
+        control
+            .start_with(
+                fake_server_on_windows(false, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        control
+            .send_unchecked(r#"{"jsonrpc":"2.0","method":"quit"}"#)
+            .unwrap();
+        assert!(
+            wait_until(|| exits(&events) == vec![Some(3)]),
+            "自分で終わったことを知らせない"
+        );
+        // 回収は次の停止のとき。ここでは 2 回目を知らせない。回収のときに孫も止める
+        control.stop();
+        assert_eq!(exits(&events), vec![Some(3)]);
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
+    // send_rejects_messages_outside_the_allow_list の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn send_rejects_messages_outside_the_allow_list_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("reject-win");
+        let held = held_file("reject");
+        control
+            .start_with(
+                fake_server_on_windows(false, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        let error = control
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"workspace/executeCommand","params":{"command":"x"}}"#)
+            .unwrap_err();
+        assert!(error.contains("workspace/executeCommand"), "{error}");
+        // 拒否したメッセージは偽のサーバーに届かない（届けば echo が返る）
+        thread::sleep(Duration::from_millis(200));
+        assert!(!events.lock().unwrap().iter().any(
+            |event| matches!(event, LspEvent::Message { text } if text.contains("executeCommand"))
+        ));
+        control.stop();
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
     // 偽のサーバー（perl）。受け取ったメッセージを、method と id だけにして返す。
     // 起動したら子（sleep）の pid を標準エラーに出す。shutdown には答え、exit で終わる。
     // ignore_shutdown なら shutdown に答えず、終わらない
@@ -2531,8 +2787,7 @@ mod tests {
         (sink, events)
     }
 
-    // 条件を満たすまで、2 秒まで待つ
-    #[cfg(unix)]
+    // 条件を満たすまで、2 秒まで待つ（段階 4 T9 から Windows の偽のサーバーのテストでも使う。前は cfg(unix)）
     fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
         (0..200).any(|_| {
             let met = condition();

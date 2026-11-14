@@ -33,6 +33,12 @@
 // - record:パス … 最初の手順にする。残りの引数を 1 行に 1 つ、空行、標準入力の全部の順にパスのファイルに書いて 0 で終わる
 //   （残りの引数は手順として読まない。curl の代わりに起動して、渡されたものを見るため。段階 3 T6）
 //
+// - lsp-server・lsp-server:ignore-shutdown … LSP の偽のサーバーになる（このあとの手順は読まない。段階 4 T9）。
+//   lsp.rs の Unix のテストの偽のサーバー（perl）と同じ動き。Content-Length の見出しのメッセージを読み、"method":"…" と
+//   "id":… を取り出す。shutdown には null で答える（ignore-shutdown なら答えない）。exit で 0、quit で 3 で終わる。
+//   garbage には壊れた見出しを返す。ask を受けると workspace/configuration を問い合わせる。そのほかは
+//   {"echo":"<method>","body":…} を返す（本文に "result" があれば本文、なければ null）。標準入力が EOF になったら 1 で終わる
+//
 // 知らない手順・読めない数は、標準エラーに書いて 120 で終わる
 
 use std::io::{BufRead, Read, Write};
@@ -144,6 +150,7 @@ fn main() {
             #[cfg(windows)]
             "stdio-kinds" => stdio_kinds(value),
             "record" => record(value, &mut input),
+            "lsp-server" => lsp_server(&mut input, value == "ignore-shutdown"),
             other => fail(&format!("知らない手順 {other}")),
         }
     }
@@ -280,6 +287,82 @@ fn hold(path: &str) -> std::fs::File {
     options
         .open(path)
         .unwrap_or_else(|error| fail(&format!("{path} を開けません：{error}")))
+}
+
+// LSP の偽のサーバー（段階 4 T9。頭の説明の lsp-server）。終わるまで戻らない
+fn lsp_server(input: &mut impl BufRead, ignore_shutdown: bool) -> ! {
+    let mut out = std::io::stdout();
+    let send = |out: &mut std::io::Stdout, text: &str| {
+        write(
+            out,
+            format!("Content-Length: {}\r\n\r\n{text}", text.len()).as_bytes(),
+        )
+    };
+    loop {
+        // 見出し（空行まで）。EOF なら 1 で終わる（perl の偽のサーバーと同じ）
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            match input.read_line(&mut line) {
+                Ok(0) | Err(_) => std::process::exit(1),
+                Ok(_) => {}
+            }
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().ok();
+            }
+        }
+        let Some(length) = length else {
+            std::process::exit(1)
+        };
+        let mut body = vec![0u8; length];
+        if input.read_exact(&mut body).is_err() {
+            std::process::exit(1);
+        }
+        let body = String::from_utf8_lossy(&body).into_owned();
+        let method = body
+            .split_once("\"method\":\"")
+            .and_then(|(_, rest)| rest.split('"').next())
+            .unwrap_or("");
+        let id = body.split_once("\"id\":").map(|(_, rest)| {
+            if let Some(quoted) = rest.strip_prefix('"') {
+                format!("\"{}\"", quoted.split('"').next().unwrap_or(""))
+            } else {
+                rest.chars().take_while(char::is_ascii_digit).collect()
+            }
+        });
+        match method {
+            "shutdown" => {
+                if !ignore_shutdown {
+                    let id = id.unwrap_or_else(|| "null".to_string());
+                    send(
+                        &mut out,
+                        &format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":null}}"),
+                    );
+                }
+            }
+            "exit" => std::process::exit(0),
+            "quit" => std::process::exit(3),
+            "garbage" => write(&mut out, b"Bad-Header\r\n\r\n"),
+            "ask" => send(
+                &mut out,
+                r#"{"jsonrpc":"2.0","id":99,"method":"workspace/configuration","params":{"items":[{"section":"rust-analyzer"}]}}"#,
+            ),
+            _ => {
+                let echoed = if body.contains("\"result\"") {
+                    body.as_str()
+                } else {
+                    "null"
+                };
+                send(
+                    &mut out,
+                    &format!("{{\"echo\":\"{method}\",\"body\":{echoed}}}"),
+                );
+            }
+        }
+    }
 }
 
 // 1 行読み、行末の改行（`\r\n` も）を除いて返す。EOF・読めないときは None
