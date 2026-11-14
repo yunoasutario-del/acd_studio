@@ -1601,6 +1601,24 @@ mod tests {
         }
     }
 
+    // 確かめられないときに飛ばす。ただし ci（環境変数 CI がある）なら、理由を書いて落とす（段階 4 T5 の追加。CI のログでは、
+    // 飛ばして通ったのか確かめて通ったのかが見分けられないため）
+    #[cfg(windows)]
+    fn skip_unless_ci(reason: &str, ci: bool) {
+        if ci {
+            panic!("CI では飛ばしません（確かめられないため）：{reason}");
+        }
+        eprintln!("{reason}ので、確かめずに飛ばします");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skips_only_outside_ci() {
+        skip_unless_ci("偽の理由", false);
+        let result = std::panic::catch_unwind(|| skip_unless_ci("偽の理由", true));
+        assert!(result.is_err(), "CI なのに飛ばした");
+    }
+
     // 段階 4 T5：rust-toolchain.toml で、rust-analyzer の component のない toolchain を選んだパッケージでは、起動せずに案内を返す。
     // toolchain の版は決め打ちにせず、このリポジトリの src-tauri/rust-toolchain.toml の channel を使う（手元と CI の Windows には
     // その版が入っていて、rust-analyzer の component はない見込み）。代理がない、またはその版に component が入っているときは飛ばす
@@ -1628,8 +1646,10 @@ mod tests {
             format!("[toolchain]\nchannel = \"{channel}\"\n"),
         )
         .unwrap();
+        // CI（環境変数 CI がある）では飛ばさずに落とす（飛ばすと、CI のログの「ok」からは確かめたかが分からないため）
+        let ci = std::env::var_os("CI").is_some();
         let Ok(program) = find_rust_analyzer() else {
-            eprintln!("rustup の代理がないので飛ばします");
+            skip_unless_ci("rustup の代理（rust-analyzer.exe）がない", ci);
             return;
         };
         // component があるかは、テストの中で別に確かめる（IDE と同じ命令で --version を動かす）
@@ -1638,10 +1658,11 @@ mod tests {
             .output()
             .is_ok_and(|output| output.status.success());
         if present {
-            eprintln!(
-                "{channel} に rust-analyzer の component が入っているので、確かめずに飛ばします"
-            );
             let _ = std::fs::remove_dir_all(&package);
+            skip_unless_ci(
+                &format!("{channel} に rust-analyzer の component が入っている"),
+                ci,
+            );
             return;
         }
         let error = match rust_analyzer(package.clone(), vec![package.clone()]) {
