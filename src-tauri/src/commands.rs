@@ -1013,6 +1013,11 @@ pub async fn lsp_start(
         .to_string();
     let cpp = cpp_settings_of(&app);
     let python = lang_settings_of(&app).python;
+    // Windows（移植の段階 4 T6）：settings.json の cpp.clangd（空なら探す）
+    #[cfg(windows)]
+    let lsp_paths = app_dir(&app)
+        .map(|dir| storage::lsp_paths(&dir))
+        .unwrap_or_default();
     // 止めるときに正式な終了を待ち、g++ に標準ヘッダーの場所を聞くので、メインスレッドの外で動かす
     tauri::async_runtime::spawn_blocking(move || {
         let launch = if extension == "rs" {
@@ -1029,7 +1034,11 @@ pub async fn lsp_start(
             let (dir, projects) = lsp::clangd_place(&root, package);
             let compiler = cpp::find_compiler(&cpp)?;
             let options = cpp::compilation_database(&compiler, &projects, &cpp);
-            lsp::clangd(dir, projects, &compiler, options)?
+            #[cfg(not(windows))]
+            let launch = lsp::clangd(dir, projects, &compiler, options)?;
+            #[cfg(windows)]
+            let launch = lsp::clangd(dir, projects, &compiler, options, &lsp_paths.clangd)?;
+            launch
         } else if extension == "py" {
             // Python のパッケージ（main.py）で basedpyright を動かす（Phase 20 作業 5。D-225）。
             // 処理系が見つからなくても動かす（標準ライブラリは basedpyright の typeshed で分かる）

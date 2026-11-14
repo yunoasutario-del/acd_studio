@@ -31,9 +31,11 @@ use std::io::{BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(not(windows))]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -859,6 +861,7 @@ fn check_rust_analyzer_component(program: &Path, dir: &Path) -> Result<(), Strin
 }
 
 // clangd（Command Line Tools のもの）を探す（D-210）。見つかった場所は覚えておく
+#[cfg(not(windows))]
 fn find_clangd() -> Result<PathBuf, String> {
     static FOUND: OnceLock<PathBuf> = OnceLock::new();
     if let Some(path) = FOUND.get() {
@@ -879,6 +882,10 @@ fn find_clangd() -> Result<PathBuf, String> {
 // --query-driver に渡す形にする（glob の記号の前に \ を置く）。`,` は区切りなので、含むパスは使えない
 fn query_driver(compiler: &Path) -> Result<String, String> {
     let text = compiler.to_string_lossy();
+    // Windows（移植の段階 4 T6）：glob の区切りを / で書く（\ の前に \ を置く形では、本物の clangd 23.1.0 が g++ のパスに
+    // 合わせられず、MinGW の標準ヘッダー〔bits/stdc++.h〕が見つからなかった。/ の形では見つかった）
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
     if text.contains(',') {
         return Err(format!(
             "コンパイラのパスに「,」があるので、clangd に渡せません：{text}"
@@ -906,6 +913,7 @@ fn clangd_args(compiler: &Path) -> Result<Vec<String>, String> {
 }
 
 // clangd を dir で、projects の C++ のパッケージを扱うように動かす。options は cpp::compilation_database のもの
+#[cfg(not(windows))]
 pub fn clangd(
     dir: PathBuf,
     projects: Vec<PathBuf>,
@@ -913,6 +921,107 @@ pub fn clangd(
     options: Value,
 ) -> Result<Launch, String> {
     let program = find_clangd()?;
+    let mut command = crate::process::command(program);
+    command.args(clangd_args(compiler)?);
+    toolchain::clear_ide_env(&mut command);
+    Ok(Launch {
+        name: "clangd",
+        command,
+        dir,
+        projects,
+        options,
+        configuration: Value::Null,
+    })
+}
+
+// Windows（移植の段階 4 T6）：clangd が見つからないときの案内（xcode-select の代わり）
+#[cfg(windows)]
+pub const CLANGD_MISSING: &str = "C++ の言語機能には clangd が要ります。GitHub の clangd/clangd のリリースから clangd-windows-<版>.zip を落として %LOCALAPPDATA%\\Programs に展開するか、settings.json の cpp.clangd に clangd.exe のパスを書いてください";
+
+// Windows（移植の段階 4 T6。9.1 の追加 39）：clangd を探す。configured は settings.json の cpp.clangd（空なら探す）。
+// 探す順は、設定 → PATH の clangd.exe → %LOCALAPPDATA%\Programs\clangd_<版>\bin（いちばん新しい版）→
+// %ProgramFiles%\LLVM\bin → C:\msys64\ucrt64\bin。設定が変わっても次の起動から効くように、見つかった場所は覚えない
+#[cfg(windows)]
+fn find_clangd(configured: &str) -> Result<PathBuf, String> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let programs = std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Programs"));
+    let fixed: Vec<PathBuf> = [
+        std::env::var_os("ProgramFiles").map(|dir| PathBuf::from(dir).join(r"LLVM\bin")),
+        Some(PathBuf::from(r"C:\msys64\ucrt64\bin")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    find_clangd_in(configured, &path_dirs, programs.as_deref(), &fixed)
+}
+
+// 探す場所を全部引数で受け取る（テストで、本物の PATH・%LOCALAPPDATA%・%ProgramFiles%・C:\msys64 を見ないため）
+#[cfg(windows)]
+fn find_clangd_in(
+    configured: &str,
+    path_dirs: &[PathBuf],
+    programs: Option<&Path>,
+    fixed: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if path.is_absolute() && path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "settings.json の cpp.clangd（{configured}）が見つかりません。{CLANGD_MISSING}"
+        ));
+    }
+    path_dirs
+        .iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("clangd.exe"))
+        .chain(programs.and_then(newest_clangd))
+        .chain(fixed.iter().map(|dir| dir.join("clangd.exe")))
+        .find(|path| path.is_file())
+        .ok_or_else(|| CLANGD_MISSING.to_string())
+}
+
+// programs（%LOCALAPPDATA%\Programs）の中の clangd_<版> のうち、bin\clangd.exe があって、版がいちばん新しいもの。
+// 版は数と . だけの形（23.1.0 など）として読み、数として比べる。読めない名前（23.1.0-rc1・snapshot など）は飛ばす
+#[cfg(windows)]
+fn newest_clangd(programs: &Path) -> Option<PathBuf> {
+    let mut found: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(programs)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let version = name.strip_prefix("clangd_")?;
+            let numbers = version
+                .split('.')
+                .map(|part| {
+                    if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                        part.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<u64>>>()?;
+            let exe = entry.path().join(r"bin\clangd.exe");
+            exe.is_file().then_some((numbers, exe))
+        })
+        .collect();
+    found.sort();
+    found.pop().map(|(_, exe)| exe)
+}
+
+// Windows（移植の段階 4 T6）：設定の clangd（configured。空なら探す）を、dir で、projects の C++ のパッケージを扱うように動かす
+#[cfg(windows)]
+pub fn clangd(
+    dir: PathBuf,
+    projects: Vec<PathBuf>,
+    compiler: &Path,
+    options: Value,
+    configured: &str,
+) -> Result<Launch, String> {
+    let program = find_clangd(configured)?;
     let mut command = crate::process::command(program);
     command.args(clangd_args(compiler)?);
     toolchain::clear_ide_env(&mut command);
@@ -1599,6 +1708,133 @@ mod tests {
         ] {
             assert_eq!(missing_component_hint(stderr), None, "{stderr}");
         }
+    }
+
+    // 段階 4 T6（9.1 の追加 39）：Windows で clangd を探す順。探す場所は全部一時フォルダの中に作って渡し、本物の PATH・
+    // %LOCALAPPDATA%・%ProgramFiles%・C:\msys64 は見ない（手元と CI で結果が変わらないように）
+    #[cfg(windows)]
+    #[test]
+    fn finds_clangd_in_order_on_windows() {
+        let base = temp_dir("clangd-find");
+        let _ = std::fs::remove_dir_all(&base);
+        let exe = |dir: &str| {
+            let path = base.join(dir).join("clangd.exe");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            path
+        };
+        let configured = exe("custom");
+        let in_path = exe("path-dir");
+        let relative_target = exe("relative-dir");
+        let programs = base.join("programs");
+        for version in ["9.0.0", "23.1.0"] {
+            exe(&format!("programs/clangd_{version}/bin"));
+        }
+        // 数と . の形として読めない名前（rc・snapshot・+ の付いた数）と、bin\clangd.exe のない新しい版は飛ばす
+        for name in ["clangd_99.0.0-rc1", "clangd_snapshot", "clangd_99.+0.0"] {
+            exe(&format!("programs/{name}/bin"));
+        }
+        std::fs::create_dir_all(programs.join("clangd_30.0.0/bin")).unwrap();
+        let newest = programs.join(r"clangd_23.1.0\bin\clangd.exe");
+        let llvm = exe("llvm-bin");
+        let msys = exe("msys-bin");
+        let fixed = vec![
+            llvm.parent().unwrap().to_path_buf(),
+            msys.parent().unwrap().to_path_buf(),
+        ];
+        let find = |configured: &str,
+                    path_dirs: &[PathBuf],
+                    programs: Option<&Path>,
+                    fixed: &[PathBuf]| {
+            find_clangd_in(configured, path_dirs, programs, fixed)
+        };
+        let path_dirs = vec![in_path.parent().unwrap().to_path_buf()];
+        // 1. 設定があれば、それだけを使う
+        let text = configured.to_string_lossy().into_owned();
+        assert!(
+            find(&text, &path_dirs, Some(&programs), &fixed).unwrap() == configured,
+            "設定の clangd を使わない"
+        );
+        // 設定のファイルがない・相対パスなら、案内（ほかの場所は探さない）
+        for missing in [
+            base.join(r"none\clangd.exe").to_string_lossy().into_owned(),
+            "clangd.exe".to_string(),
+        ] {
+            let error = find(&missing, &path_dirs, Some(&programs), &fixed).unwrap_err();
+            assert!(error.contains("settings.json の cpp.clangd"), "{error}");
+            assert!(error.contains(CLANGD_MISSING), "{error}");
+        }
+        // 2. PATH の clangd.exe（相対パスのフォルダは見ない）
+        assert!(
+            find("", &path_dirs, Some(&programs), &fixed).unwrap() == in_path,
+            "PATH の clangd を使わない"
+        );
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let target_dir = relative_target.parent().unwrap().to_path_buf();
+        if let Some(relative) = relative_path(&cwd, &target_dir) {
+            assert!(relative.is_relative());
+            assert!(
+                relative.join("clangd.exe").is_file(),
+                "相対パスで一時フォルダを指せていない"
+            );
+            // 相対パスのフォルダだけの PATH は、空の PATH と同じ結果になる（相対パスの先の clangd は選ばない）
+            let with_relative = find("", &[relative], Some(&programs), &fixed);
+            assert!(
+                with_relative
+                    .as_ref()
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok())
+                    != relative_target.canonicalize().ok(),
+                "相対パスの PATH のフォルダを見た"
+            );
+            assert!(
+                with_relative == find("", &[], Some(&programs), &fixed),
+                "相対パスの PATH のフォルダがあると、結果が変わった"
+            );
+        } else {
+            eprintln!("今いる場所と一時フォルダのドライブが違うので、相対パスの確かめを飛ばします");
+        }
+        // 3. %LOCALAPPDATA%\Programs\clangd_<版>：数として比べていちばん新しい版（9.0.0 より 23.1.0）。読めない名前・exe のない版は飛ばす
+        assert!(
+            find("", &[], Some(&programs), &fixed).unwrap() == newest,
+            "いちばん新しい版を選ばない"
+        );
+        // 4. %ProgramFiles%\LLVM\bin、5. C:\msys64\ucrt64\bin の順
+        assert!(
+            find("", &[], None, &fixed).unwrap() == llvm,
+            "LLVM の場所を先に見ない"
+        );
+        assert!(
+            find("", &[], None, &fixed[1..]).unwrap() == msys,
+            "MSYS2 の場所を見ない"
+        );
+        // どこにもなければ、Windows の案内（xcode-select は出さない）
+        let error = find("", &[], Some(&base.join("none")), &[]).unwrap_err();
+        assert_eq!(error, CLANGD_MISSING);
+        assert!(error.contains("clangd-windows-<版>.zip"));
+        assert!(error.contains(r"%LOCALAPPDATA%\Programs"));
+        assert!(error.contains("cpp.clangd"));
+        assert!(!error.contains("xcode-select"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // from から to への相対パス（同じドライブのときだけ。どちらも canonicalize した `\\?\` の形）
+    #[cfg(windows)]
+    fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        if from.first() != to.first() {
+            return None;
+        }
+        let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+        let mut relative = PathBuf::new();
+        for _ in common..from.len() {
+            relative.push("..");
+        }
+        for part in &to[common..] {
+            relative.push(part.as_os_str());
+        }
+        Some(relative)
     }
 
     // 確かめられないときに飛ばす。ただし ci（環境変数 CI がある）なら、理由を書いて落とす（段階 4 T5 の追加。CI のログでは、
@@ -2602,6 +2838,28 @@ mod tests {
         assert!(args.contains(&"--enable-config=false".to_string()));
     }
 
+    // 段階 4 T6：Windows では、--query-driver の glob の区切りを / で書く（\ の前に \ を置く形では、本物の clangd 23.1.0 が
+    // g++ のパスに合わせられず、bits/stdc++.h が見つからなかった）。glob の記号の前には、今までどおり \ を置く
+    #[cfg(windows)]
+    #[test]
+    fn writes_the_query_driver_with_slashes_on_windows() {
+        assert_eq!(
+            query_driver(Path::new(r"C:\Program Files\x\g++.exe")).unwrap(),
+            "C:/Program Files/x/g++.exe"
+        );
+        assert_eq!(
+            query_driver(Path::new(r"C:\Program Files (x86)\mingw64\bin\g++.exe")).unwrap(),
+            "C:/Program Files (x86)/mingw64/bin/g++.exe"
+        );
+        assert_eq!(
+            query_driver(Path::new(r"C:\x\[a]*\g++?")).unwrap(),
+            r"C:/x/\[a\]\*/g++\?"
+        );
+        assert!(query_driver(Path::new(r"C:\x,y\g++.exe")).is_err());
+        let args = clangd_args(Path::new(r"C:\mingw64\bin\g++.exe")).unwrap();
+        assert!(args.contains(&"--query-driver=C:/mingw64/bin/g++.exe".to_string()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn restarts_for_another_language() {
@@ -2643,7 +2901,9 @@ mod tests {
         control.stop();
     }
 
-    // 手元に clangd と g++-15 があるときだけ、本当の clangd で確かめる（D-210）
+    // 手元に clangd と g++-15 があるときだけ、本当の clangd で確かめる（D-210）。
+    // Windows では analyzes_cpp_with_local_clangd_on_windows（段階 4 T6。#[ignore] で、手で動かす）
+    #[cfg(not(windows))]
     #[test]
     fn analyzes_cpp_with_local_clangd() {
         let Ok(compiler) = crate::cpp::find_compiler(&crate::cpp::CppSettings::default()) else {
@@ -2737,6 +2997,172 @@ mod tests {
         // パッケージ・コンテストのフォルダに .cache/ を作らない
         assert!(!package.join(".cache").exists());
         assert!(!root.join("abc480/.cache").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 段階 4 T6：本物の clangd（探す順で見つかるもの）と MinGW の g++ で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
+    // cargo test --lib -- --ignored --exact lsp::tests::analyzes_cpp_with_local_clangd_on_windows --nocapture
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、診断の数、子孫の exe の名前と数、かかった時間だけ
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "本物の clangd と MinGW の g++ を使う。手で 1 件だけ動かす（段階 4 T6）"]
+    fn analyzes_cpp_with_local_clangd_on_windows() {
+        let started = Instant::now();
+        let hide = |text: &str| {
+            let mut text = text.to_string();
+            for name in ["LOCALAPPDATA", "USERPROFILE"] {
+                if let Some(value) = std::env::var_os(name) {
+                    text = text.replace(&*value.to_string_lossy(), &format!("%{name}%"));
+                }
+            }
+            text
+        };
+        let compiler = crate::cpp::find_compiler(&crate::cpp::CppSettings::default())
+            .expect("g++.exe が見つからない");
+        let program = find_clangd("").expect("clangd が見つからない");
+        eprintln!("clangd：{}", hide(&program.to_string_lossy()));
+        eprintln!("g++：{}", hide(&compiler.to_string_lossy()));
+        eprintln!(
+            "--query-driver：{}",
+            hide(&query_driver(&compiler).unwrap())
+        );
+        let root = temp_dir("clangd-real-win");
+        let _ = std::fs::remove_dir_all(root.join("abc480"));
+        let package = root.join("abc480").join("abc480_a");
+        std::fs::create_dir_all(&package).unwrap();
+        let source = "#include <bits/stdc++.h>\nusing namespace std;\nint main() {\n    vector<int> a(3);\n    cout << a.size() << endl;\n}\nstruct P {\n    int f() { return 1; }\n};\n";
+        std::fs::write(package.join("main.cpp"), source).unwrap();
+        std::fs::write(package.join("compile_flags.txt"), "-std=gnu++23\n").unwrap();
+        let (dir, projects) = clangd_place(&root, &package);
+        let settings = crate::cpp::CppSettings::default();
+        let options = crate::cpp::compilation_database(&compiler, &projects, &settings);
+        let launch = clangd(dir, projects, &compiler, options, "").unwrap();
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        assert!(
+            !control
+                .start(root.clone(), launch, "a".to_string(), sink)
+                .unwrap()
+        );
+        let pid = control.server.lock().unwrap().as_ref().unwrap().child.id();
+        let uri = file_uri(&package.join("main.cpp"));
+        let wanted = path_of_uri(&uri);
+        let message = |text: String| control.send(&text).unwrap();
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "cpp", "version": 1, "text": source } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 3, "character": 6 } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 3, "method": "textDocument/documentSymbol", "params": { "textDocument": { "uri": uri } } }).to_string());
+        let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
+            events.lock().unwrap().iter().find_map(|event| match event {
+                LspEvent::Message { text } => {
+                    serde_json::from_str::<Value>(text).ok().filter(|m| pick(m))
+                }
+                _ => None,
+            })
+        };
+        let (mut diagnostics, mut definition, mut symbols) = (None, None, None);
+        for _ in 0..600 {
+            diagnostics = find(&|m| {
+                m["method"] == "textDocument/publishDiagnostics"
+                    && m["params"]["uri"].as_str().and_then(path_of_uri) == wanted
+            });
+            definition = find(&|m| m["id"] == 2);
+            symbols = find(&|m| m["id"] == 3);
+            if diagnostics.is_some() && definition.is_some() && symbols.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let diagnostics = diagnostics.expect("診断が届かない");
+        eprintln!(
+            "publishDiagnostics の URI の頭：{}",
+            drive_part(diagnostics["params"]["uri"].as_str().unwrap())
+        );
+        let list = diagnostics["params"]["diagnostics"].as_array().unwrap();
+        eprintln!("診断の数：{}", list.len());
+        for item in list.iter().take(3) {
+            eprintln!("  診断：{}", hide(item["message"].as_str().unwrap_or("")));
+        }
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
+        let (mut in_messages, mut in_logs) = (0, 0);
+        for event in events.lock().unwrap().iter() {
+            match event {
+                LspEvent::Message { text } => {
+                    in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Log { text } => {
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Exited { .. } => {}
+            }
+        }
+        eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        let children = crate::win::descendants(pid);
+        let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
+        names.sort();
+        eprintln!("止める前の子孫：{} 個 {names:?}", children.len());
+        control.stop();
+        assert!(!crate::win::has_job_record(pid), "Job の記録が残っている");
+        assert!(!crate::win::is_alive(pid), "clangd が残っている");
+        let gone = |child: u32| {
+            (0..100).any(|_| {
+                if crate::win::is_alive(child) {
+                    thread::sleep(Duration::from_millis(20));
+                    false
+                } else {
+                    true
+                }
+            })
+        };
+        let left: Vec<&str> = children
+            .iter()
+            .filter(|(child, _)| !gone(*child))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        // bits/stdc++.h が見つかり、診断は空（IDE の命令と --query-driver が効いている）
+        assert!(list.is_empty(), "診断が空でない（上の診断を見る）");
+        // vector の定義は MinGW の標準ヘッダーにあり、読み取り専用で開ける場所の中
+        let target = definition.expect("定義の答えが届かない")["result"][0]["uri"]
+            .as_str()
+            .expect("定義の答えに場所がない")
+            .to_string();
+        eprintln!("definition の URI の頭：{}", drive_part(&target));
+        let path = path_of_uri(&target).unwrap().canonicalize().unwrap();
+        assert!(
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains("/include/c++/"),
+            "標準ヘッダーの中でない"
+        );
+        let headers = crate::cpp::header_dirs(&compiler, None);
+        assert!(
+            crate::sources::read_source(&target, &headers, &[]).is_ok(),
+            "読み取り専用で読めない"
+        );
+        // 記号は入れ子の形。main と、P の中の f
+        let symbols = symbols.expect("記号の答えが届かない")["result"].clone();
+        let named = |list: &Value, name: &str| -> Value {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} がない"))
+        };
+        assert_eq!(
+            named(&symbols, "main")["selectionRange"]["start"]["line"],
+            2
+        );
+        assert_eq!(
+            named(&named(&symbols, "P")["children"], "f")["range"]["start"]["line"],
+            7
+        );
+        // パッケージ・コンテストのフォルダに .cache/ を作らない
+        assert!(!package.join(".cache").exists());
+        assert!(!root.join("abc480").join(".cache").exists());
+        eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
         let _ = std::fs::remove_dir_all(&root);
     }
 
