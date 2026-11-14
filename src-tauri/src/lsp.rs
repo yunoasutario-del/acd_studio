@@ -805,9 +805,57 @@ fn find_rust_analyzer() -> Result<PathBuf, String> {
 // rust-analyzer を dir で、projects のパッケージを扱うように動かす（analyzer_place で決めたもの。D-171）
 pub fn rust_analyzer(dir: PathBuf, projects: Vec<PathBuf>) -> Result<Launch, String> {
     let program = find_rust_analyzer()?;
+    // Windows（移植の段階 4 T5）：選ばれた toolchain に rust-analyzer の component がなければ、起動せずに入れ方を案内する
+    #[cfg(windows)]
+    check_rust_analyzer_component(&program, &dir)?;
     // cargo と同じく、D-104 の変数を外し、RUSTUP_AUTO_INSTALL=0 を付ける（D-107）
     let command = toolchain::cargo_command(&program, &dir);
     Ok(Launch::rust_analyzer_with(command, dir, projects))
+}
+
+// Windows（移植の段階 4 T5）：rustup の代理の標準エラーが「Unknown binary 'rust-analyzer…」（選ばれた toolchain に component が
+// ない）なら、入れ方の案内を返す。rustup の文には入れ方の命令がない（「error: Unknown binary 'rust-analyzer.exe' in official
+// toolchain '<名前>'.」だけ）。toolchain の名前が読めれば --toolchain を付ける。読めない・英数字と -._ 以外があるときは付けない
+#[cfg(windows)]
+fn missing_component_hint(stderr: &str) -> Option<String> {
+    let rest = stderr.split("Unknown binary 'rust-analyzer").nth(1)?;
+    let toolchain = rest
+        .split("toolchain '")
+        .nth(1)
+        .and_then(|tail| tail.split('\'').next())
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        });
+    let command = match toolchain {
+        Some(name) => format!("rustup component add rust-analyzer rust-src --toolchain {name}"),
+        None => "rustup component add rust-analyzer rust-src".to_string(),
+    };
+    Some(format!(
+        "rust-analyzer が入っていません（rustup の component がありません）。ターミナルで `{command}` を実行してください。rust-src は、標準ライブラリの補完と定義へのジャンプに要ります"
+    ))
+}
+
+// Windows（移植の段階 4 T5）：本番と同じ命令（同じ環境変数・同じ場所なので、選ばれる toolchain も同じ）で --version だけを動かし、
+// component がないと分かれば案内の Err。ほかの失敗では今までどおり起動を続ける（本番の起動が中身を出す）。
+// 窓は出ない（cargo_command は process::command で CREATE_NO_WINDOW を付ける）
+#[cfg(windows)]
+fn check_rust_analyzer_component(program: &Path, dir: &Path) -> Result<(), String> {
+    let Ok(output) = toolchain::cargo_command(program, dir)
+        .arg("--version")
+        .output()
+    else {
+        return Ok(());
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    match missing_component_hint(&String::from_utf8_lossy(&output.stderr)) {
+        Some(hint) => Err(hint),
+        None => Ok(()),
+    }
 }
 
 // clangd（Command Line Tools のもの）を探す（D-210）。見つかった場所は覚えておく
@@ -1513,6 +1561,101 @@ mod tests {
         );
         // どこにも `\\?\` がない（JSON の文字列に ? が出ない）
         assert!(!message.to_string().contains('?'), "{message}");
+    }
+
+    // 段階 4 T5：rustup の代理はあるが、選ばれた toolchain に rust-analyzer の component がないときの案内。
+    // rustup の文から toolchain の名前が読めれば --toolchain を付け、読めない（形が違う・変な文字がある）ときは付けない
+    #[cfg(windows)]
+    #[test]
+    fn hints_how_to_add_the_rust_analyzer_component() {
+        let hint = missing_component_hint(
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain '9.9.9-x86_64-pc-windows-msvc'.\n",
+        )
+        .expect("案内がない");
+        assert!(
+            hint.contains(
+                "`rustup component add rust-analyzer rust-src --toolchain 9.9.9-x86_64-pc-windows-msvc`"
+            ),
+            "{hint}"
+        );
+        assert!(hint.contains("rust-src は、標準ライブラリの補完と定義へのジャンプに要ります"));
+        for stderr in [
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain.\n",
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain 'a b;c'.\n",
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain ''.\n",
+        ] {
+            let hint = missing_component_hint(stderr).expect("案内がない");
+            assert!(
+                hint.contains("`rustup component add rust-analyzer rust-src`"),
+                "{stderr} → {hint}"
+            );
+            assert!(!hint.contains("--toolchain"), "{stderr} → {hint}");
+        }
+        // ほかの失敗には案内を出さない（本番の起動が中身を出す）
+        for stderr in [
+            "",
+            "error: toolchain '9.9.9-x86_64-pc-windows-msvc' is not installed\n",
+            "error: Unknown binary 'cargo.exe' in official toolchain '9.9.9-x86_64-pc-windows-msvc'.\n",
+        ] {
+            assert_eq!(missing_component_hint(stderr), None, "{stderr}");
+        }
+    }
+
+    // 段階 4 T5：rust-toolchain.toml で、rust-analyzer の component のない toolchain を選んだパッケージでは、起動せずに案内を返す。
+    // toolchain の版は決め打ちにせず、このリポジトリの src-tauri/rust-toolchain.toml の channel を使う（手元と CI の Windows には
+    // その版が入っていて、rust-analyzer の component はない見込み）。代理がない、またはその版に component が入っているときは飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn refuses_a_toolchain_without_rust_analyzer() {
+        let manifest = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-toolchain.toml"),
+        )
+        .unwrap();
+        let channel = manifest
+            .lines()
+            .find_map(|line| {
+                let value = line
+                    .trim()
+                    .strip_prefix("channel")?
+                    .trim()
+                    .strip_prefix('=')?;
+                Some(value.trim().trim_matches('"').to_string())
+            })
+            .expect("rust-toolchain.toml に channel がない");
+        let package = temp_dir("rust-analyzer-missing");
+        std::fs::write(
+            package.join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = \"{channel}\"\n"),
+        )
+        .unwrap();
+        let Ok(program) = find_rust_analyzer() else {
+            eprintln!("rustup の代理がないので飛ばします");
+            return;
+        };
+        // component があるかは、テストの中で別に確かめる（IDE と同じ命令で --version を動かす）
+        let present = toolchain::cargo_command(&program, &package)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if present {
+            eprintln!(
+                "{channel} に rust-analyzer の component が入っているので、確かめずに飛ばします"
+            );
+            let _ = std::fs::remove_dir_all(&package);
+            return;
+        }
+        let error = match rust_analyzer(package.clone(), vec![package.clone()]) {
+            Ok(_) => panic!("component のない toolchain なのに、起動の前に断らなかった"),
+            Err(error) => error,
+        };
+        assert!(error.contains("rust-analyzer が入っていません"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "rustup component add rust-analyzer rust-src --toolchain {channel}"
+            )),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&package);
     }
 
     // 段階 4 T2（9.1 の追加 41）：作業領域が UNC（ネットワークの場所）なら、言語サーバーは使えないと知らせる
@@ -2703,6 +2846,201 @@ mod tests {
         };
         assert_eq!(names(&package), ["main.py"]);
         assert_eq!(names(&root.join("abc480")), ["abc480_a"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // URI の `file:///` のすぐあとの、ドライブ名と `:` の部分だけ（最大 8 文字。パスの残りは出さない）
+    #[cfg(windows)]
+    fn drive_part(uri: &str) -> String {
+        let rest = uri.strip_prefix("file:///").unwrap_or("");
+        let end = rest.find('/').unwrap_or(rest.len()).min(8);
+        format!("file:///{}", &rest[..end])
+    }
+
+    // 段階 4 T5：本物の rust-analyzer（stable の component）で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
+    // cargo test --lib -- --ignored --exact lsp::tests::analyzes_rust_with_local_rust_analyzer --nocapture
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、版、子孫の exe の名前と数だけ
+    // （作業領域のパスと利用者のフォルダの名前は出さない）
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "本物の rust-analyzer を使う（読み込みと cargo check が重い）。手で 1 件だけ動かす（段階 4 T5）"]
+    fn analyzes_rust_with_local_rust_analyzer() {
+        let started = Instant::now();
+        let root = temp_dir("rust-analyzer-real");
+        let package = root.join("abc480_a");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        // 依存クレートはない（cargo check がネットにつながない）
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"abc480_a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        let source = "fn main() {\n    let v: Vec<i32> = Vec::new();\n    let x: i32 = \"a\";\n    println!(\"{} {}\", v.len(), x);\n}\n";
+        std::fs::write(package.join("src/main.rs"), source).unwrap();
+        // IDE と同じ命令（toolchain::cargo_command）で版を見る。テストのプロセスに RUSTUP_TOOLCHAIN（src-tauri/rust-toolchain.toml
+        // の版）があっても外れて、既定の toolchain が選ばれる（rust-toolchain.toml の版には rust-analyzer の component がない見込み）
+        eprintln!(
+            "RUSTUP_TOOLCHAIN（テストのプロセス）：{}",
+            if std::env::var_os("RUSTUP_TOOLCHAIN").is_some() {
+                "あり"
+            } else {
+                "なし"
+            }
+        );
+        let program = find_rust_analyzer().expect("rust-analyzer（rustup の代理）が見つからない");
+        let version = toolchain::cargo_command(&program, &package)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            version.status.success(),
+            "rust-analyzer --version が失敗した（src-tauri/rust-toolchain.toml の版が選ばれたかもしれない）：{}",
+            String::from_utf8_lossy(&version.stderr).trim()
+        );
+        eprintln!(
+            "rust-analyzer の版：{}",
+            String::from_utf8_lossy(&version.stdout).trim()
+        );
+        // 起動の前の確かめ（check_rust_analyzer_component の --version）で、起動が遅れる時間を 5 回測る（段階 4 T5）
+        let times: Vec<String> = (0..5)
+            .map(|_| {
+                let begin = Instant::now();
+                check_rust_analyzer_component(&program, &package).unwrap();
+                format!("{:.0}", begin.elapsed().as_secs_f64() * 1000.0)
+            })
+            .collect();
+        eprintln!(
+            "起動の前の確かめにかかった時間（ミリ秒）：{}",
+            times.join("・")
+        );
+        let (dir, projects) = analyzer_place(&root, &package);
+        let launch = rust_analyzer(dir, projects).unwrap();
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        assert!(
+            !control
+                .start(root.clone(), launch, "a".to_string(), sink)
+                .unwrap()
+        );
+        let pid = control.server.lock().unwrap().as_ref().unwrap().child.id();
+        let uri = file_uri(&package.join("src/main.rs"));
+        let wanted = path_of_uri(&uri);
+        let message = |text: String| control.send(&text).unwrap();
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": source } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didSave", "params": { "textDocument": { "uri": uri } } }).to_string());
+        let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
+            events.lock().unwrap().iter().find_map(|event| match event {
+                LspEvent::Message { text } => {
+                    serde_json::from_str::<Value>(text).ok().filter(|m| pick(m))
+                }
+                _ => None,
+            })
+        };
+        // 型の誤り（cargo check の E0308）の診断が届くまで、120 秒まで待つ。診断の URI は、サーバーの返した形のまま
+        // path_of_uri で戻して比べる（ドライブ名の大文字・小文字や %3A の違いがあっても同じファイル）
+        let mut diagnostics = None;
+        for _ in 0..1200 {
+            diagnostics = find(&|m| {
+                m["method"] == "textDocument/publishDiagnostics"
+                    && m["params"]["uri"].as_str().and_then(path_of_uri) == wanted
+                    && m["params"]["diagnostics"]
+                        .as_array()
+                        .is_some_and(|list| !list.is_empty())
+            });
+            if diagnostics.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let diagnostics = diagnostics.expect("診断が届かない");
+        let diagnostic_uri = diagnostics["params"]["uri"].as_str().unwrap().to_string();
+        eprintln!(
+            "publishDiagnostics の URI の頭：{}",
+            drive_part(&diagnostic_uri)
+        );
+        eprintln!(
+            "診断の数：{}",
+            diagnostics["params"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        // サーバーの返した形の URI でも、作業領域の中と見なす
+        assert!(check_message(&json!({ "jsonrpc": "2.0", "method": "textDocument/didClose", "params": { "textDocument": { "uri": diagnostic_uri } } }), &root).is_ok());
+        // Vec の定義（標準ライブラリ。rust-src の中）。読み込みが終わる前は空の答えのことがあるので、10 回まで聞き直す
+        let mut target = None;
+        for attempt in 0..10 {
+            let id = 100 + attempt;
+            message(json!({ "jsonrpc": "2.0", "id": id, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 11 } } }).to_string());
+            let mut answer = None;
+            for _ in 0..300 {
+                answer = find(&|m| m["id"] == id);
+                if answer.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let first = &answer.expect("定義の答えが届かない")["result"][0];
+            target = first["uri"]
+                .as_str()
+                .or_else(|| first["targetUri"].as_str())
+                .map(str::to_string);
+            if target.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+        let target = target.expect("定義の答えに場所がない");
+        eprintln!("definition の URI の頭：{}", drive_part(&target));
+        let found = crate::sources::read_source(&target, &[], &[])
+            .expect("定義の行き先を読み取り専用で読めない");
+        assert!(found.content.contains("pub struct Vec"));
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
+        let (mut in_messages, mut in_logs) = (0, 0);
+        for event in events.lock().unwrap().iter() {
+            match event {
+                LspEvent::Message { text } => {
+                    in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Log { text } => {
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Exited { .. } => {}
+            }
+        }
+        eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        // 止めたあと、Job の記録と子孫のプロセス（rust-analyzer・cargo など）が残らない
+        let children = crate::win::descendants(pid);
+        let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
+        names.sort();
+        eprintln!("止める前の子孫：{} 個 {names:?}", children.len());
+        control.stop();
+        assert!(!crate::win::has_job_record(pid), "Job の記録が残っている");
+        assert!(
+            !crate::win::is_alive(pid),
+            "rust-analyzer（代理）が残っている"
+        );
+        // 2 秒まで、終わるのを待つ
+        let gone = |child: u32| {
+            (0..100).any(|_| {
+                if crate::win::is_alive(child) {
+                    thread::sleep(Duration::from_millis(20));
+                    false
+                } else {
+                    true
+                }
+            })
+        };
+        let left: Vec<&str> = children
+            .iter()
+            .filter(|(child, _)| !gone(*child))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
