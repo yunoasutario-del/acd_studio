@@ -11,6 +11,8 @@
 import { LSPPlugin, Workspace, type WorkspaceFile } from "@codemirror/lsp-client";
 import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
+import { IS_WINDOWS } from "../panels/logLinks";
+import { canonicalUri } from "./lspUri";
 
 class IdeFile implements WorkspaceFile {
   constructor(
@@ -43,13 +45,10 @@ export type WorkspaceHooks = {
 const DISPLAY_TIMEOUT_MS = 10_000;
 const POLL_MS = 50;
 
-// URI の比べ方：パーセントエンコードの違い（%e3 と %E3 など）で別のファイルと見なさない
+// URI の比べ方：パーセントエンコードの違い（%e3 と %E3 など）で別のファイルと見なさない。
+// Windows では、ドライブ名の大文字・小文字も見分けない（lspUri.ts。Windows 移植の段階 4 T8）
 function canonical(uri: string): string {
-  try {
-    return decodeURIComponent(uri);
-  } catch {
-    return uri;
-  }
+  return canonicalUri(uri, IS_WINDOWS);
 }
 
 export class IdeWorkspace extends Workspace {
