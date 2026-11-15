@@ -289,6 +289,15 @@ fn override_initialize(message: &mut Value, dir: &Path, options: &Value) {
     }
     // パンくずリストの記号は、入れ子の形（DocumentSymbol）で返してもらう（Phase 18 作業 2。D-216）
     text_document["documentSymbol"] = json!({ "hierarchicalDocumentSymbolSupport": true });
+    // workspace/configuration の問い合わせには Rust の側（spawn_stdout_reader）で答えるので、その能力を宣言する。
+    // 宣言しないと、basedpyright は設定（pythonPath・検査の強さ。D-225）を問い合わせない（workspace.configuration の直し）
+    if !params["capabilities"]
+        .get("workspace")
+        .is_some_and(Value::is_object)
+    {
+        params["capabilities"]["workspace"] = json!({});
+    }
+    params["capabilities"]["workspace"]["configuration"] = json!(true);
 }
 
 // ---- 送るメッセージの検査（D-131） ----
@@ -1449,10 +1458,13 @@ mod tests {
             params["initializationOptions"],
             json!({ "linkedProjects": ["/ws/problems/abc001_a/Cargo.toml"] })
         );
-        // 入れ子の記号の能力だけを足す
+        // 入れ子の記号の能力と、workspace/configuration の能力を足す（後者は workspace.configuration の直し）
         assert_eq!(
             params["capabilities"],
-            json!({ "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } })
+            json!({
+                "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } },
+                "workspace": { "configuration": true }
+            })
         );
         // 能力がない・形が違うときも足す
         for params in [json!({}), json!({ "capabilities": { "textDocument": 1 } })] {
@@ -1526,6 +1538,46 @@ mod tests {
         assert!(text_document.get("diagnostic").is_none());
         // ほかの能力は残す
         assert_eq!(text_document["hover"]["contentFormat"][0], "markdown");
+    }
+
+    // workspace/configuration の問い合わせには Rust の側で答えるので、initialize でその能力を宣言する。
+    // 宣言しないと、basedpyright は設定（pythonPath・検査の強さ）を問い合わせない（workspace.configuration の直し）。
+    // 合わないものを全部集めてから比べる
+    #[test]
+    fn declares_workspace_configuration() {
+        let cases = [
+            // capabilities がない
+            (json!({}), json!({ "configuration": true })),
+            // workspace がない
+            (
+                json!({ "capabilities": {} }),
+                json!({ "configuration": true }),
+            ),
+            // workspace の形が違う
+            (
+                json!({ "capabilities": { "workspace": 1 } }),
+                json!({ "configuration": true }),
+            ),
+            // ほかの欄は残し、画面から false が来ても true にする
+            (
+                json!({ "capabilities": { "workspace": { "workspaceFolders": true, "configuration": false } } }),
+                json!({ "workspaceFolders": true, "configuration": true }),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (params, wanted) in cases {
+            let mut message = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params.clone() });
+            override_initialize(
+                &mut message,
+                Path::new("/ws/a"),
+                &settings(&[PathBuf::from("/ws/a")]),
+            );
+            let workspace = &message["params"]["capabilities"]["workspace"];
+            if *workspace != wanted {
+                wrong.push(format!("{params} → {workspace}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     // Unix のパスの例。Windows では reads_file_uris_on_windows（段階 4 T2）
@@ -1701,9 +1753,13 @@ mod tests {
             params["initializationOptions"],
             json!({ "linkedProjects": [r"C:\ws\problems\abc001_a\Cargo.toml"] })
         );
+        // workspace/configuration に Rust の側で答えるので、その能力を宣言する（workspace.configuration の直し）
         assert_eq!(
             params["capabilities"],
-            json!({ "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } })
+            json!({
+                "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } },
+                "workspace": { "configuration": true }
+            })
         );
         let request = json!({
             "jsonrpc": "2.0", "id": 9, "method": "workspace/configuration",
@@ -3644,7 +3700,8 @@ mod tests {
         );
         let uri = file_uri(&package.join("main.py"));
         let message = |text: String| control.send(&text).unwrap();
-        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": { "workspace": { "configuration": true } } } }).to_string());
+        // 画面と同じく、workspace.configuration の能力は送らない（能力は Rust の側の override_initialize が足す）
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }).to_string());
         message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
         message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "python", "version": 1, "text": source } } }).to_string());
         let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
@@ -3942,7 +3999,8 @@ mod tests {
 
     // 段階 4 T7：本物の basedpyright（探す順で見つかるもの）と CPython 3.13 で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
     // cargo test --lib -- --ignored --exact lsp::tests::analyzes_python_with_local_basedpyright_on_windows --nocapture
-    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、診断の数、子孫の exe の名前と数、かかった時間だけ
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、診断の数、Python was not found の数、
+    // severity 2 の数、子孫の exe の名前と数、かかった時間だけ
     #[cfg(windows)]
     #[test]
     #[ignore = "本物の basedpyright（node）と CPython を使う。手で 1 件だけ動かす（段階 4 T7）"]
@@ -3984,7 +4042,8 @@ mod tests {
         let uri = file_uri(&package.join("main.py"));
         let wanted = path_of_uri(&uri);
         let message = |text: String| control.send(&text).unwrap();
-        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": { "workspace": { "configuration": true } } } }).to_string());
+        // 画面と同じく、workspace.configuration の能力は送らない（能力は Rust の側の override_initialize が足す）
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }).to_string());
         message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
         message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "python", "version": 1, "text": source } } }).to_string());
         let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
@@ -4033,20 +4092,23 @@ mod tests {
             .unwrap()
             .clone();
         eprintln!("診断の数：{}", list.len());
-        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
-        let (mut in_messages, mut in_logs) = (0, 0);
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）。
+        // 標準エラーの「Python was not found」（PATH の python を探して WindowsApps の実行エイリアスに当たった文）も数える
+        let (mut in_messages, mut in_logs, mut python_not_found) = (0, 0, 0);
         for event in events.lock().unwrap().iter() {
             match event {
                 LspEvent::Message { text } => {
                     in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
                 }
                 LspEvent::Log { text } => {
-                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count();
+                    python_not_found += text.matches("Python was not found").count();
                 }
                 LspEvent::Exited { .. } => {}
             }
         }
         eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        eprintln!("Python was not found の数：{python_not_found}");
         let children = crate::win::descendants(pid);
         let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
         names.sort();
@@ -4080,6 +4142,15 @@ mod tests {
                 )
             })
             .collect();
+        eprintln!(
+            "severity 2 の数：{}",
+            lines.iter().filter(|(_, severity)| *severity == 2).count()
+        );
+        // 設定の pythonPath が届いていれば、PATH の python を探さない（workspace.configuration の直し）
+        assert_eq!(
+            python_not_found, 0,
+            "basedpyright が PATH の python を探した"
+        );
         assert!(lines.contains(&(7, 1)), "型の誤りの診断がない");
         assert!(lines.contains(&(0, 4)), "使っていない import の印がない");
         assert!(
