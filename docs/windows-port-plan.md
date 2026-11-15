@@ -1814,6 +1814,147 @@ commands.rs の T2 の変更（refuse_network_root）は cfg(windows) の行。c
   venv（`%LOCALAPPDATA%\Programs\basedpyright-venv`）と clangd（`%LOCALAPPDATA%\Programs\clangd_23.1.0`）は残す
 - インストーラー（nsis）で入れた exe での動きは見ていない（段階 4 も、画面の確かめは target\release の exe と、開発用のビルドで行った）
 
+### 段階 4 の push と merge（2026-11-15。workspace.configuration の直しの T1 で書いた）
+
+最後の push（push 3）
+- 36fa3b2..26d8595 の 1 コミット（26d8595。段階 4 の結果）。--force なし。利用者の許可を得てから。
+  push の前に、利用者が自分の窓で、送る差分とメッセージを AtCoder のユーザー名・パスワード・REVEL_SESSION で照らし合わせた（どれも 0 件）
+- push の前の確かめ（26d8595 と同じ中身、AC 電源）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 397 通過・0 失敗・9 無視（lib 37.45 秒。時間を測るテストも 1 回目で通った）、
+  npm test 15 件・0 失敗、npm run build 通過
+
+CI（どちらも macos-latest・windows-latest とも success。数字は利用者がログインしたブラウザで見た。run の id〔長い番号〕は控えていない）
+
+| run | コミット | macOS の lib | Windows の lib |
+| --- | --- | --- | --- |
+| （番号は控えていない） | 26d8595（push 3） | 308 通過・0 失敗・0 無視・1 filtered out（24.98 秒） | 397 通過・0 失敗・8 無視・1 filtered out（68.32 秒） |
+| #38 | 0927ed2（merge のあとの main） | 308 通過・0 失敗・0 無視・1 filtered out（39.52 秒） | 397 通過・0 失敗・8 無視・1 filtered out（68.58 秒） |
+
+- npm test はどちらも両方の OS で 15 件・0 失敗。push 3 の Annotations は、Node.js 20 の非推奨の warning（両方の OS）と macOS の runner の混雑の知らせだけで、orphan process の知らせはなかった
+- CI の Windows の lib のテストは 68 秒台で、9.1 の追加 36 の「100 秒を超えたら考え直す」には届いていない
+
+PR と merge
+- PR 6：base は利用者のリポジトリの main、compare は windows-port-stage4。元の開発者のリポジトリには出していない
+- merge：0927ed2。「Merge pull request」の形（Squash・Rebase ではない。題には GitHub の名前が入るので、ここには写さない）。親は 92adb32 と 26d8595 で、tree は 26d8595 と同じ。
+  1 回目は GitHub の「Merge error: The server is currently unable to perform this operation」で失敗し（そのときの origin の main は 92adb32 のままだった）、数分後の 2 回目で Merged になった。
+  windows-port-stage4 のブランチは消していない。手元の main は `git fetch origin` のあと `git merge --ff-only origin/main` で合わせ、origin/main と同じ 0927ed2 になった
+- 36fa3b2 と 0927ed2 のあいだで変わったのは docs/windows-port-plan.md だけ（`git diff --stat 36fa3b2 0927ed2`）。そのため、36fa3b2 から作った release の exe（2026-11-15 01:43:22・10,147,840 バイト）は、
+  0927ed2 とコードが同じ
+
+### 段階 4 のあとの直し：workspace.configuration（2026-11-15 から）
+
+段階 4 の結果の「workspace.configuration の件」を直す。ブランチは main の 0927ed2 から作った lsp-workspace-configuration。
+両方の OS の動きを変えるので、移植の段階とは別の PR にする（9.1 の追加 42）。①②⑥ は、この PR を merge したあとで、別のブランチで扱う（2026-11-15 に利用者が決めた）
+
+何を変えるか
+- lsp.rs の override_initialize で、initialize の `capabilities.workspace.configuration` を true にする。capabilities.workspace がない・オブジェクトでないときは作り、ほかの欄があれば残す（textDocument と同じ扱い）
+- 画面のライブラリ（@codemirror/lsp-client）と lsp.ts は変えない。workspace/configuration の問い合わせには、今も Rust の側（spawn_stdout_reader）が答えていて、画面には届かない。そのため、能力を宣言するのも Rust の側でよい
+- 答え（configuration_answer・basedpyright_configuration）は変えない。T7 の本物の basedpyright のテストは、能力を自分で入れた形で standard の検査（severity 2 が出ない）を通っていたので、答えの形は今のままで足りる
+
+ほかのサーバーへの影響の見込み（コードから。サーバーの動きは推測）
+
+| サーバー | 問い合わせてくるか | 今の答え | 見込み |
+| --- | --- | --- | --- |
+| basedpyright | 来る（段階 4 の試しのスクリプトの vii・viii で 2 回） | python・basedpyright の節に答える | 設定（pythonPath・typeCheckingMode standard・diagnosticMode openFilesOnly）が届く |
+| rust-analyzer | 来る見込み（推測） | rust-analyzer の節と、節のない問い合わせに、initializationOptions と同じ linkedProjects を返す（settings の説明書きのとおり、もともと答える作り） | 動きは同じ見込み。設定を受け取ったときに、作業領域をもう一度読み込むかもしれない（推測） |
+| clangd | 来ない見込み（推測。clangd は initializationOptions を使う） | configuration は null なので、来ても null を返す | 変わらない見込み |
+
+処理系が渡るか
+- basedpyright_configuration は、処理系が見つかったときだけ pythonPath を入れ、見つからなければ `"python": {}` にする。そのときは、直したあとも basedpyright が PATH の python を探すので、
+  「Python was not found」は出続ける見込み（推測。この直しの範囲の外として、残ることに書く）
+- 本物の basedpyright のテストは、どちらも `find_interpreter(&PythonSettings::default())` で処理系を取り、`Some(&interpreter)` を渡す（Windows 版は見つからなければ expect で落ち、macOS 向けは飛ぶ）。
+  そのため、テストが動くときは、いつも pythonPath が入る（コードを読んで確かめた）
+- 画面の IDE は、commands.rs の lsp_start で `find_interpreter(&python).ok()` を渡す（python は settings.json の python の設定）。settings.json の python.cpython（または python.pypy）に値があればそのパスだけを使い、
+  なければ Windows では find_on_windows で探す。python.interpreter が pypy なら、PyPy のパスが pythonPath に入る
+
+どう確かめるか（T2）
+- 先に落とす単体のテスト（本番のコードを直す前に書いて、落ちることを確かめる）
+  - overrides_initialize_on_windows（Windows）と overrides_initialize_and_answers_configuration（cfg(unix)。CI の macos-latest で確かめる）：capabilities の期待に `"workspace": {"configuration": true}` を足す
+  - 新しい、両方の OS のテスト declares_workspace_configuration：capabilities.workspace がないとき・数などの形のとき・ほかの欄があるときに、configuration が true になり、ほかの欄が残る
+- 本物の basedpyright のテスト：initialize を、自分で workspace.configuration を入れる形から、IDE と同じ形（`{"capabilities": {}}`。rust-analyzer・clangd のテストと同じ）にする。
+  - Windows 版（#[ignore]。手で 1 件だけ動かす）：直す前は「severity 2 が出ない」の確かめで落ちる見込み（設定が届かず、basedpyright の既定の検査の強さで調べるため。推測）。
+    標準エラーに「Python was not found」が 0 回であることの確かめを足す（Windows だけ。直す前は 3 回出て落ちる見込み）
+  - macOS 向け：同じ形に直す。basedpyright と python3.13 がない機械では飛ぶので、CI の macos-latest では飛んでいる見込み（推測。runner の中身は見ていない）。macOS の本物の basedpyright では確かめられない
+- 外す確かめ：本番に足した行を一時的に外すと、上の単体のテストが落ちること（控え→ハッシュの違い→テスト→絶対パスで戻す→更新時刻を今に→ハッシュを並べる）
+- 本物の rust-analyzer・clangd のテスト（どちらも #[ignore]）を、直したあとに手で 1 件ずつ動かし、今までどおり通ることを確かめる（先に落ちる確かめではない）
+
+画面の確かめ（T3。release の exe。手順の文は、コードと直す前の画面で照らしてから出す）
+- 前提（利用者が自分の窓で確かめる。値は書かない）：settings.json の python.interpreter が cpython で、python.cpython が空か CPython 3.13 の python.exe の絶対パスであること。
+  空のときは、IDE が CPython を見つけていること（同じ find_interpreter を使う Python のサンプルテストが動くかで見る）。この前提が合わないと、直したあとも pythonPath が届かない
+- 直す前：今の target\release\atcoder-studio.exe（36fa3b2 から作ったもの。0927ed2 とコードが同じ。使う直前に時刻と大きさを確かめる）で、acd-t10-lsp の p1/main.py を開き、
+  実行ログの「[basedpyright] 起動しました：p1」のあとの「Python was not found」の数（今は 3 の見込み）、1 行目の `import sys` の印、9 行目の誤りを控える
+- 直したあと：このブランチから release の exe を作り直し（`npm run tauri build -- --no-bundle`、AC 電源。直す前の exe は上書きされるので、直す前の確かめを先に全部終える）、同じことを見る。
+  「Python was not found」が 0、`import sys` の印が standard の形（目立たない印の見込み。直す前の見え方と比べる）、9 行目は今までどおり誤り
+- Rust の r1：診断・定義へのジャンプ・参照が今までどおりか、実行ログに新しい警告が出ないか。C++ の c1：起動して診断が出るか。閉じたあと、言語サーバーのプロセスが 0 か
+- 「提出」「提出する」のボタンは押さない。提出の確認のダイアログが出ても Enter を押さない
+
+コミットと push
+
+| 順 | まとまり | 中身 |
+| --- | --- | --- |
+| T1 | 文書 | 段階 4 の push と merge、この節、9.1 の追加 42 |
+| T2 | 直し | override_initialize の直しとテスト（先に落とす確かめ、外す確かめ、本物の basedpyright・rust-analyzer・clangd を手で 1 件ずつ） |
+| push 1 | T2 までを push | 利用者の許可を得てから。--force なし。CI の macos-latest で cfg(unix) の単体のテストを確かめる |
+| T3 | 画面の確かめ | 直す前の exe → 直したあとの exe。結果を文書に書く |
+| push 2 | T3 を push | push 1 と同じ |
+
+- PR は利用者がブラウザで作る（base は利用者のリポジトリの main、compare は lsp-workspace-configuration）
+- 進め方は段階 4 と同じ：各コミットの前に報告して待つ。コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。
+  時間を測るテストが落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する。止まらなくなるおそれのあるテストは、外から上限を付けて動かす
+
+結果（2026-11-15）
+
+T2（b172567）
+- lsp.rs の override_initialize の終わりに、capabilities.workspace がない・オブジェクトでないときは `{}` を作り、configuration を true にする行を足した（cfg なし。両方の OS）
+- 本物のテストの initialize は、画面と同じ道を通る（テストの control.send → LspControl::send → send_checked → Server::send → check_message → override_initialize。画面の lsp_send も同じ control.send）。コードを読んで確かめた
+- 直す前の失敗：overrides_initialize_on_windows（capabilities に workspace がない）、declares_workspace_configuration（新。4 つの形とも合わない）、
+  analyzes_python_with_local_basedpyright_on_windows（initialize を `{"capabilities": {}}` にした。「Python was not found」3 回で落ちた。severity 2 は 4 件、診断は 5 件）
+- 直したあと：上の 3 件が通った。本物の basedpyright は「Python was not found」0 回、severity 2 は 0 件、診断は 3 件（0.8 秒）
+- 外す確かめ：configuration を true にする行を消すと 2 件が落ち、workspace を作る所を消すと declares_workspace_configuration が落ちた（数の形で serde_json が panic）。
+  どちらも控えから戻し、ハッシュが外す前と同じことを確かめた
+- 本物の rust-analyzer（23.5 秒）・clangd（4.9 秒）のテストも通った。rust-analyzer に workspace/configuration の問い合わせが来るようになったかは、このテストでは見ていない
+- 手元の確かめ（AC 電源）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 398 通過・0 失敗・9 無視（lib 36.31 秒）、npm test 15 件・0 失敗、npm run build 通過
+
+push 1 と CI
+- cfe4cca・b172567 の 2 コミットを `git push -u origin lsp-workspace-configuration` で送った（新しいブランチ。--force なし。利用者の許可を得てから）。
+  push の前に、利用者が自分の窓で送る差分とメッセージを照らし合わせた。AtCoder のユーザー名・パスワードは 0 件。REVEL_SESSION は 1 件で、T1 の「…REVEL_SESSION で照らし合わせた（どれも 0 件）」の説明の行（Cookie の名前の語で、値ではない）だった
+- run #39（b172567）：macos-latest・windows-latest とも success（利用者がブラウザで見た）
+
+| OS | lib | 見たテスト |
+| --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out（34.94 秒） | overrides_initialize_and_answers_configuration ... ok、declares_workspace_configuration ... ok |
+| Windows | 398 通過・0 失敗・8 無視・1 filtered out（64.88 秒） | declares_workspace_configuration ... ok |
+
+- npm test は両方の OS で 15 件・0 失敗
+- cfg(unix) の overrides_initialize_and_answers_configuration は、直す前に落ちることは確かめていない（手元で動かないため）。直したあとに CI の macOS で通った
+
+画面の確かめ（T3。release の exe。利用者が操作した。ログインも提出もしていない）
+- 直す前：36fa3b2 から作った exe（2026-11-15 01:43:22・10,147,840 バイト。0927ed2 とコードが同じ）。直したあと：b172567 から作り直した exe
+  （`npm run tauri build -- --no-bundle`、AC 電源。2026-11-15 16:24:43・10,148,864 バイト。ビルドは 4 分 12 秒、error・warning の行は 0、ビルドのあとの git status は 0 行）
+- どちらの確かめの前と後も、アプリと言語サーバーのプロセスは 0、settings.json のハッシュは始める前と同じだった
+- 前提：p1/main.py で「実行」を押すと、どちらの exe でも TypeError（unsupported operand type(s) for +: 'int' and 'str'）が出た。IDE はローカルの CPython 3.13.7 を見つけている
+
+| 見たこと | 直す前 | 直したあと |
+| --- | --- | --- |
+| p1：実行ログの「[basedpyright] 起動しました：p1」のあとの「Python was not found」 | 3 回 | 0 回（起動しましたの 1 行だけ） |
+| p1：1 行目 `import sys` | 黄の下線・黄の背景・行末のメッセージ（警告） | 目に見える印なし |
+| p1：2 行目・4 行目 | 印なし | 印なし |
+| p1：8 行目 `q = deque()` | 黄の下線・黄の背景・行末のメッセージ（hover は「Type of "q" is partially unknown」など） | 印なし |
+| p1：9 行目 | 赤の下線・赤の背景・行末のメッセージ。hover は「Operator "+" not supported…」と「Argument type is unknown…」 | 赤の下線・赤の背景・行末のメッセージ。hover は「Operator "+" not supported…」だけ |
+| r1/src/main.rs | ⑤ の WARN notify error 2 回、準備完了。5 行目に赤の印。F12 で util.rs へ、Shift+F12 で main.rs の 6 行目と 1 行目 | 同じ。新しい WARN・ERROR の行はなし |
+| c1/main.cpp | ④ が 1 回。7 行目に赤の印 | 同じ |
+
+- 直したあとの p1 の印は、本物の basedpyright のテストの standard の検査（severity 2 が出ない）と合う
+- 1 行目の使っていない import は、本物のテストでは hint（severity 4）が出ているが、画面では目に見える印がなかった。画面の側で hint を捨てる所はない
+  （errorLens.ts:42 が背景とメッセージを誤りと警告だけに付けるだけ。下線は @codemirror/lint の決まりの色で描かれるはず）。見えなかった理由は未確認
+
+残ること
+- 処理系が見つからないとき（find_interpreter が Err）は、basedpyright_configuration が `"python": {}` を返すので、直したあとも basedpyright が PATH の python を探し、
+  「Python was not found」が残る見込み（推測。確かめていない）
+- macOS の画面と、macOS の本物の言語サーバーでは確かめていない（確かめたのは CI の macos-latest の単体のテストだけ。macOS 向けの本物の basedpyright のテストは CI では飛んでいる見込み）
+- rust-analyzer に workspace/configuration の問い合わせが来るようになったかは未確認（答えるのは Rust の側なので、テストの事象にも画面にも出ない）。本物のテストと画面の動きは変わらなかった
+- 画面で hint の印が目に見えなかった理由（上）
+- ①②⑥ は、この PR を merge したあとで、別のブランチで扱う
+
 ### 段階 5：提出
 
 何を変えるか
@@ -1944,6 +2085,7 @@ commands.rs の T2 の変更（refuse_network_root）は cfg(windows) の行。c
 | 追加 39（2026-11-13） | settings.json に cpp.clangd・python.basedpyright（実行ファイルのパス）を足す（9.1 の 11 の詳しい形）。使うのは Windows だけで、macOS の探し方は変えない。型を両方の OS で共有するなら、macOS では読んでも使わないことと、設定の画面で保存したときにこの 2 つが消えないこと（write_settings が残すか）をテストで確かめる。T6 の前に、変えるファイルと Unix への影響を報告して待つ | 段階 4（T6・T7） |
 | 追加 40（2026-11-13） | lsp.rs の偽のサーバーのテスト（偽のサーバーを使う cfg(unix) のテストは 11 件）は、中継・順番・正式な終了・shutdown に答えないときに子孫ごと止める・自分で終わる、の 5 つの項目だけを Windows 版にする。5 つの項目は、Unix のテストでは 4 件（中継と正式な終了は relays_messages_and_stops_gracefully の 1 件。ほかは keeps_the_order_of_messages・kills_server_that_ignores_shutdown・reports_server_that_exits_by_itself）。これに send_rejects_messages_outside_the_allow_list を足して、Windows 版は 5 件（T9）。cfg(unix) のまま残るのは 6 件（stop_during_restart_leaves_nothing・restarts_for_another_session・restarts_when_the_packages_change・stops_reading_broken_output・restarts_for_another_package・restarts_for_another_language）で、段階 4 の結果に「移していない」と書く。作業領域の外を断るテストのうち、偽のサーバーを使わない 2 件（checks_messages_against_the_allow_list・locates_files_inside_the_workspace）は T2 で Windows 版にする（リンクはジャンクション）。合わせて cfg(unix) の 13 件 ＝ 2 ＋ 5 ＋ 6 | 段階 4（T2・T9） |
 | 追加 41（2026-11-13） | 作業領域が UNC（`\\server\share`）のとき、言語サーバーは「使えません」と知らせるだけにする。知らせることはテストで確かめる。push は T4・T9・T11 のあとの 3 回で、どれも利用者の許可のあと。--force なし | 段階 4 |
+| 追加 42（2026-11-15） | workspace.configuration の件は、段階 4 では直さず、段階 4 の merge のあと、段階 5 の前に、別のブランチ（lsp-workspace-configuration）と PR で直す。「macOS / Unix の経路は cfg を付ける・場所を移す以外は変えない」の例外で、変えるのは lsp.rs の override_initialize（initialize の capabilities.workspace.configuration）とそのテストだけ。理由は、IDE が渡すつもりの basedpyright の設定（D-225）が、両方の OS で届いていないため。macOS でも、basedpyright の診断の数と種類が変わり（standard になり、pythonPath が届く）、rust-analyzer に workspace/configuration の問い合わせが来るようになる見込み。macOS の確かめは CI の macos-latest の単体のテストだけで、macOS の画面と、macOS の本物の言語サーバーでは確かめられない。①②⑥（lsp.ts）は、この PR を merge したあとで別のブランチにする | 段階 4 のあとの直し |
 
 ---
 
