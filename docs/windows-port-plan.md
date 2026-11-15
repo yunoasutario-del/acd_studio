@@ -1955,6 +1955,92 @@ push 1 と CI
 - 画面で hint の印が目に見えなかった理由（上）
 - ①②⑥ は、この PR を merge したあとで、別のブランチで扱う
 
+push 2 と merge（2026-11-15。実行ログの直しの T1 で書いた）
+- push 2：b172567..ce5bf93 の 1 コミット（ce5bf93。この節の結果）。--force なし。利用者の許可を得てから。
+  push の前に、利用者が自分の窓で送る差分とメッセージを照らし合わせた。AtCoder のユーザー名・パスワードは 0 件。REVEL_SESSION は 1 件で、「push 1 と CI」の照らし合わせの説明の行（Cookie の名前の語で、値ではない）だった
+- PR 7：base は利用者のリポジトリの main、compare は lsp-workspace-configuration。元の開発者のリポジトリには出していない
+- merge：00a3637。「Merge pull request」の形（題には GitHub の名前が入るので、ここには写さない）。親は 0927ed2 と ce5bf93 で、tree は ce5bf93 と同じ。1 回で Merged になった。
+  lsp-workspace-configuration のブランチは消していない。手元の main は `git fetch origin` のあと `git merge --ff-only origin/main` で合わせ、origin/main と同じ 00a3637 になった
+
+CI（どちらも macos-latest・windows-latest とも success。数字は利用者がログインしたブラウザで見た。run の id〔長い番号〕は控えていない）
+
+| run | コミット | macOS の lib | Windows の lib |
+| --- | --- | --- | --- |
+| #40 | ce5bf93（push 2） | 309 通過・0 失敗・0 無視・1 filtered out（64.97 秒） | 398 通過・0 失敗・8 無視・1 filtered out（64.82 秒） |
+| #42 | 00a3637（merge のあとの main） | 309 通過・0 失敗・0 無視・1 filtered out（42.00 秒） | 398 通過・0 失敗・8 無視・1 filtered out（62.73 秒） |
+
+- npm test はどちらも両方の OS で 15 件・0 失敗。Annotations は、どちらも Node.js 20 の非推奨の warning（両方の OS）と macOS の runner の混雑の知らせだけ
+- CI の Windows の lib のテストは 62〜65 秒で、9.1 の追加 36 の「100 秒を超えたら考え直す」には届いていない
+
+### 実行ログの直し：①②⑥（2026-11-15 から）
+
+段階 4 の結果の「実行ログの気になる行」のうち、両方の OS に関わる ①②⑥ を、段階 5 の前に直す（2026-11-15 に利用者が決めた）。ブランチは main の 00a3637 から作った lsp-log-fixes。
+①② を先に直し、⑥ も一緒に直す。ただし、⑥ のテストで npm test から workspace.ts を読み込めないなど、手間がふくらむときは、そこで止めて相談する。
+変えるのは画面の側（src/editor/lsp.ts・src/editor/workspace.ts・新しい src/editor/lspExit.ts とそのテスト）だけで、Rust は変えない。両方の OS で同じコードなので、9.1 の追加 43 の例外にする
+
+①：IDE が止めたのに「起動に失敗しました」と書く
+- 見分けられない所：lsp.ts の Exited の受け口は、current の接続なら handleExit を呼ぶ。handleExit は connection.ready だけを見て、読み込みの前なら「起動に失敗しました。読み込みが終わる前に止まりました」、
+  あとなら「止まりました」と書く。IDE が止めたのか、サーバーが自分で終わったのかは見ていない
+- T10 の ① の流れ（コードからの見立て）：前の作業領域の rust-analyzer が読み込みの途中 → フォルダを開く（commands.rs の open_workspace が LspControl::stop を呼ぶ）→
+  lsp.rs の stop が shutdown を送り、読み込み中で STOP_WAIT（3 秒）のうちに終わらないので kill_group で止める（Windows では Job を止めた終了コード -525598719、macOS ではシグナルなので終了コードなしの見込み）→
+  その Exited が current の接続に届き、ready が false なので「起動に失敗」と書く
+- 見分け方（案 A。2026-11-15 に利用者が決めた）：Rust の側はもう 2 つの道に分かれている（コードを読んで確かめた）。サーバーが自分で終わったときは、終わるのを待つスレッドが、
+  Exited の直前に Log「<名前> が終わりました」を出す。IDE が止めたとき（stop）は、始めに reported を swap して知らせる役を取るので、正式な終了でも kill でもその Log は出さず、Exited だけを出す。
+  画面は、この Log をもう受け取って表示から外している。そこで、画面の Log の受け口で「<接続のサーバーの名前> が終わりました」を受けたら、その接続が自分で終わったと覚え、handleExit で分ける。
+  終了コードは使わないので、Windows の -525598719 と macOS のシグナル（終了コードなし）を同じに扱える
+  - 自分で終わった・読み込みのあと：「止まりました（終了コード X）」、状態は stopped（今と同じ）
+  - 自分で終わった・読み込みの前：「起動に失敗しました。読み込みが終わる前に止まりました（終了コード X）」、状態は failed（今と同じ）
+  - IDE が止めた：「止めました」（終了コードは付けない。2026-11-15 に利用者が決めた）、状態は stopped
+- 弱い所：Log の文に頼る（今も画面は同じ文で Log を表示から外している）。同じ sink から順に送るので、Log は Exited より先に届く見込み（Tauri のチャンネルの順番の決まりは未確認）
+- Rust の Exited に止めたかどうかの欄を足す案（案 B）は取らない。Exited と比べる Rust のテストに cfg(unix) のものがあり、手元ではコンパイルできないため
+
+②：前のサーバーの知らせに、新しいサーバーの名前が付く
+- lsp.ts の serverName は 1 つしかない変数で、tag()・setStatus・logLine がこれを使う。attach は、lspStart を待つ前に serverName を新しい名前にする。
+  lspStart の中で Rust が前のサーバーを止めると、その Exited が待つ間に届くことがあり、そのときはまだ current が前の接続なので、handleExit が新しい名前で
+  「[clangd] 止まりました（終了コード 0）」などと書く（T10 の ②）
+- 直し方：接続についての知らせ（handleExit、チャンネルの Log の受け口、送れないときの警告）は、接続が覚えているサーバーの名前（connection.server）で出す。
+  attach・restartLsp などの、今のサーバーについての行は、今のまま serverName を使う。① と合わせると、言語を替えたときの前のサーバーの行は「[rust-analyzer] 止めました」になる見込み
+
+⑥：再起動のあとに「ERROR orphan DidCloseTextDocument」
+- コードで確かめた流れ（原因はコードの上でははっきりした。画面ではまだ確かめていない）：restartLsp は、current を閉じて client.disconnect() を呼んだあとで、LSP の拡張を外す。
+  拡張を外すと、ライブラリの LSPPlugin.destroy が workspace.closeFile を呼び、IdeWorkspace.closeFile が client.didClose を呼ぶ。ライブラリの disconnect() は transport を消さず、
+  initializing を新しい待ちの Promise にして、最後に workspace.disconnected() を呼ぶだけ。notification() は transport があるので、initializing を待ってから送る。
+  そのため、待っていた didClose は、次の connect のあと、新しいサーバーの initialize の答えが来たときに、新しいサーバーへ送られる。新しいサーバーはそのファイルの didOpen を受けていないので、
+  rust-analyzer が orphan を出す。サーバーが自分で終わったあと（handleExit の disconnect）に、タブを替えて拡張を外したときも、同じことが起きる見込み（推測）
+- 直し方：IdeWorkspace で、サーバーにつながっているかを覚える。disconnected()（ライブラリの Workspace にある空の関数で、disconnect() の最後に呼ばれる）で false にし、
+  connected() の頭で true にする。closeFile は、つながっているときだけ didClose を送る（files から外すのは今までどおり）。lsp.ts の順番は変えない
+
+どう確かめるか
+- ①②：新しい src/editor/lspExit.ts に、終わりの知らせの文と状態を決める純粋な関数を置き（lspUri.ts と同じ形）、tests/lspExit.test.ts で守る。
+  3 つの場合（IDE が止めた、自分で終わった×読み込みの前と後）と、名前が引数のもので出ること、IDE が止めた場合の終了コード（-525598719・null・0）を確かめる。
+  先に、lspExit.ts を今の動き（ready だけで決める）で作ってテストが落ちることを確かめてから直す
+- ⑥：IdeWorkspace に偽の client を渡し、disconnected() のあとの closeFile で didClose を送らないことを確かめる。npm test から workspace.ts を読み込めるかは未確認で、T3 の最初に確かめる
+- 外す確かめ：自分で終わったかを見る所、つながっているかを見る所を、一時的に外して落ちること（控え→ハッシュの違い→テスト→絶対パスで戻す→更新時刻を今に→ハッシュを並べる）
+- テストが守らないこと：lsp.ts の Log の受け口で自分で終わったと覚える所と、handleExit が connection.server を渡す所（コードを読んで確かめ、画面で見る）
+
+画面の確かめ（T4。release の exe。手順の文は、コードと直す前の画面で照らしてから出す）
+- 直す前の exe：今の target\release の exe（b172567 から作ったもの）。b172567 と 00a3637 のあいだのコードの違いは、使う前に git diff --stat で確かめる（計画書だけの見込み）
+- ①：acd-t10-lsp を開き、r1/src/main.rs を開いて、「準備完了」になる前に「フォルダを開く」で acd-t10-lsp をもう一度開く（open_workspace が止めるので、同じフォルダでも起きる見込み。推測）。
+  直す前は「[rust-analyzer] 起動に失敗しました。読み込みが終わる前に止まりました（終了コード -525598719）」、直したあとは「[rust-analyzer] 止めました」の見込み。時機によって再現しないときは、そのまま書く
+- ②：r1/src/main.rs を開いて「準備完了」まで待ち、c1/main.cpp、p1/main.py の順に開く。直す前は「[clangd] 止まりました（終了コード 0）」など、直したあとは前のサーバーの名前で「止めました」の見込み。新しい「止めました」の文は、ここでも見る
+- ⑥：r1/src/main.rs を開いて「準備完了」まで待ち、メニューの「言語サーバーを再起動」を押す。直す前は「ERROR orphan DidCloseTextDocument: …」、直したあとはその行が出ず、再起動のあとも診断の印が出る見込み
+- 閉じたあとに、言語サーバーのプロセスの数と settings.json のハッシュを確かめる。「提出」のボタンは押さない。提出の確認のダイアログが出ても Enter を押さない
+
+コミットと push
+
+| 順 | まとまり | 中身 |
+| --- | --- | --- |
+| T1 | 文書 | workspace.configuration の push 2 と merge、この節、9.1 の追加 43 |
+| T2 | ①② | lspExit.ts（新）・lsp.ts・tests/lspExit.test.ts |
+| T3 | ⑥ | workspace.ts とテスト（はじめに npm test から読み込めるかを確かめる。手間がふくらむときは止めて相談） |
+| push 1 | T3 までを push | 利用者の許可を得てから。--force なし |
+| T4 | 画面の確かめ | 直す前の exe → 直したあとの exe。結果を文書に書く |
+| push 2 | T4 を push | push 1 と同じ |
+
+- PR は利用者がブラウザで作る（base は利用者のリポジトリの main、compare は lsp-log-fixes）
+- 進め方は前と同じ：各コミットの前に報告して待つ。コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。
+  時間を測るテストが落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する
+
 ### 段階 5：提出
 
 何を変えるか
@@ -2086,6 +2172,7 @@ push 1 と CI
 | 追加 40（2026-11-13） | lsp.rs の偽のサーバーのテスト（偽のサーバーを使う cfg(unix) のテストは 11 件）は、中継・順番・正式な終了・shutdown に答えないときに子孫ごと止める・自分で終わる、の 5 つの項目だけを Windows 版にする。5 つの項目は、Unix のテストでは 4 件（中継と正式な終了は relays_messages_and_stops_gracefully の 1 件。ほかは keeps_the_order_of_messages・kills_server_that_ignores_shutdown・reports_server_that_exits_by_itself）。これに send_rejects_messages_outside_the_allow_list を足して、Windows 版は 5 件（T9）。cfg(unix) のまま残るのは 6 件（stop_during_restart_leaves_nothing・restarts_for_another_session・restarts_when_the_packages_change・stops_reading_broken_output・restarts_for_another_package・restarts_for_another_language）で、段階 4 の結果に「移していない」と書く。作業領域の外を断るテストのうち、偽のサーバーを使わない 2 件（checks_messages_against_the_allow_list・locates_files_inside_the_workspace）は T2 で Windows 版にする（リンクはジャンクション）。合わせて cfg(unix) の 13 件 ＝ 2 ＋ 5 ＋ 6 | 段階 4（T2・T9） |
 | 追加 41（2026-11-13） | 作業領域が UNC（`\\server\share`）のとき、言語サーバーは「使えません」と知らせるだけにする。知らせることはテストで確かめる。push は T4・T9・T11 のあとの 3 回で、どれも利用者の許可のあと。--force なし | 段階 4 |
 | 追加 42（2026-11-15） | workspace.configuration の件は、段階 4 では直さず、段階 4 の merge のあと、段階 5 の前に、別のブランチ（lsp-workspace-configuration）と PR で直す。「macOS / Unix の経路は cfg を付ける・場所を移す以外は変えない」の例外で、変えるのは lsp.rs の override_initialize（initialize の capabilities.workspace.configuration）とそのテストだけ。理由は、IDE が渡すつもりの basedpyright の設定（D-225）が、両方の OS で届いていないため。macOS でも、basedpyright の診断の数と種類が変わり（standard になり、pythonPath が届く）、rust-analyzer に workspace/configuration の問い合わせが来るようになる見込み。macOS の確かめは CI の macos-latest の単体のテストだけで、macOS の画面と、macOS の本物の言語サーバーでは確かめられない。①②⑥（lsp.ts）は、この PR を merge したあとで別のブランチにする | 段階 4 のあとの直し |
+| 追加 43（2026-11-15） | 実行ログの ①②⑥ を、段階 5 の前に、別のブランチ（lsp-log-fixes）と PR で直す。「macOS / Unix の経路は cfg を付ける・場所を移す以外は変えない」の例外で、変えるのは画面の側（src/editor/lsp.ts・src/editor/workspace.ts・新しい src/editor/lspExit.ts とそのテスト）だけ。Rust は変えない。① は案 A（画面が「<名前> が終わりました」の Log で、サーバーが自分で終わったかを見分ける。終了コードは使わない）で、IDE が止めたときの文は「止めました」（終了コードを付けない）。⑥ も一緒に直すが、手間がふくらむときは止めて相談する。macOS でも、実行ログの文（① の「止めました」、② の名前）と再起動のあとの didClose（⑥）が変わる。macOS の確かめは CI の macos-latest の npm test だけで、macOS の画面では確かめられない | 実行ログの直し |
 
 ---
 
