@@ -311,6 +311,52 @@ pub fn python_settings(dir: &Path) -> PythonSettings {
     }
 }
 
+// Windows（移植の段階 4 T6。9.1 の追加 39）：言語サーバーの実行ファイルのパス（settings.json の cpp.clangd）。空なら探す。
+// macOS では読まない（Unix の探し方は変えない。知らない項目として残る）
+#[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspPaths {
+    pub clangd: String,
+    // settings.json の python.basedpyright（basedpyright-langserver.exe のパス。段階 4 T7）
+    pub basedpyright: String,
+}
+
+#[cfg(windows)]
+fn parse_lsp_paths(value: &Value, problems: &mut Vec<String>) -> LspPaths {
+    let mut paths = LspPaths::default();
+    // cpp の欄がオブジェクトでないときの知らせは parse_cpp_settings が出すので、ここでは出さない
+    if let Some(section) = value.get("cpp").and_then(Value::as_object) {
+        match section.get("clangd") {
+            None => {}
+            Some(Value::String(path)) => paths.clangd = path.trim().to_string(),
+            Some(_) => {
+                problems.push("cpp.clangd（clangd.exe のパスの文字列にしてください）".to_string())
+            }
+        }
+    }
+    // python の欄がオブジェクトでないときの知らせは parse_python_settings が出すので、ここでは出さない（段階 4 T7）
+    if let Some(section) = value.get("python").and_then(Value::as_object) {
+        match section.get("basedpyright") {
+            None => {}
+            Some(Value::String(path)) => paths.basedpyright = path.trim().to_string(),
+            Some(_) => problems.push(
+                "python.basedpyright（basedpyright-langserver.exe のパスの文字列にしてください）"
+                    .to_string(),
+            ),
+        }
+    }
+    paths
+}
+
+// Windows：言語サーバーを起動するときに読む。読めない・ないときは既定（探す）
+#[cfg(windows)]
+pub fn lsp_paths(dir: &Path) -> LspPaths {
+    match reread_settings(dir) {
+        Ok(Some(loaded)) => loaded.lsp_paths,
+        _ => LspPaths::default(),
+    }
+}
+
 // 問題・コンテストを作るときに読む（D-198）。読めない・ないときは既定（input! は入れない）
 pub fn problem_settings(dir: &Path) -> ProblemSettings {
     match reread_settings(dir) {
@@ -699,6 +745,9 @@ pub struct LoadedSettings {
     pub problem: ProblemSettings,
     pub cpp: CppSettings,
     pub python: PythonSettings,
+    // Windows：言語サーバーの実行ファイルのパス（段階 4 T6）
+    #[cfg(windows)]
+    pub lsp_paths: LspPaths,
     // 読めなかった見た目・提出・問題文の欄・C++・Python の項目
     pub appearance_problems: Vec<String>,
 }
@@ -722,6 +771,8 @@ fn parse_settings(value: Value) -> Option<LoadedSettings> {
     let problem = parse_problem_settings(&value, &mut appearance_problems);
     let cpp = parse_cpp_settings(&value, &mut appearance_problems);
     let python = parse_python_settings(&value, &mut appearance_problems);
+    #[cfg(windows)]
+    let lsp_paths = parse_lsp_paths(&value, &mut appearance_problems);
     Some(LoadedSettings {
         key_bindings,
         invalid,
@@ -730,6 +781,8 @@ fn parse_settings(value: Value) -> Option<LoadedSettings> {
         problem,
         cpp,
         python,
+        #[cfg(windows)]
+        lsp_paths,
         appearance_problems,
     })
 }
@@ -1522,6 +1575,130 @@ mod tests {
             read(r#"{"version": 1, "cpp": "x"}"#).appearance_problems,
             ["cpp"]
         );
+    }
+
+    // 段階 4 T6（9.1 の追加 39）：Windows では cpp.clangd（clangd.exe のパス）を読む。ない・読めないときは空（探す）
+    #[cfg(windows)]
+    #[test]
+    fn reads_the_clangd_path_on_windows() {
+        let read = |text: &str| parse_settings(serde_json::from_str(text).unwrap()).unwrap();
+        let loaded = read(
+            r#"{"version": 1, "cpp": {"compiler": "C:\\x\\g++.exe", "clangd": " C:\\x\\clangd.exe "}}"#,
+        );
+        assert_eq!(loaded.lsp_paths.clangd, r"C:\x\clangd.exe");
+        assert_eq!(loaded.cpp.compiler, r"C:\x\g++.exe");
+        assert!(loaded.appearance_problems.is_empty());
+        assert_eq!(read(r#"{"version": 1}"#).lsp_paths, LspPaths::default());
+        let wrong = read(r#"{"version": 1, "cpp": {"clangd": 23}}"#);
+        assert_eq!(wrong.lsp_paths, LspPaths::default());
+        assert_eq!(
+            wrong.appearance_problems,
+            ["cpp.clangd（clangd.exe のパスの文字列にしてください）"]
+        );
+        // cpp の欄がオブジェクトでないときの知らせは 1 つだけ（parse_cpp_settings の「cpp」）
+        assert_eq!(
+            read(r#"{"version": 1, "cpp": "x"}"#).appearance_problems,
+            ["cpp"]
+        );
+        // lsp_paths はファイルから読む
+        let dir = TempDir::new("clangd-path");
+        fs::create_dir_all(&dir.0).unwrap();
+        fs::write(
+            dir.0.join(SETTINGS_FILE),
+            r#"{"version": 1, "cpp": {"clangd": "C:\\y\\clangd.exe"}}"#,
+        )
+        .unwrap();
+        assert_eq!(lsp_paths(&dir.0).clangd, r"C:\y\clangd.exe");
+    }
+
+    // 段階 4 T6・T7：macOS（Unix）では cpp.clangd・python.basedpyright を読まない。型が違っても「読めなかった項目」に
+    // 出さない（知らない項目と同じ）
+    #[cfg(unix)]
+    #[test]
+    fn ignores_the_language_server_paths_on_unix() {
+        let loaded = parse_settings(
+            serde_json::from_str(
+                r#"{"version": 1, "cpp": {"clangd": 23, "compiler": "/opt/x/g++-15"}, "python": {"basedpyright": 23, "pypy": "/opt/x/pypy3"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            loaded.appearance_problems.is_empty(),
+            "{:?}",
+            loaded.appearance_problems
+        );
+        assert_eq!(loaded.cpp.compiler, "/opt/x/g++-15");
+        assert_eq!(loaded.python.pypy, "/opt/x/pypy3");
+    }
+
+    // 段階 4 T7（9.1 の追加 39）：Windows では python.basedpyright（basedpyright-langserver.exe のパス）を読む。
+    // ない・読めないときは空（探す）。python の欄がオブジェクトでないときの知らせは、parse_python_settings の「python」だけ
+    #[cfg(windows)]
+    #[test]
+    fn reads_the_basedpyright_path_on_windows() {
+        let read = |text: &str| parse_settings(serde_json::from_str(text).unwrap()).unwrap();
+        let loaded = read(
+            r#"{"version": 1, "python": {"interpreter": "cpython", "basedpyright": " C:\\x\\basedpyright-langserver.exe "}}"#,
+        );
+        assert_eq!(
+            loaded.lsp_paths.basedpyright,
+            r"C:\x\basedpyright-langserver.exe"
+        );
+        assert!(loaded.appearance_problems.is_empty());
+        assert_eq!(read(r#"{"version": 1}"#).lsp_paths.basedpyright, "");
+        let wrong = read(r#"{"version": 1, "python": {"basedpyright": 23}}"#);
+        assert_eq!(wrong.lsp_paths.basedpyright, "");
+        assert_eq!(
+            wrong.appearance_problems,
+            ["python.basedpyright（basedpyright-langserver.exe のパスの文字列にしてください）"]
+        );
+        assert_eq!(
+            read(r#"{"version": 1, "python": "x"}"#).appearance_problems,
+            ["python"]
+        );
+        // lsp_paths はファイルから読む（cpp.clangd と一緒に）
+        let dir = TempDir::new("basedpyright-path");
+        fs::create_dir_all(&dir.0).unwrap();
+        fs::write(
+            dir.0.join(SETTINGS_FILE),
+            r#"{"version": 1, "cpp": {"clangd": "C:\\y\\clangd.exe"}, "python": {"basedpyright": "C:\\y\\basedpyright-langserver.exe"}}"#,
+        )
+        .unwrap();
+        let paths = lsp_paths(&dir.0);
+        assert_eq!(paths.clangd, r"C:\y\clangd.exe");
+        assert_eq!(paths.basedpyright, r"C:\y\basedpyright-langserver.exe");
+    }
+
+    // 段階 4 T6（9.1 の追加 39）：設定の画面で保存しても、cpp.clangd・python.basedpyright（と cpp.compiler）は消えない
+    // （write_settings は cpp の欄に触れず、python の欄は interpreter だけを入れ替える）
+    #[test]
+    fn keeps_the_language_server_paths_when_saving() {
+        let dir = TempDir::new("lsp-paths-write");
+        fs::create_dir_all(&dir.0).unwrap();
+        fs::write(
+            dir.0.join(SETTINGS_FILE),
+            r#"{"version": 1, "cpp": {"compiler": "C:\\x\\g++.exe", "clangd": "C:\\x\\clangd.exe"}, "python": {"interpreter": "cpython", "basedpyright": "C:\\x\\basedpyright-langserver.exe"}}"#,
+        )
+        .unwrap();
+        write_settings(
+            &dir.0,
+            &[],
+            &Appearance::default(),
+            &SubmitSettings::default(),
+            &ProblemSettings::default(),
+            Interpreter::Pypy,
+        )
+        .unwrap();
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(dir.0.join(SETTINGS_FILE)).unwrap()).unwrap();
+        assert_eq!(value["cpp"]["compiler"], r"C:\x\g++.exe");
+        assert_eq!(value["cpp"]["clangd"], r"C:\x\clangd.exe");
+        assert_eq!(
+            value["python"]["basedpyright"],
+            r"C:\x\basedpyright-langserver.exe"
+        );
+        assert_eq!(value["python"]["interpreter"], "pypy");
     }
 
     #[test]

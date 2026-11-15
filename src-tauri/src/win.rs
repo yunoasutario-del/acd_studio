@@ -470,6 +470,83 @@ pub(crate) fn has_job_record(pid: u32) -> bool {
     jobs().contains_key(&pid)
 }
 
+// テスト用：pid の子孫（pid と exe の名前）。プロセスの一覧を 1 回だけ取り、親の pid をたどる（段階 4 T5。
+// 本物の言語サーバーを止めたあとに子孫が残らないことを確かめる）。pid の使い回しは考えない
+#[cfg(test)]
+pub(crate) fn descendants(pid: u32) -> Vec<(u32, String)> {
+    let mut all: Vec<(u32, u32, String)> = Vec::new();
+    // SAFETY: 引数は値だけ。失敗すれば INVALID_HANDLE_VALUE が返る
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let snapshot = Handle(snapshot);
+    // SAFETY: PROCESSENTRY32W はゼロで初期化してよい C の構造体。dwSize に大きさを入れてから渡す
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: 取った一覧と、書き込み先を渡す
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+        all.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..len]),
+        ));
+        // SAFETY: 取った一覧と、書き込み先を渡す
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+    }
+    let mut found: Vec<(u32, String)> = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(parent) = frontier.pop() {
+        for (child, child_parent, name) in &all {
+            if *child_parent == parent
+                && *child != pid
+                && !found.iter().any(|(known, _)| known == child)
+            {
+                found.push((*child, name.clone()));
+                frontier.push(*child);
+            }
+        }
+    }
+    found
+}
+
+// テスト用のジャンクション（段階 4 T2 で lsp.rs のテストに作り、T3 で sources.rs のテストからも使うためにここへ移した）。
+// 管理者は要らない（段階 1 で確認済み）。link と target は一時フォルダの中だけ。
+// テストが落ちても残らないように、Drop でジャンクションそのものだけを remove_dir で消す（指す先の中身はたどらない）
+#[cfg(test)]
+pub(crate) struct TestJunction(std::path::PathBuf);
+
+#[cfg(test)]
+impl TestJunction {
+    pub(crate) fn new(link: &std::path::Path, target: &std::path::Path) -> TestJunction {
+        use std::os::windows::process::CommandExt;
+        let link = crate::trust::without_verbatim(link);
+        let target = crate::trust::without_verbatim(target);
+        let _ = std::fs::remove_dir(&link);
+        let status = crate::process::command("cmd")
+            .raw_arg(format!(
+                r#"/C mklink /J "{}" "{}""#,
+                link.display(),
+                target.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ジャンクションを作れない");
+        TestJunction(link)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestJunction {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
 // テスト用：止めずに Job のハンドルを閉じる（IDE が異常に終わったときにあたる）
 #[cfg(test)]
 pub(crate) fn close_job_without_terminating(pid: u32) {

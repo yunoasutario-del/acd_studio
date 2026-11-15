@@ -55,6 +55,7 @@ fn allowed_roots(
     .collect()
 }
 
+#[cfg(not(windows))]
 fn display_location(real: &Path, home: Option<&Path>) -> String {
     let home = home.and_then(|home| home.canonicalize().ok());
     match home
@@ -63,6 +64,22 @@ fn display_location(real: &Path, home: Option<&Path>) -> String {
     {
         Some(rest) => format!("~/{}", rest.to_string_lossy()),
         None => real.to_string_lossy().into_owned(),
+    }
+}
+
+// Windows（移植の段階 4 T3）：trust.rs の display_above と同じ形にする。ホームの下は `~/` のあとを `/` 区切りに、
+// ホームの外は canonicalize が付ける `\\?\` を外して出す（real・ホームとも canonicalize した `\\?\` の形で比べる）
+#[cfg(windows)]
+fn display_location(real: &Path, home: Option<&Path>) -> String {
+    let home = home.and_then(|home| home.canonicalize().ok());
+    match home
+        .as_deref()
+        .and_then(|home| real.strip_prefix(home).ok())
+    {
+        Some(rest) => format!("~/{}", rest.to_string_lossy().replace('\\', "/")),
+        None => crate::trust::without_verbatim(real)
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
@@ -177,10 +194,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn reads_rust_sources_in_the_allowed_places() {
         let home = TempDir::new("allowed");
         let std_src = home.file(
@@ -234,11 +247,77 @@ mod tests {
         assert!(read_from(&roots, &[], &[], None, "https://example.com/a.rs").is_err());
     }
 
+    // refuses_everything_else の Windows 版（段階 4 T3）。リンクはフォルダへのジャンクション（ファイルへのリンクは管理者でないと作れない）。
+    // ジャンクションの変数は TempDir のあとに作り、先に片付ける（TempDir の remove_dir_all より前に消す）
+    #[cfg(windows)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章"
-    )]
+    fn refuses_everything_else_on_windows() {
+        let home = TempDir::new("refused-win");
+        let outside = TempDir::new("refused-win-outside");
+        home.file(".rustup/toolchains/t/lib/ok.rs", b"// ok");
+        home.file(".cargo/registry/src/i/c/src/lib.rs", b"");
+        fs::create_dir_all(home.0.join(".rustup/toolchains/t/bin")).unwrap();
+        let secret = home.file("secret.rs", b"// secret");
+        let other = home.file(".cargo/config.toml", b"");
+        let cargo_bin = home.file(".cargo/bin/tool.rs", b"");
+        let not_rs = home.file(".rustup/toolchains/t/lib/Cargo.toml", b"");
+        outside.file("far.rs", b"// far");
+        let _junction = crate::win::TestJunction::new(
+            &home.0.join(".rustup/toolchains/t/lib/link"),
+            &outside.0,
+        );
+        // 許可の外
+        for path in [&secret, &other, &cargo_bin] {
+            let error = read(&home, path).unwrap_err();
+            assert!(error.contains("作業領域の外"), "{error}");
+        }
+        // .rs 以外、フォルダ、ないファイル
+        assert!(read(&home, &not_rs).unwrap_err().contains(".rs"));
+        assert!(read(&home, &home.0.join(".rustup/toolchains/t/lib")).is_err());
+        assert!(read(&home, &home.0.join(".rustup/toolchains/t/lib/none.rs")).is_err());
+        // 許可した場所の中のジャンクションが、外を指す
+        assert!(
+            read(&home, &home.0.join(".rustup/toolchains/t/lib/link/far.rs"))
+                .unwrap_err()
+                .contains("作業領域の外")
+        );
+        let roots = allowed_roots(Some(&home.0), None, None);
+        let base = file_uri(&home.0);
+        let read_uri = |uri: &str| read_from(&roots, &[], &[], Some(&home.0), uri);
+        // .. で外に出る
+        assert!(read_uri(&format!("{base}/.rustup/toolchains/t/../../secret.rs")).is_err());
+        // .. を含んでも、許可した場所の中なら読める（MinGW の標準ヘッダーの bin/../lib の形の見立て）
+        assert_eq!(
+            read_uri(&format!("{base}/.rustup/toolchains/t/bin/../lib/ok.rs"))
+                .unwrap()
+                .content,
+            "// ok"
+        );
+        // ドライブ名が小文字・: が %3A の URI でも読める
+        let ok = file_uri(&home.0.join(".rustup/toolchains/t/lib/ok.rs"));
+        let at = "file:///C".len();
+        let lower = format!("{}{}", ok[..at].to_ascii_lowercase(), &ok[at..]);
+        let percent = format!("{}%3A{}", &ok[..at], &ok[at + 1..]);
+        for (n, uri) in [lower, percent].iter().enumerate() {
+            assert_eq!(read_uri(uri).unwrap().content, "// ok", "{n}");
+        }
+        // \\?\ を入れた URI、予約名、2 つ目より後ろの部分の :、%5C で作る ..、file: でない
+        for (n, uri) in [
+            format!("file:////?/{}", &ok["file:///".len()..]),
+            format!("{base}/.rustup/toolchains/t/lib/NUL"),
+            format!("{ok}:x"),
+            format!("{base}/.rustup/toolchains/t/lib/..%5C..%5C..%5C..%5Csecret.rs"),
+            "untitled:a.rs".to_string(),
+            "https://example.com/a.rs".to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(read_uri(uri).is_err(), "{n} 番目を読んだ");
+        }
+    }
+
+    #[test]
     fn checks_the_size_and_the_encoding() {
         let home = TempDir::new("limits");
         let big = home.file(
@@ -259,10 +338,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 4（file: の URI と、canonicalize が付ける接頭辞）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn honors_rustup_home_and_cargo_home() {
         let dir = TempDir::new("env");
         let custom_rustup = dir.file("rustup/toolchains/t/a.rs", b"// a");
@@ -277,7 +352,14 @@ mod tests {
         let found = read_from(&roots, &[], &[], None, &file_uri(&custom_rustup)).unwrap();
         assert_eq!(found.content, "// a");
         // ホームが分からなければ、絶対パスで示す
-        assert_eq!(found.location, custom_rustup.to_string_lossy());
+        #[cfg(not(windows))]
+        let shown = custom_rustup.to_string_lossy().into_owned();
+        // Windows では canonicalize が付ける `\\?\` を表示に出さない（段階 4 T3）
+        #[cfg(windows)]
+        let shown = crate::trust::without_verbatim(&custom_rustup)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(found.location, shown);
         assert!(read_from(&roots, &[], &[], None, &file_uri(&custom_cargo)).is_ok());
         // ない場所は載せない
         assert!(allowed_roots(None, None, None).is_empty());
@@ -321,6 +403,92 @@ mod tests {
                 .language,
             Language::Rust
         );
+    }
+
+    // reads_cpp_headers_without_extensions の Windows 版（段階 4 T3）。リンクはフォルダへのジャンクション。
+    // MinGW の g++ の標準ヘッダーの場所は bin/../lib/gcc/… の形なので、.. を含む URI でも読めることを確かめる
+    #[cfg(windows)]
+    #[test]
+    fn reads_cpp_headers_without_extensions_on_windows() {
+        let dir = TempDir::new("cpp-win");
+        let outside = TempDir::new("cpp-win-outside");
+        let vector = dir.file("gcc/include/c++/15/vector", b"// vector");
+        let tcc = dir.file("gcc/include/c++/15/bits/vector.tcc", b"// tcc");
+        let dsu = dir.file("acl/atcoder/dsu.hpp", b"// dsu");
+        fs::create_dir_all(dir.0.join("gcc/bin")).unwrap();
+        let secret = dir.file("secret", b"// secret");
+        let rust = dir.file("rustup/toolchains/t/Cargo.toml", b"");
+        outside.file("far.hpp", b"// far");
+        let _junction = crate::win::TestJunction::new(&dir.0.join("acl/atcoder/link"), &outside.0);
+        let roots = allowed_roots(None, Some(&dir.0.join("rustup")), None);
+        let cpp_roots = vec![
+            dir.0.join("gcc/include/c++/15").canonicalize().unwrap(),
+            dir.0.join("acl").canonicalize().unwrap(),
+        ];
+        let read_uri = |uri: &str| read_from(&roots, &cpp_roots, &[], None, uri);
+        for (path, content) in [(&vector, "// vector"), (&tcc, "// tcc"), (&dsu, "// dsu")] {
+            let found = read_uri(&file_uri(path)).unwrap();
+            assert_eq!(found.content, content);
+            assert_eq!(found.language, Language::Cpp);
+        }
+        let base = file_uri(&dir.0);
+        assert_eq!(
+            read_uri(&format!("{base}/gcc/bin/../include/c++/15/vector"))
+                .unwrap()
+                .content,
+            "// vector"
+        );
+        // C++ の場所の外、ジャンクションで外を指すもの、.. で外に出るもの
+        assert!(
+            read_uri(&file_uri(&secret))
+                .unwrap_err()
+                .contains("作業領域の外")
+        );
+        assert!(read_uri(&file_uri(&dir.0.join("acl/atcoder/link/far.hpp"))).is_err());
+        assert!(read_uri(&format!("{base}/acl/../secret")).is_err());
+        // Rust の場所は今までどおり .rs だけ
+        assert!(read_uri(&file_uri(&rust)).unwrap_err().contains(".rs"));
+    }
+
+    // reads_python_sources の Windows 版（段階 4 T3）。拡張モジュールは .pyd、リンクはフォルダへのジャンクション
+    #[cfg(windows)]
+    #[test]
+    fn reads_python_sources_on_windows() {
+        let dir = TempDir::new("python-win");
+        let outside = TempDir::new("python-win-outside");
+        let stub = dir.file(
+            "typeshed/stdlib/collections/__init__.pyi",
+            b"class deque: ...",
+        );
+        let module = dir.file("Lib/heapq.py", b"def heappush(): ...");
+        let binary = dir.file("DLLs/_heapq.pyd", b"");
+        let secret = dir.file("secret.py", b"");
+        outside.file("far.pyi", b"");
+        let _junction =
+            crate::win::TestJunction::new(&dir.0.join("typeshed/stdlib/link"), &outside.0);
+        let python_roots = vec![
+            dir.0.join("typeshed").canonicalize().unwrap(),
+            dir.0.join("Lib").canonicalize().unwrap(),
+            dir.0.join("DLLs").canonicalize().unwrap(),
+        ];
+        let read_uri = |uri: &str| read_from(&[], &[], &python_roots, None, uri);
+        for path in [&stub, &module] {
+            assert_eq!(
+                read_uri(&file_uri(path)).unwrap().language,
+                Language::Python
+            );
+        }
+        assert!(
+            read_uri(&file_uri(&binary))
+                .unwrap_err()
+                .contains(".py・.pyi")
+        );
+        assert!(
+            read_uri(&file_uri(&secret))
+                .unwrap_err()
+                .contains("作業領域の外")
+        );
+        assert!(read_uri(&file_uri(&dir.0.join("typeshed/stdlib/link/far.pyi"))).is_err());
     }
 
     // Python の場所の .py・.pyi（D-225）

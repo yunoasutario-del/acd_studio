@@ -1002,6 +1002,9 @@ pub async fn lsp_start(
 ) -> Result<Option<Started>, String> {
     // 言語サーバーは開いただけでコードを動かすことがあるので、信頼していない作業領域では拒否する（D-128）
     let root = workspace.trusted_root()?;
+    // Windows（移植の段階 4 T2）：ネットワークの場所（UNC）など、ドライブ名のない作業領域では使えないと知らせる
+    #[cfg(windows)]
+    lsp::refuse_network_root(&root)?;
     let file = resolve(&root, &path).map_err(|error| error.to_string())?;
     let extension = file
         .extension()
@@ -1010,6 +1013,11 @@ pub async fn lsp_start(
         .to_string();
     let cpp = cpp_settings_of(&app);
     let python = lang_settings_of(&app).python;
+    // Windows（移植の段階 4 T6・T7）：settings.json の cpp.clangd・python.basedpyright（空なら探す）
+    #[cfg(windows)]
+    let lsp_paths = app_dir(&app)
+        .map(|dir| storage::lsp_paths(&dir))
+        .unwrap_or_default();
     // 止めるときに正式な終了を待ち、g++ に標準ヘッダーの場所を聞くので、メインスレッドの外で動かす
     tauri::async_runtime::spawn_blocking(move || {
         let launch = if extension == "rs" {
@@ -1026,7 +1034,11 @@ pub async fn lsp_start(
             let (dir, projects) = lsp::clangd_place(&root, package);
             let compiler = cpp::find_compiler(&cpp)?;
             let options = cpp::compilation_database(&compiler, &projects, &cpp);
-            lsp::clangd(dir, projects, &compiler, options)?
+            #[cfg(not(windows))]
+            let launch = lsp::clangd(dir, projects, &compiler, options)?;
+            #[cfg(windows)]
+            let launch = lsp::clangd(dir, projects, &compiler, options, &lsp_paths.clangd)?;
+            launch
         } else if extension == "py" {
             // Python のパッケージ（main.py）で basedpyright を動かす（Phase 20 作業 5。D-225）。
             // 処理系が見つからなくても動かす（標準ライブラリは basedpyright の typeshed で分かる）
@@ -1035,7 +1047,17 @@ pub async fn lsp_start(
             };
             let (dir, projects) = lsp::basedpyright_place(&root, package);
             let interpreter = crate::python::find_interpreter(&python).ok();
-            lsp::basedpyright(dir, projects, interpreter.as_deref())?
+            #[cfg(not(windows))]
+            let launch = lsp::basedpyright(dir, projects, interpreter.as_deref())?;
+            // Windows（移植の段階 4 T7）：settings.json の python.basedpyright（空なら探す）
+            #[cfg(windows)]
+            let launch = lsp::basedpyright(
+                dir,
+                projects,
+                interpreter.as_deref(),
+                &lsp_paths.basedpyright,
+            )?;
+            launch
         } else {
             return Ok(None);
         };
@@ -1082,12 +1104,21 @@ pub fn locate_source(
 pub async fn read_source(uri: String, app: AppHandle) -> Result<ReadOnlySource, String> {
     let cpp = cpp_settings_of(&app);
     let python = lang_settings_of(&app).python;
+    // Windows（移植の段階 4 T7）：settings.json の python.basedpyright（空なら探す）
+    #[cfg(windows)]
+    let lsp_paths = app_dir(&app)
+        .map(|dir| storage::lsp_paths(&dir))
+        .unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         let cpp_roots = cpp::find_compiler(&cpp)
             .map(|compiler| cpp::header_dirs(&compiler, cpp.ac_library.as_deref()))
             .unwrap_or_default();
         // Python：basedpyright の typeshed と、設定の処理系の標準ライブラリ・site-packages（D-225）
-        let mut python_roots: Vec<PathBuf> = lsp::basedpyright_typeshed().into_iter().collect();
+        #[cfg(not(windows))]
+        let typeshed = lsp::basedpyright_typeshed();
+        #[cfg(windows)]
+        let typeshed = lsp::basedpyright_typeshed(&lsp_paths.basedpyright);
+        let mut python_roots: Vec<PathBuf> = typeshed.into_iter().collect();
         if let Ok(interpreter) = crate::python::find_interpreter(&python) {
             python_roots.extend(crate::python::library_dirs(&interpreter));
         }

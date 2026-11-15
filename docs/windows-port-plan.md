@@ -409,9 +409,11 @@ OS の違いによる差（ジャッジは Linux の x86_64）
 
 | 対象 | 候補と入手方法 | 確認状況 |
 | --- | --- | --- |
-| clangd | (1) LLVM の公式インストーラー（winget の `LLVM.LLVM`。`C:\Program Files\LLVM\bin\clangd.exe`）(2) clangd の GitHub の配布の zip (3) MSYS2 の `mingw-w64-ucrt-x86_64-clang-tools-extra`。MinGW の g++ を `--query-driver` に渡して使う（4.2） | 未確認 |
-| basedpyright | (1) `pip install basedpyright`（Node.js を同梱した wheel で、Scripts に `basedpyright-langserver.exe` ができる。推測）(2) `npm install -g basedpyright`（`.cmd` になる。4.8 の制約）。(1) を勧める | 未確認 |
-| rust-analyzer | 5.3 | 未確認 |
+| clangd | (1) LLVM の公式インストーラー（winget の `LLVM.LLVM`。`C:\Program Files\LLVM\bin\clangd.exe`）(2) clangd の GitHub の配布の zip (3) MSYS2 の `mingw-w64-ucrt-x86_64-clang-tools-extra`。MinGW の g++ を `--query-driver` に渡して使う（4.2）。**段階 4 では (2) を `%LOCALAPPDATA%\Programs` の下に展開する（9.1 の追加 38）** | 未確認 |
+| basedpyright | (1) `pip install basedpyright`（Node.js を同梱した wheel で、Scripts に `basedpyright-langserver.exe` ができる。推測）(2) `npm install -g basedpyright`（`.cmd` になる。4.8 の制約）。(1) を勧める。**段階 4 では (1) を、CPython の本体ではなく専用の venv に、版を固定して入れる（9.1 の追加 38）** | 未確認 |
+| rust-analyzer | 5.3。**段階 4 では rust-src と一緒に stable に入れる（9.1 の追加 38）** | 未確認 |
+
+2026-11-13 の時点で、このマシンには 3 つとも入っていない（rust-analyzer は rustup の代理だけ。「段階 4」の節）。
 
 ---
 
@@ -1498,17 +1500,319 @@ examples/test_child.rs の stdio-kinds（T3）は cfg(windows) の中。submit.r
   - macOS の画面と、Keychain を他のプログラムが読めるかどうか（手元に Mac がない）
 - インストーラー（nsis）で入れた exe での動き（段階 3 も、画面の確かめは target\release の exe で行った）
 
+### 段階 3 の push と merge（2026-11-13。段階 4 の T1 で書いた）
+
+最後の push
+- 19ab805..f66af5f の 5 コミット（1f08095・a1b5d9c・35aac85・e67e9f5・f66af5f）。--force なし。利用者の許可を得てから
+- push の前の確かめ（f66af5f、AC 電源、2026-11-13）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、
+  cargo test 370 通過・0 失敗・10 無視（lib 41.81 秒）、npm test 11 件・0 失敗、npm run build 通過。
+  時間を測るテストは、このときは落ちなかった。T5c のあとの全部の cargo test では、これで 15 回中 3 回落ちたことになる（原因は未確認のまま）
+- push の前の秘密の値の調べ：形での調べで 0 件でなかったものが 7 件あった。種類と数は、テストの偽の値（`REVEL_SESSION=` の形）1、
+  password の語（スクリプトの名前・WebView2 の設定の名前・探した言葉）5、40 文字以上の英数字（ハッシュ）1。どれも利用者の側でも行を読み、
+  秘密の値でないことを確かめた（合った行そのものは、ここには書かない）。パスワードと AtCoder のユーザー名との照合（利用者が自分の窓で動かした）は、
+  足した行・コミットのメッセージとも 0 件
+
+CI（どちらも macos-latest・windows-latest とも success。数字は利用者がログインしたブラウザで見た。run の id〔長い番号〕は控えていない）
+
+| run | コミット | macOS の lib | Windows の lib |
+| --- | --- | --- | --- |
+| #31 | f66af5f（段階 3 の最後） | 306 通過・0 失敗・0 無視・1 filtered out（38.05 秒） | 370 通過・0 失敗・9 無視・1 filtered out（63.36 秒） |
+| #33 | 92adb32（merge のあとの main） | 306 通過・0 失敗・0 無視・1 filtered out（50.55 秒） | 370 通過・0 失敗・9 無視・1 filtered out（66.43 秒） |
+
+- 「段階 3 の結果」の「1f08095 からあとの push の CI の結果は、次の段階の最初の文書のコミットで残す」は、この表で残した
+- CI の Windows の lib のテストは 63〜67 秒で、9.1 の追加 36 の「100 秒を超えたら考え直す」には届いていない
+
+PR と merge
+- PR 5：base は利用者のリポジトリの main、compare は windows-port-stage3。元の開発者のリポジトリには出していない。PR の画面の CI も緑だった（テストの数字は見ていない）
+- merge：92adb32（2026-11-13 21:12:44 +09:00）。「Merge pull request」の形（Squash・Rebase ではない）。親は 3a32b0e と f66af5f。
+  windows-port-stage3 のブランチは消していない。手元の main は `git merge --ff-only` で合わせ、origin/main と同じ 92adb32 になった
+
+手元の 10 無視と CI の 9 無視の差
+- 手元の無視の 10 件は、debug の 6 件（段階 6）と、段階 4 で直す 4 件（sources の 3 件、lsp::overrides_initialize_and_answers_configuration）
+- CI は ci.yml の 82 行目の `--skip debug::tests::debugs_with_real_lldb_dap` で 1 件を外す。そのテストは Windows では ignore（debug.rs の 2169〜2173 行目）なので、
+  手元では無視に数え、CI では filtered out に数える。そのため CI の無視は 9 件になる（コードから。CI のログで、外された 1 件の名前そのものは見ていない）
+
 ### 段階 4：LSP（補完・診断）
 
 何を変えるか
 - file_uri・path_of_uri（`file:///C:/…`、ドライブ名の大文字・小文字と `%3A`）、src/editor/lsp.ts の documentUri
 - clangd・basedpyright・rust-analyzer の探索、clangd の `--query-driver` と MinGW
-- `\\?\` の正規化（dunce）、sources.rs の読み取り専用で開いてよい場所（HOME・RUSTUP_HOME・CARGO_HOME）
+- `\\?\` の正規化、sources.rs の読み取り専用で開いてよい場所（HOME・RUSTUP_HOME・CARGO_HOME）。
+  `\\?\` を外すのは dunce を足さず、trust.rs の `without_verbatim`（段階 3 T2 で pub(crate) にしたもの）を使う（9.1 の追加 37。8 章の「段階 4 で決める」の答え）
 
 どう確認するか
 - 3 言語それぞれで、補完・診断・定義へのジャンプ（標準ライブラリの中へも）・参照の検索・整形・ホバー
 - 作業領域の外のファイルの URI が断られる（lsp.rs のテストを Windows のパスで）
 - 言語サーバーの再起動・IDE を終えたときに、言語サーバーのプロセスが残らない
+
+段階 4 の下調べ（2026-11-13。コードを読んだだけで、ビルド・テスト・言語サーバーの起動はしていない。行番号は 92adb32 のもの）
+
+いまの Windows では、言語サーバーは起動しても、ファイルについての要求（textDocument/…）は Rust の側ですべて断られている見込み（下の 1〜3。推測）。
+段階 1 の画面の確かめでは、rust-analyzer の component がなく起動の時点で失敗していた（「段階 1 の結果」）ので、この先は誰も見ていない
+
+| # | 場所 | 中身 | 確認状況 |
+| --- | --- | --- | --- |
+| 1 | lsp.rs:151-162 `file_uri` | canonicalize した `\\?\C:\…` をそのまま符号にするので、`file://%5C%5C%3F%5CC%3A%5C…` になる（正しい形は `file:///C:/…`） | 推測（コードから） |
+| 2 | lsp.rs:268-287 `path_of_uri` | `file://` の後ろが `/` で始まるものだけを受け付ける。1 の形は None。`file:///C:/x` を渡しても `\C:\x` のパスになり、canonicalize が失敗する見込み | 推測 |
+| 3 | lsp.rs:291-309 `check_uri` | まだないファイル（didClose）の確かめで RootDir と Normal だけを許し（Prefix の `C:` を許さない）、`\\?\` の付いた root と starts_with で比べる | 推測 |
+| 4 | lsp.rs:208-221・166-172・973-990 | initialize の rootUri・rootPath、rust-analyzer の linkedProjects、画面に返す rootUri に `\\?\` の付いたパスが渡る | 推測 |
+| 5 | cpp.rs:352-400 `compilation_database` | clangd に渡す命令の鍵（ファイルのパス）・workingDirectory・`-c` のファイルが `\\?\` の形。clangd が didOpen の URI から作るパスと一致せず、IDE の命令が使われない見込み（使われないと bits/stdc++.h が見つからない。推測） | 推測 |
+| 6 | lsp.rs:693-708 `find_clangd` | `/usr/bin/xcrun --find clangd` だけ。案内文は xcode-select | 確認済み（コード） |
+| 7 | lsp.rs:711-726 `query_driver` | `\` の前に `\` を足すので `C:\\Program Files (x86)\\…` になる。clangd が Windows でこの形を読めるかは不明 | 未確認（T6 で本物の clangd で `\\` と `/` の両方を試す） |
+| 8 | lsp.rs:762-774 `find_basedpyright` | `.exe` の付かない名前を `/opt/homebrew/bin`・PATH・`/usr/local/bin` で探す。案内文は brew | 確認済み（コード） |
+| 9 | lsp.rs:814-821 `basedpyright_typeshed` | npm 版の並び（langserver.index.js の隣の `dist/typeshed-fallback`）が前提。pip 版の並びは調べていない | 未確認（T7 で入れてから並びを見る） |
+| 10 | sources.rs:78-80 | path_of_uri を使うので、2 と同じ理由で標準ライブラリ・ヘッダー・typeshed を読み取り専用で開けない見込み。テスト 3 件は Windows で ignore（182・240・264 行目） | ignore：確認済み／動き：推測 |
+| 11 | sources.rs:58-67 `display_location` | Windows では `~/` の後ろが `\` 区切りになる（trust.rs:118-129 の display_above と同じ形で直せる） | 推測 |
+| 12 | src/editor/workspace.ts:47-53 `canonical` | URI の比べ方は `%3A` と `:` の違いを吸収するが、ドライブ名の大文字・小文字は吸収しない。publishDiagnostics は `getFile` で照合する（@codemirror/lsp-client 6.3.0 の dist/index.js:1821）ので、サーバーがドライブ名を小文字で返すと診断が出ない | 照合の仕組み：確認済み／サーバーの返す形：未確認（rust-analyzer は小文字、basedpyright は `file:///c%3A/…` の形で返す見込み。どちらも推測） |
+| 13 | src/editor/lsp.ts:312-315 `documentUri` | Rust が返す rootUri に相対パスを足すだけなので、1 を直すと画面が送る URI も変わる。lsp.ts を変えなくてよいかは T2 で確かめて報告する | 未確認 |
+| 14 | lsp.rs:1991 | analyzes_cpp_with_local_clangd が `/include/c++/` で確かめているので、Windows の `\` 区切りでは落ちる見込み | 推測 |
+| 15 | debug.rs:46 | debug.rs も file_uri を使う。1 を直すとデバッグにも効く（デバッグは段階 6 で、Windows では動かしていない） | 確認済み（use の行） |
+
+lsp.rs のテストで Windows で動いていないもの（92adb32）
+- Windows で ignore：overrides_initialize_and_answers_configuration の 1 件
+- `#[cfg(unix)]` の `#[test]`：13 件。内わけは、作業領域の外を断るテストが 3 件（checks_messages_against_the_allow_list・locates_files_inside_the_workspace は
+  偽のサーバーを使わない。send_rejects_messages_outside_the_allow_list は偽のサーバー〔perl〕を使う）と、偽のサーバーの動きを確かめるテストが 10 件
+  （下調べの報告では「偽のサーバーのテスト 11 件」と書いたが、send_rejects… を数え違えていた。利用者の指摘で直した）
+- Windows で確かめているのは、止めたあとに Job の記録が残らないこと（forgets_the_job_record_after_stopping_on_windows）だけ
+
+このマシンの言語サーバー（2026-11-13。読むだけで確かめた）
+
+| サーバー | 状況 |
+| --- | --- |
+| rust-analyzer | `%USERPROFILE%\.cargo\bin\rust-analyzer.exe`（rustup の代理）だけ。stable と 1.99.0 のどちらにも rust-analyzer・rust-src の component がない。rustup の既定は stable-x86_64-pc-windows-msvc。scaffold は rust-toolchain.toml を作らないので、作業領域では stable が使われる |
+| clangd | PATH にも、`%ProgramFiles%\LLVM\bin`・`%ProgramFiles(x86)%\LLVM\bin`・`C:\msys64\ucrt64\bin`・MinGW の bin にもない |
+| basedpyright | PATH にない。CPython 3.13 の pip の一覧にも、npm の global にもない |
+
+入れ方（9.1 の追加 38。1 つずつ、入れる直前に版・コマンドの全文・入れる場所・変わる場所を見せて、利用者の返事を待つ。順は rust-analyzer → basedpyright → clangd）
+- rust-analyzer：`rustup component add rust-analyzer rust-src --toolchain stable-x86_64-pc-windows-msvc`。その時点の `rustup default` の出力（既定が stable であること）も見せる。rust-src は標準ライブラリの補完と定義へのジャンプに要る
+- basedpyright：CPython 3.13.7（`%LOCALAPPDATA%\Programs\Python\Python313\python.exe`）で専用の venv（`%LOCALAPPDATA%\Programs\basedpyright-venv` の案）を作り、
+  版を固定して pip で入れる。CPython の本体（ジャッジに合わせる処理系で、提出の前の import の検査と読み取り専用の場所にも使う）に何も入らないことを、
+  入れる前と後の pip list（findstr で絞る）で示す。npm 版（`.cmd`。4.8 の制約）は使わない
+- clangd：GitHub の clangd/clangd の releases の Windows の zip を、`%LOCALAPPDATA%\Programs\` の下に展開する（管理者の権限は要らず、PATH も変えない見込み）。
+  落とした zip の SHA-256（Get-FileHash）を報告に出し、利用者が GitHub のリリースのページと比べる。展開の前に zip の中の並びを確かめる。
+  zip の中のものは、`clangd.exe --version` のほかは IDE とテストを通してしか動かさない
+- どれも PATH には入れないので、IDE は settings.json の cpp.clangd・python.basedpyright（9.1 の追加 39）か、決まった場所の探索で見つける
+
+段階 4 は、次のまとまりごとに 1 つずつコミットする（2026-11-13 に決めた順。ブランチは最新の main〔92adb32〕から作った windows-port-stage4）。
+進め方は段階 3 と同じ：macOS / Unix の経路は cfg を付ける・場所を移す以外は変えず、変えたときはコミットの報告とメッセージに明記する。手元に Mac がないので、確かめは CI で行う。
+各コミットの前に報告して返事を待つ。コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。テストの時間の余裕は広げない。
+不具合を直すときは、先にテストを書いて失敗を確かめ、直す前の失敗をメッセージに書く。新しい処理は、一時的に外してテストが落ちることも確かめ、戻したこと（ハッシュ）を見せる。
+控えのファイルを Copy-Item で戻したときは、更新時刻を今の時刻にしてからビルドする。
+言語サーバーを入れる・PATH や設定を変えるなど、リポジトリの外を変えるときは、変える前に必ず聞く
+
+| 順 | まとまり | 何を変えるか | どう確認するか |
+| --- | --- | --- | --- |
+| T1 | 文書 | 段階 3 の push・CI・merge、段階 4 の下調べ、この表、9.1 の追加 37〜41 | — |
+| T2 | URI | Windows だけ、file_uri を `file:///C:/…`（`\\?\` を外す、ドライブ名は大文字、`:` は符号にしない）にし、path_of_uri は `file:///C:/…`・`file:///c%3A/…` を受け付け、check_uri のまだないファイルの確かめを直す。UNC は「使えません」と知らせる（9.1 の追加 41）。**Unix は cfg を付けるだけ** | 先に、断るか中と見なすかの表を報告してから、Windows のテストで失敗を確かめる。入れるもの：日本語・空白・`%3A`・小文字のドライブ名・外のファイル・`..`、`%5C` で作る `..`、2 つ目より後ろの部分の `:`（`a.rs:x` の形）、`file:////?/C:/…`・`%5C%5C%3F%5C…` のように `\\?\` を URI に入れたもの、ドライブ名だけが小文字のまだないファイル（didClose）、NUL などの予約名、UNC。迷うものは断る側に倒す。checks_messages_against_the_allow_list・locates_files_inside_the_workspace の Windows 版（リンクはジャンクション）。overrides_initialize_and_answers_configuration は cfg(unix) にして Windows 版を足す。画面の documentUri（lsp.ts:312-315）を変えなくてよいかを報告する |
+| T3 | 読み取り専用で開く場所 | sources.rs の ignore 3 件を外す。表示を `/` 区切りにする（Windows だけ）。cfg(unix) の 3 件（refuses_everything_else・reads_cpp_headers_without_extensions・reads_python_sources）の Windows 版を足す | 先に ignore を外して失敗を確かめる |
+| T4 | サーバーに渡すパス | rootUri・rootPath・linkedProjects、clangd の命令の鍵・workingDirectory・`-c` から `\\?\` を外す | 先にテストで失敗を確かめる。外して落ちることも確かめる |
+| push 1 | T4 までを push | 利用者の許可を得てから。push の前に、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる | CI の macOS で Unix が壊れていないか |
+| T5 | rust-analyzer | Windows の案内文（component がないとき）。本物の rust-analyzer を使うテスト（Windows だけ、なければ飛ぶ）を足すか | rust-analyzer を入れたあと（入れる前に聞く）。本物が publishDiagnostics と definition で返した URI の、ドライブ名と `:` の部分だけを報告する |
+| T6 | clangd | 前に、変えるファイルと Unix への影響を報告して待つ。Windows の探し方（settings.json の cpp.clangd → PATH の clangd.exe → 決まった場所）、`--query-driver` の Windows の形、案内文、analyzes_cpp_with_local_clangd の確かめを区切りに依らない形に。settings.json の 2 つの項目（9.1 の追加 39） | 先にテストで失敗を確かめる（探す順・引数・設定の読み書き）。本物は clangd を入れたあと。URI の報告は T5 と同じ |
+| T7 | basedpyright | Windows の探し方（settings.json の python.basedpyright → PATH の `.exe` → 決まった場所）、pip 版の typeshed の場所、案内文 | 同上 |
+| T8 | 画面の URI の照合 | T5〜T7 で分かった形に合わせて、workspace.ts の照合（ドライブ名の大文字・小文字、`%3A`）を Windows だけ直す（pythonNote.ts と同じ形で npm test を足す）。要る見込み | 本物のサーバーの答えの形で確かめてから直す |
+| T9 | 止めたあとに残らない（テスト） | examples/test_child.rs に偽の言語サーバーの手順を足し、Windows 版のテストを 5 件作る（9.1 の追加 40）。中継・順番・正式な終了・shutdown に答えないときに子孫ごと止める・自分で終わる、の 5 つの項目は、Unix のテストでは 4 件（relays_messages_and_stops_gracefully〔中継と正式な終了〕・keeps_the_order_of_messages・kills_server_that_ignores_shutdown・reports_server_that_exits_by_itself）。これに send_rejects_messages_outside_the_allow_list を足して 5 件。cfg(unix) のまま残るのは 6 件（stop_during_restart_leaves_nothing・restarts_for_another_session・restarts_when_the_packages_change・stops_reading_broken_output・restarts_for_another_package・restarts_for_another_language） | 新しい処理は外して落ちることを確かめる |
+| push 2 | T9 までを push | push 1 と同じ | 同上 |
+| T10 | 画面の確かめ | release の exe で 3 言語。手順の文はコードと照らしてから出す | 利用者が操作する |
+| T11 | まとめ | 段階 4 の結果、Unix を変えた所の表、移していないテスト、残る未確認 | push の前に、秘密の値の調べ、送り先、--force なし、送るコミットの数を見せる |
+| push 3 | T11 までを push | push 1 と同じ | 同上 |
+
+画面の確かめ（T10）の前提（手順の文を書くときに、もう一度コードと照らす）
+- 言語サーバーの状態（例：「rust-analyzer：準備完了」）は、下のパネルの見出しの行の「対象：…」のすぐ左に出る（BottomPanel.tsx:295-298、文字は App.tsx:257-259・518-525）
+- 実行ログの行は「[clangd] 起動しました：<パッケージ>」の形（lsp.ts:90-91・353-354）
+- 「提出」「提出する」のボタンは押さない。提出の確認のダイアログが出ても Enter を押さない
+- 補完を Ctrl+Space で出すと、日本語の IME の切り替えと重なるかもしれない（推測）。打って出る補完で見る
+
+macOS / Unix の経路を変えそうな所（変えたときは、コミットの報告とメッセージに書く）
+- settings.json の cpp.clangd・python.basedpyright：使うのは Windows だけ。型を両方の OS で共有するなら、macOS では読んでも使わないこと、
+  設定の画面で保存したときにこの 2 つが消えないこと（write_settings が残すか）をテストで確かめる
+- `\\?\` を外す関数を、Unix では何もしない形で通すと、Unix の側の文字が変わる（段階 1 の display_inside と同じ形）
+- テストのコード：overrides_initialize… の属性、analyzes_cpp_with_local_clangd の確かめ方、test_child.rs の偽のサーバー（Unix でもコンパイルされる）
+- 画面の workspace.ts（T8）：両方の OS で同じコードなので、logLinks.ts:23 の IS_WINDOWS で分ける
+- CI：ci.yml は変える予定がない。ただし windows-latest に LLVM と MinGW が入っていれば、T6 のあとに本物の clangd のテストが CI でも動き出すかもしれない（推測。runner の中身は見ていない）
+
+### 段階 4 の結果（2026-11-15）
+
+ブランチ windows-port-stage4（main の 92adb32 から）。main からのコミットは、36fa3b2 までで 10 個と、このまとめの 1 個。
+origin/windows-port-stage4 には 36fa3b2 まで push してある（push 1・push 2。どちらも利用者の許可を得てから。--force なし）。
+このまとめは、まだ push していない（push 3 は、秘密の値の調べと利用者の許可のあと）。
+一つひとつの直し方・直す前の失敗・外して落ちる確かめ・測った値は、各コミットのメッセージにある。ci.yml は段階 4 で変えていない
+
+コミット（並びはコミットの順）
+
+| 順 | コミット | 入れたもの |
+| --- | --- | --- |
+| T1 | e321357 | この文書（段階 4 の計画と下調べ、段階 3 の push・merge の記録、9.1 の追加 37〜41） |
+| T2 | e3ecaff | Windows の file: の URI（file_uri・path_of_uri・check_uri のまだないファイル）。UNC の作業領域では言語サーバーを使えないと知らせる |
+| T3 | 5d85611 | 読み取り専用で開く場所の表示（sources.rs の display_location）。ignore の 3 件を外し、Windows 版のテストを 3 件足した。テストのジャンクションを win.rs に移した |
+| T4 | 32f3bb4 | 言語サーバーに渡すパス（rootPath・linkedProjects・clangd の命令）から `\\?\` を外す |
+| T5 | 7b55acd | rust-analyzer の component がないときに入れ方を知らせる。本物の rust-analyzer のテスト（#[ignore]） |
+| T5 の追加 | 70757b3 | CI では、rust-analyzer の案内のテストを飛ばさずに落とす（skip_unless_ci） |
+| T6 | 3c8ee59 | clangd を探す（settings.json の cpp.clangd → PATH → 決まった場所）。`--query-driver` を `/` の形で渡す。本物の clangd のテスト（#[ignore]） |
+| T7 | b1eb67b | basedpyright（pip 版）を探す（settings.json の python.basedpyright → PATH → 決まった場所）。pip 版の typeshed の場所。本物の basedpyright のテスト（#[ignore]） |
+| T8 | a4be26d | 画面の URI の照合で、Windows ではドライブ名の大文字・小文字を区別しない（src/editor/lspUri.ts） |
+| T9 | 36fa3b2 | 偽の言語サーバー（examples/test_child.rs の lsp-server）で、中継と止め方の Windows 版のテストを 5 件 |
+| T11 | このまとめ | 段階 4 の結果 |
+
+- T2・T3・T4 のコミットのメッセージに書いた `\?\` は、`\\?\` のこと（メッセージを命令に直接書いて渡したときに `\` が 1 つ減った。コードは正しい。T5 からは、メッセージをファイルに書いて渡している）
+
+push と CI（どちらも利用者がログインしたブラウザで見た。run の id〔長い番号〕は控えていない）
+
+| push | run | 送ったコミット | windows-latest の lib | macos-latest の lib |
+| --- | --- | --- | --- | --- |
+| push 1 | #34 | e321357・e3ecaff・5d85611・32f3bb4（T1〜T4） | success。384 通過・0 失敗・5 無視・1 filtered out（69.55 秒） | はじめは cancelled（機械が割り当てられなかった）。やり直しで success。306 通過・0 失敗・0 無視・1 filtered out（42.94 秒） |
+| push 2 | （番号は控えていない） | 7b55acd・70757b3・3c8ee59・b1eb67b・a4be26d・36fa3b2（T5〜T9） | success。397 通過・0 失敗・8 無視・1 filtered out（67.75 秒）。「CI では飛ばしません」は 0 件 | success。308 通過・0 失敗・0 無視・1 filtered out（36.19 秒） |
+
+- npm test は、push 2 では両方の OS で 15 件・0 失敗
+- Annotations：Node.js 20 の非推奨の warning（actions/checkout@v4・actions/setup-node@v4 が Node 24 で強制的に動いた。push 1（#34）から出ている）。push 2 では、macOS の runner の混雑の知らせもあった
+- orphan process：push 1 の Windows は vctip だけ（MSVC のリンカーなどが動かす、Visual Studio の利用状況の送り役。テストの言語サーバーではない。推測）。macOS はなし。push 2 は両方の OS ともなし
+- CI の Windows の lib のテストは 67〜70 秒で、9.1 の追加 36 の「100 秒を超えたら考え直す」には届いていない
+- 手元の無視は 9 件（debug の 6 件と、本物の rust-analyzer・clangd・basedpyright のテスト 3 件）。CI の Windows は、debug の 1 件を ci.yml の `--skip` で外すので（段階 3 の push と merge の節）、8 無視・1 filtered out になる
+- 最後の手元の確かめ（36fa3b2、AC 電源）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 397 通過・0 失敗・9 無視（lib 42.47 秒。1 回目は時間を測るテストの stops_a_program_over_the_memory_limit_while_running が 2.245 秒で落ち、
+  余裕は広げずに 1 回だけ動かし直して通った。9.1 の追加 36 の既知の問題）、npm test 15 件・0 失敗、npm run build 通過
+
+このマシンに入れた言語サーバー（どれも、入れる前に利用者の許可を得た。どれも PATH には入れていない）
+
+| サーバー | 版と場所 |
+| --- | --- |
+| rust-analyzer | stable（1.98.1）の component（rust-analyzer・rust-src）。rustup の代理 `%USERPROFILE%\.cargo\bin\rust-analyzer.exe` から動く。1.99.0 には入れていない（T10 の 2-1 は、この版で入れ方の案内を見た） |
+| clangd | 23.1.0。GitHub の clangd/clangd のリリースの clangd-windows-23.1.0.zip（SHA-256 は利用者がリリースのページと比べた）を `%LOCALAPPDATA%\Programs\clangd_23.1.0` に展開した |
+| basedpyright | 1.40.2（based on pyright 1.1.414）。CPython 3.13.7 で作った venv `%LOCALAPPDATA%\Programs\basedpyright-venv` に、nodejs-wheel-binaries 24.19.0 と一緒に pip で入れた。CPython の本体の pip list は、入れる前も後も pip だけ |
+
+本物のサーバーが返す URI の形（T5〜T7 の #[ignore] のテストで、publishDiagnostics と definition の答えの頭だけを見た）
+
+| サーバー | URI の頭 | 1 件のテストの時間 |
+| --- | --- | --- |
+| rust-analyzer | `file:///c:`（ドライブ名は小文字） | 44〜51 秒 |
+| clangd | `file:///C:`（ドライブ名は大文字） | 3〜4.5 秒（`--query-driver` が `/` の形のとき） |
+| basedpyright | `file:///c%3A`（ドライブ名は小文字、`:` は `%3A`） | 2.6 秒 |
+
+- 3 つとも、答えとログに `\\?\`・`%5C%5C%3F` の形は 0 回。言語サーバーを起動するときの current_dir は `\\?\` の形のまま（T4 で変えないと決めた）だが、答えには出なかった
+- 止めたあと、Job の記録と子孫（conhost.exe・rust-analyzer-proc-macro-srv.exe・node.exe・python.exe など）は残らなかった
+
+決まった場所を探す順番（**コードを読んで確かめた**。テストは場所を引数で渡すので、本番の場所の並びそのものは守っていない。画面でも確かめられない）
+- clangd：settings.json の cpp.clangd（空でなければそれだけ）→ PATH の clangd.exe（相対パスのフォルダは見ない）→
+  `%LOCALAPPDATA%\Programs\clangd_<版>\bin\clangd.exe`（版を数として比べていちばん新しいもの）→ `%ProgramFiles%\LLVM\bin` → `C:\msys64\ucrt64\bin`
+- basedpyright：settings.json の python.basedpyright（空でなければそれだけ）→ PATH の basedpyright-langserver.exe（相対パスのフォルダは見ない）→
+  `%LOCALAPPDATA%\Programs\basedpyright-venv\Scripts`
+- 本物の clangd・basedpyright のテストは、この探す処理（find_clangd・find_basedpyright）を通って見つけた
+
+画面の確かめ（T10。利用者が操作した）
+
+- exe：36fa3b2 から作った release の exe（`npm run tauri build -- --no-bundle`、AC 電源。src-tauri\target\release\atcoder-studio.exe、2026-11-15 01:43:22、10,147,840 バイト）。
+  エクスプローラーから起動した。ログインも提出もしていない。どの手順でも、黒いコンソールの窓は出なかった
+- 確かめ用のフォルダ：`%USERPROFILE%\Documents\acd-t10-lsp`（r1・r2 は Rust、c1 は C++、p1 は Python。10 個のファイル）。最後に見たとき、どのファイルも作ったときのハッシュのままだった。
+  r1 には、rust-analyzer の cargo check が Cargo.lock と target\ を作った
+- settings.json：始める前に写しを取り、手順 5 のあとに写しを戻した。戻したあとのハッシュは、始める前と同じ。値はここには書かない
+- 手順の番号は、T10 の手順の文のもの（手順の文そのものは、この文書には写していない）。1 は Rust、2 は rust-analyzer の component のない toolchain、3 は C++、
+  4 は Python、5 は settings.json の cpp.clangd・python.basedpyright、6 は言語サーバーのプロセスの数
+
+| 手順 | 結果 |
+| --- | --- |
+| 0、1-1〜1-5、1-7〜1-9 | ○ |
+| 1-6（Rust の、まだ開いていないファイルの参照へ移る） | ○。util.rs だけを開いて Shift+F12 → 一覧に main.rs の 6 行目と util.rs の 1 行目。main.rs の行を選ぶと main.rs のタブに移った |
+| 2-1 | ○。入れ方の案内（T5）が全文どおり出た |
+| 3-1〜3-6 | ○。7 行目だけに下線、bits/stdc++.h に誤りなし。3-6 は形が変わり、Ctrl+Z で戻した |
+| 4-1〜4-4、4-6、4-7 | ○ |
+| 4-5・4-5b（Python の参照の一覧） | 中断の前は ×（下の「4-5 の ×」） |
+| 5-2 | ○。cpp.clangd・python.basedpyright にないパス（`C:\nonexistent\…`）を書くと、それぞれ「[clangd] 起動できません：settings.json の cpp.clangd（…）が見つかりません。…」「[basedpyright] 起動できません：settings.json の python.basedpyright（…）が見つかりません。…」が全文どおり出た |
+| 5-3 | 本当の場所に直して起動し直すと「起動しました：c1」「起動しました：p1」（状態の表示が「準備完了」になったかは見ていない） |
+| 5 のあと（settings.json を戻した） | 決まった場所から見つかり、「[clangd] 起動しました：c1」「[basedpyright] 起動しました：p1」 |
+| 6 | 手順 5 のあとにアプリを閉じたとき：アプリ 0・言語サーバー 0。p1/main.py を開いたまま：アプリ 1・言語サーバー 3（node 1・python 2）。中断のあとの最初の数え：アプリ 0・言語サーバー 0 |
+
+- settings.json の cpp.clangd・python.basedpyright を書いたときに、そのパスが使われること（T6・T7 のメッセージの「テストが守らないこと」）は、5-2・5-3 で確かめた
+
+4-5 の ×（Python の参照の一覧）
+
+- 中断の前：main.py のタブを閉じて、helper.py の 1 行目の twice で Shift+F12 → 一覧は helper.py の 1 行目だけで、main.py の 4・9 行目が出なかった（4-5）。
+  main.py を開いたままでも同じだった（4-5b）。もう一度試しても同じだった
+- 中断のあとの調べ：
+  - basedpyright を IDE と同じ initialize（能力・rootUri・rootPath・workspaceFolders）で動かす試しのスクリプト（scratchpad の中だけ。リポジトリには入れていない）で、
+    10 の形を試した。変えたのは、URI の形（`file:///C:/` と `file:///c%3A/`）・diagnosticMode（openFilesOnly と workspace）・子の PATH・問い合わせる場所（定義の側と使っている側）・
+    開くファイル（両方と helper.py だけ）・workspace.configuration の能力・`\\?\` の付いた cwd・本物の acd-t10-lsp\p1。**10 の形とも、サーバーは 3 件**（helper.py 1・main.py 4・main.py 9）を返した。
+    本物の p1 は、試しの前と後でファイルの一覧とハッシュが同じだった
+  - 開発用のビルド（`npm run tauri dev`）の開発者ツールで、findAllReferences（lsp.ts）と、ライブラリの findReferences の各段にログポイントを置いた（コードは変えていない）。
+    helper.py だけを開いて Shift+F12 → 1 回目の答え（refs-1）に main.py の 4・9 行目があり、lspLocate は main.py を見つけ（locate found）、仮のファイルを足し（preview）、
+    2 回目の答え（refs-2）の 3 件とも requestFile がファイルを返した。一覧も 3 件。main.py を開いてから helper.py に戻ったとき（A）、main.py のタブを閉じたとき（B）も同じ。
+    赤いエラーは「Failed to load resource: 404」の 1 行だけ（何の資源かは見ていない）
+  - release の exe（同じ 36fa3b2 のもの）でも、1 回目・(A)・(B) とも一覧は 3 件。(A) では、一覧から main.py の 9 行目の twice の前に移れた
+- **今日は、debug・release とも再現しない。中断の前の原因は不明**（推測：そのときの状態や時機。たとえば、解析が終わる前に Shift+F12 を押した）
+- コードの読みで分かったこと：findAllReferences（lsp.ts:492〜526）は、lspLocate が null を返すと、Console に何も出さずにそのファイルを一覧から落とす。
+  lspLocate・readFile が例外のときは、console.warn（「参照のあるほかのファイルを読めません」）だけを出して落とす。また起きたときに見分けられるよう、残ることに入れる
+- 開発用のビルドも、release と同じ settings.json とデータのフォルダを使う（identifier が同じ）。開発用のビルドの前と後、release の確かめの前と後で、settings.json のハッシュは同じだった。
+  開発用のビルドでも、開発者ツールは F12・Ctrl+Shift+I では開かない見込み（lib.rs の disable_browser_keys が、debug でもブラウザのキーを切る。WebView2 の説明からの推測）。開発者ツールは開けた（案内したのは、エディタの中の右クリックの「検査」）。
+  ライブラリのファイルは開発者ツールの ignore list に入っていたので、利用者が外してからログポイントを置いた
+
+workspace.configuration の件（段階 4 では直さない。2026-11-15 に利用者が決めた）
+
+- @codemirror/lsp-client 6.3.0 の initialize の能力（dist/index.js:379-421）に workspace.configuration がない。lsp.ts・inlayHints.ts・lsp.rs の override_initialize も足していない。
+  そのため、IDE が workspace/configuration の答えで渡すつもりの basedpyright の設定（lsp.rs の basedpyright_configuration：pythonPath・typeCheckingMode standard・diagnosticMode openFilesOnly）は、
+  basedpyright に届いていない見込み
+- 試しのスクリプトでの結果：能力がないとき（IDE と同じ）は、workspace/configuration の問い合わせが 0 回で、basedpyright の標準エラーに「Python was not found; …」が 3 回出た。
+  能力を足すと、問い合わせが 2 回来て、「Python was not found」は 0 回になった。子の PATH の先頭に CPython を置いたときも 0 回になった
+- 画面でも、basedpyright を起動するたびに「Python was not found」が 3 回、実行ログに出る（下の ③。開発用のビルド・release とも）。
+  設定が届かないため、basedpyright が PATH の python を探し、WindowsApps の実行エイリアスに当たった見込み（推測。上の試しと合う）
+- T7 の本物のテストは、initialize に workspace.configuration を自分で入れていたので、この違いに気づけなかった
+- 直し方の見当：lsp.rs の override_initialize で、capabilities に `"workspace": {"configuration": true}` を足す。ライブラリと lsp.ts は両方の OS で同じなので、
+  macOS でも basedpyright（と、問い合わせるほかのサーバー）の動きが変わる。そのため段階 4 の外とし、①②⑥ と一緒に相談する
+
+実行ログの気になる行（T10 で見たもの。見立てはどれも推測）
+
+| # | 行 | 見立て | 扱い |
+| --- | --- | --- | --- |
+| ① | 起動の直後に前の作業領域の rust-analyzer が起動し、フォルダを開くと「起動に失敗しました。読み込みが終わる前に止まりました（終了コード -525598719）」 | 読み込みの途中で IDE が止めた（Job で止めたときの KILLED_EXIT_CODE）のに、handleExit が「起動に失敗」と書く。macOS でも起きる見込み | 段階 4 の外で相談（lsp.ts、両方の OS） |
+| ② | 言語を替えたときの「[clangd] 止まりました（終了コード 0）」など | 止まったのは前の言語のサーバー。tag() が新しい serverName を使うため（lsp.ts:81-83・257-283・328）。macOS でも起きる見込み | 段階 4 の外で相談 |
+| ③ | basedpyright の起動のたびに「Python was not found; run without arguments to install from the Microsoft Store, …」が 3 回 | WindowsApps の実行エイリアスが出した文。上の workspace.configuration の件 | 上の件と一緒に段階 4 の外で相談 |
+| ④ | clangd の起動のたびに「E[時刻] System include extraction: driver clang not found in PATH」 | 命令のないファイルなどに、既定の clang を使おうとした見込み。macOS では出ない見込み | 残ること |
+| ⑤ | rust-analyzer の起動のたびに「WARN notify error: Input watch path is neither a file nor a directory.」が 2 回 | 見張るパスがない、または `\\?\` の current_dir のため | 残ること |
+| ⑥ | 1-9 の再起動のあとの「ERROR orphan DidCloseTextDocument: %USERPROFILE%\Documents\acd-t10-lsp\r1\src\main.rs」 | restartLsp が切ったあとで拡張を外すので、didClose が新しいサーバーに届いた見込み。macOS でも起きる見込み | 段階 4 の外で相談 |
+| ⑦ | 参照の一覧の見出しで、rust-analyzer の main.rs は `c:/…`、util.rs は `C:/…`。basedpyright の main.py は `c%3A/…`、helper.py は `C:/…` | 開いているファイルは IDE の URI（大文字）、開いていないファイルはサーバーの URI の文字のまま出る。表示だけの違い（移るのは正しくできた） | 残ること |
+
+macOS / Unix の経路を変えた所（cfg・属性を付ける以外の変更。各コミットの差分のファイルの一覧と照らした。中身の説明は、コミットのメッセージから。どの行も、Unix の動きは同じ見込み。
+手元の Mac では何も確かめていない。確かめは CI の macos-latest で、push 1・push 2 とも success）
+
+| コミット | ファイル | Unix で変えた所 | Unix の動き |
+| --- | --- | --- | --- |
+| e3ecaff（T2） | lsp.rs | file_uri・path_of_uri と、check_uri のまだないファイルの腕に cfg(not(windows))（中身は同じ）。テストの reads_file_uris・overrides_initialize_and_answers_configuration を cfg(unix) にした | 同じ |
+| e3ecaff（T2） | workspace.rs | windows_name_ok（Windows だけの関数）を pub(crate) にした | 同じ |
+| 5d85611（T3） | sources.rs | display_location に cfg(not(windows))。テスト 3 件の cfg_attr(windows, ignore) を外した。honors_rustup_home_and_cargo_home の比べる相手を cfg で分けた（Unix の値は同じ） | 同じ |
+| 32f3bb4（T4） | lsp.rs・cpp.rs | `#[cfg(windows)]` の行を足しただけ。テストの makes_commands_for_clangd の比べる相手を cfg で分けた（Unix の値は同じ） | 同じ |
+| 3c8ee59（T6） | lsp.rs | find_clangd・clangd に cfg(not(windows))。OnceLock の use を分けて cfg(not(windows)) を付けた。テストの analyzes_cpp_with_local_clangd を cfg(not(windows)) にした | 同じ |
+| 3c8ee59（T6） | commands.rs | clangd を作る 1 行を、cfg(not(windows)) と cfg(windows) の let に分け、最後に launch を返す形にした | 同じ（呼ぶ関数と引数は同じ） |
+| 3c8ee59（T6） | storage.rs | cfg(windows) の型・関数・欄を足した。テスト keeps_the_language_server_paths_when_saving（両方の OS）と ignores_the_clangd_path_on_unix（Unix だけ）を足した | 同じ |
+| b1eb67b（T7） | lsp.rs | BASEDPYRIGHT_MISSING・find_basedpyright・basedpyright・basedpyright_typeshed に cfg(not(windows))。テストの analyzes_python_with_local_basedpyright を cfg(not(windows)) にした | 同じ |
+| b1eb67b（T7） | commands.rs | lsp_start の basedpyright を作る 1 行と、read_source の typeshed を求める 1 行を、cfg で分けた let にした | 同じ（呼ぶ関数と引数は同じ） |
+| b1eb67b（T7） | storage.rs | Unix だけのテストの名前を ignores_the_language_server_paths_on_unix にし、python.basedpyright も読まないことの確かめを足した | 同じ |
+| a4be26d（T8） | src/editor/workspace.ts・src/editor/lspUri.ts・tests/lspUri.test.ts | canonical の中身を lspUri.ts の canonicalUri に移し、OS を引数で渡す形にした（両方の OS で同じコード。文字は変わった）。npm test を 4 件足した（macOS の比べ方のテストを含む） | 同じ（macOS では windows が false で、decode だけ） |
+| 36fa3b2（T9） | lsp.rs | テストの補助 3 つ（start_with・start_with_projects・send_unchecked）と wait_until の cfg を cfg(test) に広げた | 同じ（Unix のテストの中身は同じ） |
+| 36fa3b2（T9） | examples/test_child.rs | 手順 lsp-server・lsp-server:ignore-shutdown を足した（Unix でもコンパイルされる。使うテストは Windows だけ） | 同じ |
+
+ほか（Unix のコードは変えていない）：e321357（T1）とこのまとめは文書だけ。7b55acd（T5）・70757b3（T5 の追加）は cfg(windows) の中だけ。win.rs は Windows だけのファイル。
+commands.rs の T2 の変更（refuse_network_root）は cfg(windows) の行。ci.yml と Cargo.toml は段階 4 で変えていない
+
+移していないテスト
+- lsp.rs の偽のサーバーのテストで、cfg(unix) のまま残したもの 6 件（stop_during_restart_leaves_nothing・restarts_for_another_session・restarts_when_the_packages_change・
+  stops_reading_broken_output・restarts_for_another_package・restarts_for_another_language）。移さない理由は 36fa3b2（T9）のメッセージにある（起動し直しの判断を見るもので OS に依らない、など）
+- 本物のサーバーの 3 件（analyzes_rust_with_local_rust_analyzer・analyzes_cpp_with_local_clangd_on_windows・analyzes_python_with_local_basedpyright_on_windows）は #[ignore] で、手で 1 件ずつ動かす。CI では動かない
+
+残ること・残る未確認（段階 4 のまとめ）
+
+- **段階 4 の外で相談する（両方の OS に関わる）**：workspace.configuration の件（③ を含む）、①、②、⑥
+- **4-5 の ×**：中断の前の原因は不明（今日は再現しない）。lspLocate が null を返したときに、Console に何も出さずにファイルを一覧から落とすので、また起きても見分けにくい
+- **実行ログの ④・⑤・⑦**：上の表のとおり。⑦ と一緒に、参照の一覧の見出しで `C:/…` と `c%3A/…`（basedpyright）・`c:/…`（rust-analyzer）が混ざる
+- **読み取り専用のタブ**：サーバーが返した URI の文字そのものをタブのキーにするので、同じファイルを別の形の URI で開くと、タブが 2 つになるかもしれない（推測。T8）
+- **読めないときの文（sources.rs の NOT_ALLOWED）**：Windows に SDK がないことと、`~/.rustup` などの書き方が Windows とずれている（T3 で変えないと決めた。画面で文を見てから直すかを決める）
+- **current_dir**：言語サーバーを起動するときの current_dir は `\\?\` の形のまま（T4）。3 つのサーバーの本物のテストで、答えとログに `\\?\` の形は 0 回だった。⑤ との関わりは未確認
+- **計画書の表の 4' 番**（フォルダの大文字・小文字が違う、まだないファイル）：断るのをやめて、中と見なすようにした（T2。ある祖先を canonicalize して本当の大文字・小文字に直してから比べるので、外に出る道はないため）
+- **basedpyright の typeshed**：「exe の 2 つ上 + `Lib\site-packages\basedpyright\dist\typeshed-fallback`」で求める形は、venv か CPython の本体の Scripts に入れたときだけ合う。
+  pip install --user などでは None になり、定義の行き先を読み取り専用で開けないだけになる見込み（推測。T7）
+- **npm 版の basedpyright**：settings.json の python.basedpyright に npm 版の `.cmd` を書かれたときの動きは未確認（T7）
+- **決まった場所の探す順番**：コードを読んで確かめた（上）。テスト・画面では守っていない
+- **CI の Node.js 20 の非推奨の warning**（actions/checkout@v4・actions/setup-node@v4）：あとで直すこと（ci.yml。両方の OS に関わる）
+- **macOS**：Unix の経路は CI の macos-latest でしか確かめていない（手元に Mac がない）。macOS の画面での LSP は、段階 4 では見ていない
+- **片付け**：clangd の zip（scratchpad の clangd-download）と、試しのファイル（scratchpad）を消すかは、このまとめのあとに決める。
+  venv（`%LOCALAPPDATA%\Programs\basedpyright-venv`）と clangd（`%LOCALAPPDATA%\Programs\clangd_23.1.0`）は残す
+- インストーラー（nsis）で入れた exe での動きは見ていない（段階 4 も、画面の確かめは target\release の exe と、開発用のビルドで行った）
 
 ### 段階 5：提出
 
@@ -1556,6 +1860,7 @@ examples/test_child.rs の stdio-kinds（T3）は cfg(windows) の中。submit.r
 
 決めたこと（2026-10-29）：Windows の API は windows-sys を直接使い、keyring・tauri-plugin-opener・chrono などの用途別のクレートは足さない。
 例外として、WebView2 の設定のために webview2-com と windows-core を足す。dunce を使うかは段階 4 で決める（その時点でも windows-sys の方針に合わせて自前の関数にする案がある）。
+→ 段階 4 の T1 で、dunce は足さず、trust.rs の without_verbatim を使うと決めた（9.1 の追加 37）。
 
 ---
 
@@ -1634,6 +1939,11 @@ examples/test_child.rs の stdio-kinds（T3）は cfg(windows) の中。submit.r
 | 追加 34（2026-11-08） | T5b の判断：ログアウトのあとに確かめて、残っていればもう一度消す形を足す（先に案を報告し、決まってから別のコミットでコードを書く）。session.rs:364 の save は今は変えず、T9 のあとにもう一度判断する。session.rs:368 の `let _ =` は今は変えない（詳しくは「段階 3 の既知の問題」の「T5b の切り分け」） | 段階 3（T5b のあと） |
 | 追加 35（2026-11-08） | T5c で決めたこと：Windows の Keychain::delete で、消したあと直後と 1 秒後に確かめ、見つかったら 1 回だけ消し直し、それでも残れば NOT_DELETED の Err にする（1 秒はデータから決めた数ではない）。TestKeychain の Drop は、Windows で Err のときにテスト用の項目の名前だけを出す。時間を測るテストは上限を広げず、落ちた原因は未確認のまま（詳しくは「段階 3 の既知の問題」の「T5c の結果」の節） | 段階 3（T5c） |
 | 追加 36（2026-11-11） | T10 で決めたこと。(1) 時間を測るテスト（stops_a_case_at_the_time_limit・stops_a_program_over_the_memory_limit_while_running）は、コードを変えず、既知の問題として残す。手元で落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する。CI で 1 回でも落ちたら、2 件を ignore にして CI で 1 件ずつ別に動かす案を考える。(2) テストの順番の待ちの上限（120 秒）は変えない。CI の Windows の lib のテストが 100 秒を超えたら、または順番の panic（session.rs の「資格情報のテストの順番を {:?} 待っても取れません」。{:?} の所に実際に出る時間の表記は未確認）が出たら考え直す。(3) curl の --disable は Windows だけ付ける。Unix は変えない | 段階 3（T10） |
+| 追加 37（2026-11-13） | `\\?\` を外すのに dunce は足さず、trust.rs の without_verbatim を使う（8 章の「dunce を使うかは段階 4 で決める」の答え） | 段階 4（T2・T4） |
+| 追加 38（2026-11-13） | 言語サーバーは、rust-analyzer（rust-src と一緒に stable へ）→ basedpyright（専用の venv に版を固定して pip で）→ clangd（GitHub の releases の zip を %LOCALAPPDATA%\Programs の下に）の順に、1 つずつ入れる。どれも入れる直前に、版・コマンドの全文・入れる場所・変わる場所を見せて待つ。rust-analyzer は rustup default の出力も、basedpyright は CPython の本体に何も入らないことを示す前後の pip list（findstr で絞る）も、clangd は zip の SHA-256 も見せる（利用者がリリースのページと比べる）。clangd の zip の中のものは、clangd.exe --version のほかは IDE とテストを通してしか動かさない。PATH には入れない | 段階 4（T5〜T7） |
+| 追加 39（2026-11-13） | settings.json に cpp.clangd・python.basedpyright（実行ファイルのパス）を足す（9.1 の 11 の詳しい形）。使うのは Windows だけで、macOS の探し方は変えない。型を両方の OS で共有するなら、macOS では読んでも使わないことと、設定の画面で保存したときにこの 2 つが消えないこと（write_settings が残すか）をテストで確かめる。T6 の前に、変えるファイルと Unix への影響を報告して待つ | 段階 4（T6・T7） |
+| 追加 40（2026-11-13） | lsp.rs の偽のサーバーのテスト（偽のサーバーを使う cfg(unix) のテストは 11 件）は、中継・順番・正式な終了・shutdown に答えないときに子孫ごと止める・自分で終わる、の 5 つの項目だけを Windows 版にする。5 つの項目は、Unix のテストでは 4 件（中継と正式な終了は relays_messages_and_stops_gracefully の 1 件。ほかは keeps_the_order_of_messages・kills_server_that_ignores_shutdown・reports_server_that_exits_by_itself）。これに send_rejects_messages_outside_the_allow_list を足して、Windows 版は 5 件（T9）。cfg(unix) のまま残るのは 6 件（stop_during_restart_leaves_nothing・restarts_for_another_session・restarts_when_the_packages_change・stops_reading_broken_output・restarts_for_another_package・restarts_for_another_language）で、段階 4 の結果に「移していない」と書く。作業領域の外を断るテストのうち、偽のサーバーを使わない 2 件（checks_messages_against_the_allow_list・locates_files_inside_the_workspace）は T2 で Windows 版にする（リンクはジャンクション）。合わせて cfg(unix) の 13 件 ＝ 2 ＋ 5 ＋ 6 | 段階 4（T2・T9） |
+| 追加 41（2026-11-13） | 作業領域が UNC（`\\server\share`）のとき、言語サーバーは「使えません」と知らせるだけにする。知らせることはテストで確かめる。push は T4・T9・T11 のあとの 3 回で、どれも利用者の許可のあと。--force なし | 段階 4 |
 
 ---
 
@@ -1679,12 +1989,13 @@ examples/test_child.rs の stdio-kinds（T3）は cfg(windows) の中。submit.r
   Cookie を渡す経路を --disable の付いた exe で本物のログインの画面で確かめることは、段階 5
 - テストのあとに消したはずの項目が残ったことがある（原因は未確認。段階 3 T5。T9 の手順 C〔ログアウトで消える〕で、この点も確かめる。分かったことは「段階 3 の既知の問題」の節。T5b でも、重ねた側の項目が delete のあとに残ることを 150 回中 9 回確かめた。仕組みは未確認。T9 では、本物のログアウトのあと、直後・1 分後・起動し直したあとの 3 回とも項目はなかった）
 - 段階 5 で確かめること：確認のダイアログの Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン（『提出する』が選ばれるかもしれない。推測。rfd 0.16.0 の nDefaultButton: 0 と、ボタンの並びから。動かしていない）、提出のページを画面で開くこと、「ログアウト」のボタンの説明文を画面で見ること（ログイン中にしか出ない）
+- 段階 4 で確かめること：「段階 4」の節の下調べの表（15 項目）。言語サーバーが返す URI の形（ドライブ名の大文字・小文字と `%3A`）、clangd の `--query-driver` の読み方、pip 版の basedpyright の typeshed の場所
+- （「不明」にあった「実際の REVEL_SESSION の長さ」は、段階 3 T9 で 299 バイトと測ったので消した〔4.1 の表〕。値は記録していない）
 - macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709。段階 2 は run 42210961555〕。clippy の警告は run 42210961555 のログで 0 件。debugs_with_real_lldb_dap と画面の操作は macOS の機械で確かめる。利用者の手元に Mac がないので、macOS の画面は確かめていない）
 
 不明（調べても分からなかった）
 
 - 開発者モードの設定（レジストリの値を読めなかった。シンボリックリンクを作れないことは確認済み）
-- 実際の REVEL_SESSION の長さ
 - Windows 11 でフォルダの中の予約名（NUL など）が装置を指すか
 - 8.3 の短い名前がこのボリュームで作られるか
 - ジャッジのスタックの大きさ（MinGW の ld の既定は 2 MiB と 2026-10-31 に確認済み）

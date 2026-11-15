@@ -31,9 +31,11 @@ use std::io::{BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(not(windows))]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -148,6 +150,7 @@ impl Decoder {
 // ---- URI と設定 ----
 
 // パスを file: の URI にする。英数字と -._~/ 以外はパーセントエンコードする
+#[cfg(not(windows))]
 pub fn file_uri(path: &Path) -> String {
     let mut uri = String::from("file://");
     for byte in path.to_string_lossy().as_bytes() {
@@ -161,9 +164,57 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
+// Windows（移植の段階 4 T2）：`file:///C:/a%20b/…` の形にする。`\\?\` を外し、ドライブ名は大文字にして、ドライブ名の `:` は
+// 符号にしない（rust-analyzer・clangd が返す形に近い。推測）。区切りの `\` は `/` にし、ほかは Unix と同じ規則で符号にする。
+// ドライブのないパス（UNC など）は、ドライブの部分を付けずに `\` を `/` にして符号にするだけ（path_of_uri はこれを None にする）
+#[cfg(windows)]
+pub fn file_uri(path: &Path) -> String {
+    let plain = crate::trust::without_verbatim(path);
+    let text = plain.to_string_lossy().replace('\\', "/");
+    let mut uri = String::from("file://");
+    let mut rest = text.as_str();
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        uri.push('/');
+        uri.push(bytes[0].to_ascii_uppercase() as char);
+        uri.push(':');
+        rest = &text[2..];
+    }
+    for byte in rest.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(*byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
+}
+
+// Windows（移植の段階 4 T2。9.1 の追加 41）：作業領域がネットワークの場所（UNC）など、ドライブ名のない場所なら、
+// 言語サーバーは使えないと知らせる。file: の URI がドライブ名のない形になり、path_of_uri で読めないため
+#[cfg(windows)]
+pub fn refuse_network_root(root: &Path) -> Result<(), String> {
+    let plain = crate::trust::without_verbatim(root);
+    let bytes = plain.as_os_str().as_encoded_bytes();
+    let on_drive =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    if on_drive {
+        Ok(())
+    } else {
+        Err("ネットワークの場所（\\\\サーバー\\共有 の形）など、ドライブ名のないフォルダでは、言語サーバーは使えません。ドライブ（C: など）の中のフォルダを開いてください".to_string())
+    }
+}
+
 // rust-analyzer に渡す設定（initializationOptions と workspace/configuration の答え）。
 // 決めるのは linkedProjects（projects のパッケージの Cargo.toml）だけで、ほかは既定値のまま（D-121・D-124・D-171）
 fn settings(projects: &[PathBuf]) -> Value {
+    // Windows（移植の段階 4 T4）：canonicalize が付ける `\\?\` を外してから渡す
+    #[cfg(windows)]
+    let projects: Vec<PathBuf> = projects
+        .iter()
+        .map(|dir| crate::trust::without_verbatim(dir))
+        .collect();
     let linked: Vec<String> = projects
         .iter()
         .map(|dir| dir.join("Cargo.toml").to_string_lossy().into_owned())
@@ -206,6 +257,9 @@ pub fn analyzer_place(root: &Path, package: &Path) -> (PathBuf, Vec<PathBuf>) {
 
 // 画面からの initialize の要求の、場所と設定（options。サーバーごとの initializationOptions）を上書きする（D-123）
 fn override_initialize(message: &mut Value, dir: &Path, options: &Value) {
+    // Windows（移植の段階 4 T4）：rootPath に、canonicalize が付ける `\\?\` を入れない（rootUri は file_uri が外す）
+    #[cfg(windows)]
+    let dir = &crate::trust::without_verbatim(dir);
     let uri = file_uri(dir);
     let name = dir
         .file_name()
@@ -265,6 +319,7 @@ const ALLOWED_METHODS: &[&str] = &[
 ];
 
 // file: の URI をパスにする（file_uri の逆。%XX を戻す）。file: でない、ホスト名がある、などは None
+#[cfg(not(windows))]
 pub(crate) fn path_of_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     if !rest.starts_with('/') {
@@ -286,12 +341,80 @@ pub(crate) fn path_of_uri(uri: &str) -> Option<PathBuf> {
     String::from_utf8(decoded).ok().map(PathBuf::from)
 }
 
+// Windows（移植の段階 4 T2）：`file:///C:/…`・`file:///c%3A/…` の形だけを読み、`C:\…`（`\\?\` なし、ドライブ名は大文字）にする。
+// 次のものは None（計画書の段階 4 T2 の表）：ホスト名がある（UNC を含む）、ドライブ名で始まらない（`file:////?/…` を含む）、
+// %XX を戻すと `\`・`:`・NUL・制御文字・`*?"<>|` がある部分、予約名（NUL・CON・COM1 など。拡張子付きも）・末尾が `.` か空白の部分。
+// `.` と `..` の部分は残す（あるファイルは canonicalize したあとで、まだないファイルは check_uri で部分の形を確かめる。
+// MinGW の標準ヘッダーは `bin/../lib/gcc/…` の形の場所にあり、clangd がその形で返すかもしれないため。推測）。
+// 名前の決まりは workspace.rs の windows_name_ok（段階 1 C5）と同じ
+#[cfg(windows)]
+pub(crate) fn path_of_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let text = String::from_utf8(decoded).ok()?;
+    let head = text.as_bytes();
+    if head.len() < 4 || !head[1].is_ascii_alphabetic() || head[2] != b':' || head[3] != b'/' {
+        return None;
+    }
+    let mut path = PathBuf::from(format!("{}:\\", head[1].to_ascii_uppercase() as char));
+    for part in text[4..].split('/').filter(|part| !part.is_empty()) {
+        if part != "." && part != ".." && !crate::workspace::windows_name_ok(part) {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
+// Windows（移植の段階 4 T2）：まだないファイルが作業領域の中か。部分は Prefix・RootDir・Normal だけ（`.`・`..` は断る。Unix と同じ）。
+// いちばん近い、ある祖先のフォルダを canonicalize し、そこにまだない部分を付け足してから root と比べる
+// （外を指すジャンクションの中の、まだないフォルダの中のファイルを断る。消したフォルダの中のファイルの didClose は通る）
+#[cfg(windows)]
+fn missing_inside(path: &Path, root: &Path) -> bool {
+    use std::path::Component;
+    if !path.components().all(|c| {
+        matches!(
+            c,
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+        )
+    }) {
+        return false;
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(real) = ancestor.canonicalize() {
+            let Ok(missing) = path.strip_prefix(ancestor) else {
+                return false;
+            };
+            return real.join(missing).starts_with(root);
+        }
+    }
+    false
+}
+
 // URI が作業領域（root。canonicalize 済み）の中のファイルか。あるファイルは実際のパス（リンクをたどった先）で、
 // ない（消した後の didClose など）ファイルは、`.`・`..` を含まないことと、root の下にあることで確かめる
 fn check_uri(uri: &str, root: &Path) -> Result<(), String> {
     let path = path_of_uri(uri).ok_or_else(|| format!("file: の URI ではありません：{uri}"))?;
     let inside = match path.canonicalize() {
         Ok(real) => real.starts_with(root),
+        #[cfg(windows)]
+        Err(_) => missing_inside(&path, root),
+        #[cfg(not(windows))]
         Err(_) => {
             path.components().all(|c| {
                 matches!(
@@ -684,12 +807,61 @@ fn find_rust_analyzer() -> Result<PathBuf, String> {
 // rust-analyzer を dir で、projects のパッケージを扱うように動かす（analyzer_place で決めたもの。D-171）
 pub fn rust_analyzer(dir: PathBuf, projects: Vec<PathBuf>) -> Result<Launch, String> {
     let program = find_rust_analyzer()?;
+    // Windows（移植の段階 4 T5）：選ばれた toolchain に rust-analyzer の component がなければ、起動せずに入れ方を案内する
+    #[cfg(windows)]
+    check_rust_analyzer_component(&program, &dir)?;
     // cargo と同じく、D-104 の変数を外し、RUSTUP_AUTO_INSTALL=0 を付ける（D-107）
     let command = toolchain::cargo_command(&program, &dir);
     Ok(Launch::rust_analyzer_with(command, dir, projects))
 }
 
+// Windows（移植の段階 4 T5）：rustup の代理の標準エラーが「Unknown binary 'rust-analyzer…」（選ばれた toolchain に component が
+// ない）なら、入れ方の案内を返す。rustup の文には入れ方の命令がない（「error: Unknown binary 'rust-analyzer.exe' in official
+// toolchain '<名前>'.」だけ）。toolchain の名前が読めれば --toolchain を付ける。読めない・英数字と -._ 以外があるときは付けない
+#[cfg(windows)]
+fn missing_component_hint(stderr: &str) -> Option<String> {
+    let rest = stderr.split("Unknown binary 'rust-analyzer").nth(1)?;
+    let toolchain = rest
+        .split("toolchain '")
+        .nth(1)
+        .and_then(|tail| tail.split('\'').next())
+        .filter(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        });
+    let command = match toolchain {
+        Some(name) => format!("rustup component add rust-analyzer rust-src --toolchain {name}"),
+        None => "rustup component add rust-analyzer rust-src".to_string(),
+    };
+    Some(format!(
+        "rust-analyzer が入っていません（rustup の component がありません）。ターミナルで `{command}` を実行してください。rust-src は、標準ライブラリの補完と定義へのジャンプに要ります"
+    ))
+}
+
+// Windows（移植の段階 4 T5）：本番と同じ命令（同じ環境変数・同じ場所なので、選ばれる toolchain も同じ）で --version だけを動かし、
+// component がないと分かれば案内の Err。ほかの失敗では今までどおり起動を続ける（本番の起動が中身を出す）。
+// 窓は出ない（cargo_command は process::command で CREATE_NO_WINDOW を付ける）
+#[cfg(windows)]
+fn check_rust_analyzer_component(program: &Path, dir: &Path) -> Result<(), String> {
+    let Ok(output) = toolchain::cargo_command(program, dir)
+        .arg("--version")
+        .output()
+    else {
+        return Ok(());
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    match missing_component_hint(&String::from_utf8_lossy(&output.stderr)) {
+        Some(hint) => Err(hint),
+        None => Ok(()),
+    }
+}
+
 // clangd（Command Line Tools のもの）を探す（D-210）。見つかった場所は覚えておく
+#[cfg(not(windows))]
 fn find_clangd() -> Result<PathBuf, String> {
     static FOUND: OnceLock<PathBuf> = OnceLock::new();
     if let Some(path) = FOUND.get() {
@@ -710,6 +882,10 @@ fn find_clangd() -> Result<PathBuf, String> {
 // --query-driver に渡す形にする（glob の記号の前に \ を置く）。`,` は区切りなので、含むパスは使えない
 fn query_driver(compiler: &Path) -> Result<String, String> {
     let text = compiler.to_string_lossy();
+    // Windows（移植の段階 4 T6）：glob の区切りを / で書く（\ の前に \ を置く形では、本物の clangd 23.1.0 が g++ のパスに
+    // 合わせられず、MinGW の標準ヘッダー〔bits/stdc++.h〕が見つからなかった。/ の形では見つかった）
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
     if text.contains(',') {
         return Err(format!(
             "コンパイラのパスに「,」があるので、clangd に渡せません：{text}"
@@ -737,6 +913,7 @@ fn clangd_args(compiler: &Path) -> Result<Vec<String>, String> {
 }
 
 // clangd を dir で、projects の C++ のパッケージを扱うように動かす。options は cpp::compilation_database のもの
+#[cfg(not(windows))]
 pub fn clangd(
     dir: PathBuf,
     projects: Vec<PathBuf>,
@@ -757,10 +934,113 @@ pub fn clangd(
     })
 }
 
+// Windows（移植の段階 4 T6）：clangd が見つからないときの案内（xcode-select の代わり）
+#[cfg(windows)]
+pub const CLANGD_MISSING: &str = "C++ の言語機能には clangd が要ります。GitHub の clangd/clangd のリリースから clangd-windows-<版>.zip を落として %LOCALAPPDATA%\\Programs に展開するか、settings.json の cpp.clangd に clangd.exe のパスを書いてください";
+
+// Windows（移植の段階 4 T6。9.1 の追加 39）：clangd を探す。configured は settings.json の cpp.clangd（空なら探す）。
+// 探す順は、設定 → PATH の clangd.exe → %LOCALAPPDATA%\Programs\clangd_<版>\bin（いちばん新しい版）→
+// %ProgramFiles%\LLVM\bin → C:\msys64\ucrt64\bin。設定が変わっても次の起動から効くように、見つかった場所は覚えない
+#[cfg(windows)]
+fn find_clangd(configured: &str) -> Result<PathBuf, String> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let programs = std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Programs"));
+    let fixed: Vec<PathBuf> = [
+        std::env::var_os("ProgramFiles").map(|dir| PathBuf::from(dir).join(r"LLVM\bin")),
+        Some(PathBuf::from(r"C:\msys64\ucrt64\bin")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    find_clangd_in(configured, &path_dirs, programs.as_deref(), &fixed)
+}
+
+// 探す場所を全部引数で受け取る（テストで、本物の PATH・%LOCALAPPDATA%・%ProgramFiles%・C:\msys64 を見ないため）
+#[cfg(windows)]
+fn find_clangd_in(
+    configured: &str,
+    path_dirs: &[PathBuf],
+    programs: Option<&Path>,
+    fixed: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if path.is_absolute() && path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "settings.json の cpp.clangd（{configured}）が見つかりません。{CLANGD_MISSING}"
+        ));
+    }
+    path_dirs
+        .iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("clangd.exe"))
+        .chain(programs.and_then(newest_clangd))
+        .chain(fixed.iter().map(|dir| dir.join("clangd.exe")))
+        .find(|path| path.is_file())
+        .ok_or_else(|| CLANGD_MISSING.to_string())
+}
+
+// programs（%LOCALAPPDATA%\Programs）の中の clangd_<版> のうち、bin\clangd.exe があって、版がいちばん新しいもの。
+// 版は数と . だけの形（23.1.0 など）として読み、数として比べる。読めない名前（23.1.0-rc1・snapshot など）は飛ばす
+#[cfg(windows)]
+fn newest_clangd(programs: &Path) -> Option<PathBuf> {
+    let mut found: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(programs)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let version = name.strip_prefix("clangd_")?;
+            let numbers = version
+                .split('.')
+                .map(|part| {
+                    if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                        part.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<u64>>>()?;
+            let exe = entry.path().join(r"bin\clangd.exe");
+            exe.is_file().then_some((numbers, exe))
+        })
+        .collect();
+    found.sort();
+    found.pop().map(|(_, exe)| exe)
+}
+
+// Windows（移植の段階 4 T6）：設定の clangd（configured。空なら探す）を、dir で、projects の C++ のパッケージを扱うように動かす
+#[cfg(windows)]
+pub fn clangd(
+    dir: PathBuf,
+    projects: Vec<PathBuf>,
+    compiler: &Path,
+    options: Value,
+    configured: &str,
+) -> Result<Launch, String> {
+    let program = find_clangd(configured)?;
+    let mut command = crate::process::command(program);
+    command.args(clangd_args(compiler)?);
+    toolchain::clear_ide_env(&mut command);
+    Ok(Launch {
+        name: "clangd",
+        command,
+        dir,
+        projects,
+        options,
+        configuration: Value::Null,
+    })
+}
+
 // basedpyright（`brew install basedpyright`）を探す（D-225）。IDE は入れない。
 // 探す順は、Homebrew（/opt/homebrew/bin）、PATH、/usr/local/bin（Python の処理系と同じ）
+#[cfg(not(windows))]
 pub const BASEDPYRIGHT_MISSING: &str = "Python の言語機能には basedpyright が要ります。ターミナルで `brew install basedpyright` を実行して入れてください";
 
+#[cfg(not(windows))]
 fn find_basedpyright() -> Result<PathBuf, String> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
@@ -789,6 +1069,7 @@ fn basedpyright_configuration(interpreter: Option<&Path>) -> Value {
 }
 
 // basedpyright を dir で、projects の Python のパッケージを扱うように動かす。interpreter は設定の処理系
+#[cfg(not(windows))]
 pub fn basedpyright(
     dir: PathBuf,
     projects: Vec<PathBuf>,
@@ -811,11 +1092,97 @@ pub fn basedpyright(
 // basedpyright の中の typeshed（標準ライブラリなどの型の情報。定義ジャンプの行き先。D-225）。
 // `basedpyright-langserver` のリンクをたどった先（npm のパッケージの `langserver.index.js`）の隣の
 // `dist/typeshed-fallback`。なければ None
+#[cfg(not(windows))]
 pub fn basedpyright_typeshed() -> Option<PathBuf> {
     let program = find_basedpyright().ok()?.canonicalize().ok()?;
     program
         .parent()?
         .join("dist/typeshed-fallback")
+        .canonicalize()
+        .ok()
+}
+
+// Windows（移植の段階 4 T7）：basedpyright が見つからないときの案内（brew の代わり）
+#[cfg(windows)]
+pub const BASEDPYRIGHT_MISSING: &str = "Python の言語機能には basedpyright が要ります。CPython 3.13 で venv を作り（例：%LOCALAPPDATA%\\Programs\\basedpyright-venv）、その中に `pip install basedpyright` で入れるか、settings.json の python.basedpyright に basedpyright-langserver.exe のパスを書いてください";
+
+// Windows（移植の段階 4 T7。9.1 の追加 38・39）：basedpyright（pip 版の basedpyright-langserver.exe）を探す。
+// configured は settings.json の python.basedpyright（空なら探す）。探す順は、設定 → PATH の basedpyright-langserver.exe →
+// %LOCALAPPDATA%\Programs\basedpyright-venv\Scripts。見つかった場所は覚えない
+#[cfg(windows)]
+fn find_basedpyright(configured: &str) -> Result<PathBuf, String> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let fixed: Vec<PathBuf> = std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join(r"Programs\basedpyright-venv\Scripts"))
+        .into_iter()
+        .collect();
+    find_basedpyright_in(configured, &path_dirs, &fixed)
+}
+
+// 探す場所を全部引数で受け取る（テストで、本物の PATH・%LOCALAPPDATA% を見ないため）
+#[cfg(windows)]
+fn find_basedpyright_in(
+    configured: &str,
+    path_dirs: &[PathBuf],
+    fixed: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if path.is_absolute() && path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "settings.json の python.basedpyright（{configured}）が見つかりません。{BASEDPYRIGHT_MISSING}"
+        ));
+    }
+    path_dirs
+        .iter()
+        .filter(|dir| dir.is_absolute())
+        .chain(fixed)
+        .map(|dir| dir.join("basedpyright-langserver.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| BASEDPYRIGHT_MISSING.to_string())
+}
+
+// Windows（移植の段階 4 T7）：設定の basedpyright（configured。空なら探す）を、dir で、projects の Python のパッケージを
+// 扱うように動かす。interpreter は設定の処理系
+#[cfg(windows)]
+pub fn basedpyright(
+    dir: PathBuf,
+    projects: Vec<PathBuf>,
+    interpreter: Option<&Path>,
+    configured: &str,
+) -> Result<Launch, String> {
+    let program = find_basedpyright(configured)?;
+    let mut command = crate::process::command(program);
+    command.arg("--stdio");
+    toolchain::clear_ide_env(&mut command);
+    Ok(Launch {
+        name: "basedpyright",
+        command,
+        dir,
+        projects,
+        options: Value::Null,
+        configuration: basedpyright_configuration(interpreter),
+    })
+}
+
+// Windows（移植の段階 4 T7）：basedpyright の中の typeshed。pip で venv（か CPython の本体）に入れたときの並び
+// （<venv>\Scripts\basedpyright-langserver.exe と <venv>\Lib\site-packages\basedpyright\dist\typeshed-fallback）から求める。
+// なければ None（pip install --user など、並びが違うときも None。定義の行き先を読み取り専用で開けないだけ）
+#[cfg(windows)]
+pub fn basedpyright_typeshed(configured: &str) -> Option<PathBuf> {
+    pip_typeshed(&find_basedpyright(configured).ok()?)
+}
+
+#[cfg(windows)]
+fn pip_typeshed(program: &Path) -> Option<PathBuf> {
+    program
+        .parent()?
+        .parent()?
+        .join(r"Lib\site-packages\basedpyright\dist\typeshed-fallback")
         .canonicalize()
         .ok()
 }
@@ -905,7 +1272,8 @@ impl LspControl {
         Ok(false)
     }
 
-    #[cfg(all(test, unix))]
+    // 段階 4 T9：Windows の偽のサーバーのテストでも使う（前は cfg(all(test, unix))）
+    #[cfg(test)]
     fn start_with(
         &self,
         command: Command,
@@ -919,7 +1287,7 @@ impl LspControl {
     }
 
     // パッケージの組が変わったとき（コンテストのフォルダに問題を足したなど）も、起動し直す（D-171）
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn start_with_projects(
         &self,
         command: Command,
@@ -938,7 +1306,7 @@ impl LspControl {
     }
 
     // 偽のサーバーの単体テスト用：許可リストにない方法（hello・quit など）で偽のサーバーを動かす
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn send_unchecked(&self, text: &str) -> Result<(), String> {
         self.send_checked(text, false)
     }
@@ -1063,11 +1431,9 @@ mod tests {
         );
     }
 
+    // Unix のパスの例。Windows では overrides_initialize_on_windows（段階 4 T2）
+    #[cfg(unix)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows：段階 4（LSP に渡すパスの区切りと URI）で直す。docs/windows-port-plan.md 7 章"
-    )]
     fn overrides_initialize_and_answers_configuration() {
         let dir = Path::new("/ws/problems/abc001_a");
         let mut message = json!({
@@ -1162,6 +1528,8 @@ mod tests {
         assert_eq!(text_document["hover"]["contentFormat"][0], "markdown");
     }
 
+    // Unix のパスの例。Windows では reads_file_uris_on_windows（段階 4 T2）
+    #[cfg(unix)]
     #[test]
     fn reads_file_uris() {
         assert_eq!(
@@ -1176,6 +1544,793 @@ mod tests {
         assert_eq!(path_of_uri("https://example.com/a"), None);
         assert_eq!(path_of_uri("file:///a%2"), None);
         assert_eq!(path_of_uri("file:///a%ZZ"), None);
+    }
+
+    // 段階 4 T2：Windows の file: の URI。`\\?\` を外し、ドライブ名は大文字、`:` は符号にしない。
+    // ドライブのないパス（UNC など）は、ドライブの部分を付けずに `\` を `/` にして符号にするだけで、path_of_uri はそれを None にする
+    #[cfg(windows)]
+    #[test]
+    fn makes_file_uris_on_windows() {
+        assert_eq!(
+            file_uri(Path::new(r"\\?\C:\a b\あ")),
+            "file:///C:/a%20b/%E3%81%82"
+        );
+        assert_eq!(file_uri(Path::new(r"c:\x\y.rs")), "file:///C:/x/y.rs");
+        assert_eq!(file_uri(Path::new(r"C:\")), "file:///C:/");
+        for (path, uri) in [
+            (r"\\?\UNC\server\share\a.rs", "file:////server/share/a.rs"),
+            (r"\\server\share\a.rs", "file:////server/share/a.rs"),
+            (r"\x\a.rs", "file:///x/a.rs"),
+            (r"C:a.rs", "file:///C:a.rs"),
+            (r"a\b.rs", "file://a/b.rs"),
+        ] {
+            assert_eq!(file_uri(Path::new(path)), uri, "{path}");
+            assert_eq!(path_of_uri(uri), None, "{uri}");
+        }
+    }
+
+    // 段階 4 T2：Windows の path_of_uri。断るか中と見なすかの表（計画書の段階 4 T2）のとおり
+    #[cfg(windows)]
+    #[test]
+    fn reads_file_uris_on_windows() {
+        for (uri, path) in [
+            (
+                "file:///C:/T/ws/%E6%97%A5%E6%9C%AC%20%E8%AA%9E.rs",
+                r"C:\T\ws\日本 語.rs",
+            ),
+            ("file:///C:/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            ("file:///C%3A/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            ("file:///c%3a/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            ("file:///c:/T/ws/a.rs", r"C:\T\ws\a.rs"),
+            // . と .. は残す（あるファイルは canonicalize のあとで、まだないファイルは要素の形で確かめる）
+            (
+                "file:///C:/T/ws/../out/secret.rs",
+                r"C:\T\ws\..\out\secret.rs",
+            ),
+            (
+                "file:///C:/T/mingw64/bin/../lib/gcc/vector",
+                r"C:\T\mingw64\bin\..\lib\gcc\vector",
+            ),
+            // %2F は区切りになる（Unix と同じ）
+            ("file:///C:/T/ws/a%2Fb.rs", r"C:\T\ws\a\b.rs"),
+            ("file:///C:/", r"C:\"),
+        ] {
+            assert_eq!(path_of_uri(uri), Some(PathBuf::from(path)), "{uri}");
+        }
+        // 小文字のドライブ名の URI からも、文字として C:\… が返る（PathBuf の == はドライブ名の大文字・小文字の違いを
+        // 見分けないようなので、文字列で比べる。外して落ちることの確かめで分かった）
+        for uri in ["file:///c:/T/ws/a.rs", "file:///c%3a/T/ws/a.rs"] {
+            assert_eq!(
+                path_of_uri(uri).unwrap().to_string_lossy(),
+                r"C:\T\ws\a.rs",
+                "{uri}"
+            );
+        }
+        for uri in [
+            // %5C で作る ..（戻すと \ がある）
+            "file:///C:/T/ws/..%5C..%5Cout%5Csecret.rs",
+            // 2 つ目より後ろの部分の :（代替データストリーム）
+            "file:///C:/T/ws/a.rs:x",
+            "file:///C:/T/ws/a%3Ax.rs",
+            "file:///C:/T/C:/a.rs",
+            // \\?\ を URI に入れたもの
+            "file:////?/C:/T/ws/a.rs",
+            "file://%5C%5C%3F%5CC%3A%5CT%5Cws%5Ca.rs",
+            "file:///%5C%5C%3F%5CC%3A%5CT%5Cws%5Ca.rs",
+            // 予約名（拡張子付き・途中の部分も）
+            "file:///C:/T/ws/NUL",
+            "file:///C:/T/ws/nul.txt",
+            "file:///C:/T/ws/con.rs",
+            "file:///C:/T/ws/COM1",
+            "file:///C:/T/ws/COM%C2%B9",
+            "file:///C:/T/ws/CONIN$",
+            "file:///C:/T/ws/NUL/a.rs",
+            // 末尾の . と空白、使えない文字、NUL、制御文字
+            "file:///C:/T/ws/a.rs.",
+            "file:///C:/T/ws/...",
+            "file:///C:/T/ws/a.rs%20",
+            "file:///C:/T/ws/a%3F.rs",
+            "file:///C:/T/ws/a%2A.rs",
+            "file:///C:/T/ws/a%00.rs",
+            "file:///C:/T/ws/a%01.rs",
+            // UNC・ホスト名
+            "file://server/share/a.rs",
+            "file:////server/share/a.rs",
+            "file://localhost/C:/T/ws/a.rs",
+            // ドライブ名がない、: のあとに / がない、古い | の形、英字でないドライブ名
+            "file:///x",
+            "file:///C:",
+            "file:///C:x",
+            "file:///C|/T/a.rs",
+            "file:///1:/T/a.rs",
+            // 壊れた %XX、file: でない
+            "file:///C:/a%2",
+            "file:///C:/a%ZZ",
+            "https://example.com/a",
+        ] {
+            assert_eq!(path_of_uri(uri), None, "{uri}");
+        }
+    }
+
+    // 段階 4 T2：canonicalize は、ドライブ名を大文字で返す（小文字で渡しても）。file_uri もドライブ名を大文字にするので、
+    // 作業領域の URI とそろう。失敗の文には、利用者のフォルダの名前を出さない
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_returns_the_drive_in_upper_case() {
+        let real = std::env::temp_dir().canonicalize().unwrap();
+        let text = real.to_string_lossy().into_owned();
+        let rest = text
+            .strip_prefix(r"\\?\")
+            .expect("canonicalize の結果に \\\\?\\ がない");
+        let drive = rest.chars().next().unwrap();
+        assert!(
+            drive.is_ascii_uppercase(),
+            "ドライブ名が大文字でない：{drive}"
+        );
+        let lower = format!("{}{}", drive.to_ascii_lowercase(), &rest[1..]);
+        assert!(
+            Path::new(&lower).canonicalize().unwrap() == real,
+            "小文字のドライブ名で渡すと、結果が違う"
+        );
+        // 行き帰り：file_uri の URI を path_of_uri で戻すと、`\\?\` を外した同じパスになる
+        let file = real.join("日本 語.rs");
+        assert!(
+            path_of_uri(&file_uri(&file)) == Some(crate::trust::without_verbatim(&file)),
+            "行き帰りで同じパスにならない"
+        );
+    }
+
+    // 段階 4 T2：initialize に入れる場所と、画面に返す rootUri（画面の documentUri はこれに相対パスを足す）
+    #[cfg(windows)]
+    #[test]
+    fn overrides_initialize_on_windows() {
+        let dir = Path::new(r"C:\ws\problems\abc001_a");
+        let mut message = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "rootUri": "file:///elsewhere", "initializationOptions": { "x": 1 }, "capabilities": {} }
+        });
+        override_initialize(&mut message, dir, &settings(&[dir.to_path_buf()]));
+        let params = &message["params"];
+        assert_eq!(params["rootUri"], "file:///C:/ws/problems/abc001_a");
+        assert_eq!(
+            params["workspaceFolders"][0]["uri"],
+            "file:///C:/ws/problems/abc001_a"
+        );
+        assert_eq!(params["workspaceFolders"][0]["name"], "abc001_a");
+        assert_eq!(
+            params["initializationOptions"],
+            json!({ "linkedProjects": [r"C:\ws\problems\abc001_a\Cargo.toml"] })
+        );
+        assert_eq!(
+            params["capabilities"],
+            json!({ "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } } })
+        );
+        let request = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "workspace/configuration",
+            "params": { "items": [{ "section": "rust-analyzer" }, { "section": "python" }, { "section": "other" }] }
+        });
+        let answer = configuration_answer(
+            &request,
+            &json!({ "rust-analyzer": settings(&[dir.to_path_buf()]) }),
+        );
+        assert_eq!(
+            answer["result"][0]["linkedProjects"][0],
+            r"C:\ws\problems\abc001_a\Cargo.toml"
+        );
+        assert_eq!(answer["result"][1], Value::Null);
+        let configuration = basedpyright_configuration(Some(Path::new(r"C:\x\python.exe")));
+        let answer = configuration_answer(&request, &configuration);
+        assert_eq!(answer["result"][1]["pythonPath"], r"C:\x\python.exe");
+        // 画面に返す rootUri は `\\?\` を外した形。パッケージは `/` 区切り
+        let started = started(
+            Path::new(r"\\?\C:\ws"),
+            Path::new(r"\\?\C:\ws\problems\abc001_a"),
+            false,
+            "rust-analyzer",
+        );
+        assert_eq!(started.package, "problems/abc001_a");
+        assert_eq!(started.root_uri, "file:///C:/ws/problems/abc001_a");
+    }
+
+    // 段階 4 T4：サーバーに渡すパス（initialize の rootPath、rust-analyzer の linkedProjects）に、canonicalize が付ける
+    // `\\?\` を入れない。実際の起動では、場所もパッケージも canonicalize した `\\?\C:\…` の形で来る
+    #[cfg(windows)]
+    #[test]
+    fn passes_paths_without_the_verbatim_prefix_on_windows() {
+        let dir = Path::new(r"\\?\C:\ws\problems\abc001_a");
+        let options = settings(&[dir.to_path_buf()]);
+        let mut message = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } });
+        override_initialize(&mut message, dir, &options);
+        let params = &message["params"];
+        assert_eq!(params["rootPath"], r"C:\ws\problems\abc001_a");
+        assert_eq!(params["rootUri"], "file:///C:/ws/problems/abc001_a");
+        assert_eq!(
+            params["initializationOptions"],
+            json!({ "linkedProjects": [r"C:\ws\problems\abc001_a\Cargo.toml"] })
+        );
+        // workspace/configuration の答えも同じ設定から作る
+        let request = json!({
+            "jsonrpc": "2.0", "id": 7, "method": "workspace/configuration",
+            "params": { "items": [{ "section": "rust-analyzer" }] }
+        });
+        let answer = configuration_answer(&request, &json!({ "rust-analyzer": options }));
+        assert_eq!(
+            answer["result"][0]["linkedProjects"][0],
+            r"C:\ws\problems\abc001_a\Cargo.toml"
+        );
+        // どこにも `\\?\` がない（JSON の文字列に ? が出ない）
+        assert!(!message.to_string().contains('?'), "{message}");
+    }
+
+    // 段階 4 T5：rustup の代理はあるが、選ばれた toolchain に rust-analyzer の component がないときの案内。
+    // rustup の文から toolchain の名前が読めれば --toolchain を付け、読めない（形が違う・変な文字がある）ときは付けない
+    #[cfg(windows)]
+    #[test]
+    fn hints_how_to_add_the_rust_analyzer_component() {
+        let hint = missing_component_hint(
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain '9.9.9-x86_64-pc-windows-msvc'.\n",
+        )
+        .expect("案内がない");
+        assert!(
+            hint.contains(
+                "`rustup component add rust-analyzer rust-src --toolchain 9.9.9-x86_64-pc-windows-msvc`"
+            ),
+            "{hint}"
+        );
+        assert!(hint.contains("rust-src は、標準ライブラリの補完と定義へのジャンプに要ります"));
+        for stderr in [
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain.\n",
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain 'a b;c'.\n",
+            "error: Unknown binary 'rust-analyzer.exe' in official toolchain ''.\n",
+        ] {
+            let hint = missing_component_hint(stderr).expect("案内がない");
+            assert!(
+                hint.contains("`rustup component add rust-analyzer rust-src`"),
+                "{stderr} → {hint}"
+            );
+            assert!(!hint.contains("--toolchain"), "{stderr} → {hint}");
+        }
+        // ほかの失敗には案内を出さない（本番の起動が中身を出す）
+        for stderr in [
+            "",
+            "error: toolchain '9.9.9-x86_64-pc-windows-msvc' is not installed\n",
+            "error: Unknown binary 'cargo.exe' in official toolchain '9.9.9-x86_64-pc-windows-msvc'.\n",
+        ] {
+            assert_eq!(missing_component_hint(stderr), None, "{stderr}");
+        }
+    }
+
+    // 段階 4 T6（9.1 の追加 39）：Windows で clangd を探す順。探す場所は全部一時フォルダの中に作って渡し、本物の PATH・
+    // %LOCALAPPDATA%・%ProgramFiles%・C:\msys64 は見ない（手元と CI で結果が変わらないように）
+    #[cfg(windows)]
+    #[test]
+    fn finds_clangd_in_order_on_windows() {
+        let base = temp_dir("clangd-find");
+        let _ = std::fs::remove_dir_all(&base);
+        let exe = |dir: &str| {
+            let path = base.join(dir).join("clangd.exe");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            path
+        };
+        let configured = exe("custom");
+        let in_path = exe("path-dir");
+        let relative_target = exe("relative-dir");
+        let programs = base.join("programs");
+        for version in ["9.0.0", "23.1.0"] {
+            exe(&format!("programs/clangd_{version}/bin"));
+        }
+        // 数と . の形として読めない名前（rc・snapshot・+ の付いた数）と、bin\clangd.exe のない新しい版は飛ばす
+        for name in ["clangd_99.0.0-rc1", "clangd_snapshot", "clangd_99.+0.0"] {
+            exe(&format!("programs/{name}/bin"));
+        }
+        std::fs::create_dir_all(programs.join("clangd_30.0.0/bin")).unwrap();
+        let newest = programs.join(r"clangd_23.1.0\bin\clangd.exe");
+        let llvm = exe("llvm-bin");
+        let msys = exe("msys-bin");
+        let fixed = vec![
+            llvm.parent().unwrap().to_path_buf(),
+            msys.parent().unwrap().to_path_buf(),
+        ];
+        let find = |configured: &str,
+                    path_dirs: &[PathBuf],
+                    programs: Option<&Path>,
+                    fixed: &[PathBuf]| {
+            find_clangd_in(configured, path_dirs, programs, fixed)
+        };
+        let path_dirs = vec![in_path.parent().unwrap().to_path_buf()];
+        // 1. 設定があれば、それだけを使う
+        let text = configured.to_string_lossy().into_owned();
+        assert!(
+            find(&text, &path_dirs, Some(&programs), &fixed).unwrap() == configured,
+            "設定の clangd を使わない"
+        );
+        // 設定のファイルがない・相対パスなら、案内（ほかの場所は探さない）
+        for missing in [
+            base.join(r"none\clangd.exe").to_string_lossy().into_owned(),
+            "clangd.exe".to_string(),
+        ] {
+            let error = find(&missing, &path_dirs, Some(&programs), &fixed).unwrap_err();
+            assert!(error.contains("settings.json の cpp.clangd"), "{error}");
+            assert!(error.contains(CLANGD_MISSING), "{error}");
+        }
+        // 2. PATH の clangd.exe（相対パスのフォルダは見ない）
+        assert!(
+            find("", &path_dirs, Some(&programs), &fixed).unwrap() == in_path,
+            "PATH の clangd を使わない"
+        );
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let target_dir = relative_target.parent().unwrap().to_path_buf();
+        if let Some(relative) = relative_path(&cwd, &target_dir) {
+            assert!(relative.is_relative());
+            assert!(
+                relative.join("clangd.exe").is_file(),
+                "相対パスで一時フォルダを指せていない"
+            );
+            // 相対パスのフォルダだけの PATH は、空の PATH と同じ結果になる（相対パスの先の clangd は選ばない）
+            let with_relative = find("", &[relative], Some(&programs), &fixed);
+            assert!(
+                with_relative
+                    .as_ref()
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok())
+                    != relative_target.canonicalize().ok(),
+                "相対パスの PATH のフォルダを見た"
+            );
+            assert!(
+                with_relative == find("", &[], Some(&programs), &fixed),
+                "相対パスの PATH のフォルダがあると、結果が変わった"
+            );
+        } else {
+            eprintln!("今いる場所と一時フォルダのドライブが違うので、相対パスの確かめを飛ばします");
+        }
+        // 3. %LOCALAPPDATA%\Programs\clangd_<版>：数として比べていちばん新しい版（9.0.0 より 23.1.0）。読めない名前・exe のない版は飛ばす
+        assert!(
+            find("", &[], Some(&programs), &fixed).unwrap() == newest,
+            "いちばん新しい版を選ばない"
+        );
+        // 4. %ProgramFiles%\LLVM\bin、5. C:\msys64\ucrt64\bin の順
+        assert!(
+            find("", &[], None, &fixed).unwrap() == llvm,
+            "LLVM の場所を先に見ない"
+        );
+        assert!(
+            find("", &[], None, &fixed[1..]).unwrap() == msys,
+            "MSYS2 の場所を見ない"
+        );
+        // どこにもなければ、Windows の案内（xcode-select は出さない）
+        let error = find("", &[], Some(&base.join("none")), &[]).unwrap_err();
+        assert_eq!(error, CLANGD_MISSING);
+        assert!(error.contains("clangd-windows-<版>.zip"));
+        assert!(error.contains(r"%LOCALAPPDATA%\Programs"));
+        assert!(error.contains("cpp.clangd"));
+        assert!(!error.contains("xcode-select"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 段階 4 T7（9.1 の追加 38・39）：Windows で basedpyright を探す順。探す場所は全部一時フォルダの中に作って渡し、本物の
+    // PATH・%LOCALAPPDATA% は見ない
+    #[cfg(windows)]
+    #[test]
+    fn finds_basedpyright_in_order_on_windows() {
+        let base = temp_dir("basedpyright-find");
+        let _ = std::fs::remove_dir_all(&base);
+        let exe = |dir: &str| {
+            let path = base.join(dir).join("basedpyright-langserver.exe");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "").unwrap();
+            path
+        };
+        let configured = exe("custom");
+        let in_path = exe("path-dir");
+        let relative_target = exe("relative-dir");
+        let venv = exe(r"basedpyright-venv\Scripts");
+        let fixed = vec![venv.parent().unwrap().to_path_buf()];
+        let path_dirs = vec![in_path.parent().unwrap().to_path_buf()];
+        // 1. 設定があれば、それだけを使う
+        let text = configured.to_string_lossy().into_owned();
+        assert!(
+            find_basedpyright_in(&text, &path_dirs, &fixed).unwrap() == configured,
+            "設定の basedpyright を使わない"
+        );
+        // 設定のファイルがない・相対パスなら、案内（ほかの場所は探さない）
+        for missing in [
+            base.join(r"none\basedpyright-langserver.exe")
+                .to_string_lossy()
+                .into_owned(),
+            "basedpyright-langserver.exe".to_string(),
+        ] {
+            let error = find_basedpyright_in(&missing, &path_dirs, &fixed).unwrap_err();
+            assert!(
+                error.contains("settings.json の python.basedpyright"),
+                "{error}"
+            );
+            assert!(error.contains(BASEDPYRIGHT_MISSING), "{error}");
+        }
+        // 2. PATH の basedpyright-langserver.exe（相対パスのフォルダは見ない）
+        assert!(
+            find_basedpyright_in("", &path_dirs, &fixed).unwrap() == in_path,
+            "PATH の basedpyright を使わない"
+        );
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        if let Some(relative) = relative_path(&cwd, relative_target.parent().unwrap()) {
+            assert!(relative.join("basedpyright-langserver.exe").is_file());
+            let with_relative = find_basedpyright_in("", &[relative], &fixed);
+            assert!(
+                with_relative
+                    .as_ref()
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok())
+                    != relative_target.canonicalize().ok(),
+                "相対パスの PATH のフォルダを見た"
+            );
+            assert!(
+                with_relative == find_basedpyright_in("", &[], &fixed),
+                "相対パスの PATH のフォルダがあると、結果が変わった"
+            );
+        } else {
+            eprintln!("今いる場所と一時フォルダのドライブが違うので、相対パスの確かめを飛ばします");
+        }
+        // 3. 決まった場所（%LOCALAPPDATA%\Programs\basedpyright-venv\Scripts）
+        assert!(
+            find_basedpyright_in("", &[], &fixed).unwrap() == venv,
+            "決まった場所の basedpyright を使わない"
+        );
+        // どこにもなければ、Windows の案内（brew は出さない）
+        let error = find_basedpyright_in("", &[], &[base.join("none")]).unwrap_err();
+        assert_eq!(error, BASEDPYRIGHT_MISSING);
+        assert!(error.contains(r"%LOCALAPPDATA%\Programs\basedpyright-venv"));
+        assert!(error.contains("pip install basedpyright"));
+        assert!(error.contains("python.basedpyright"));
+        assert!(!error.contains("brew"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // 段階 4 T7：pip で venv に入れた basedpyright の typeshed の場所（Scripts の 1 つ上の Lib\site-packages\basedpyright\dist）
+    #[cfg(windows)]
+    #[test]
+    fn finds_the_pip_typeshed_on_windows() {
+        let base = temp_dir("basedpyright-typeshed");
+        let _ = std::fs::remove_dir_all(&base);
+        let program = base.join(r"venv\Scripts\basedpyright-langserver.exe");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, "").unwrap();
+        // typeshed がなければ None
+        assert_eq!(pip_typeshed(&program), None);
+        let typeshed = base.join(r"venv\Lib\site-packages\basedpyright\dist\typeshed-fallback");
+        std::fs::create_dir_all(typeshed.join("stdlib")).unwrap();
+        assert!(
+            pip_typeshed(&program) == typeshed.canonicalize().ok(),
+            "venv の typeshed を求められない"
+        );
+        // 並びが違う（Scripts の 1 つ上に Lib がない。pip install --user など）なら None
+        let elsewhere = base.join(r"user\Python313\Scripts\basedpyright-langserver.exe");
+        std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(pip_typeshed(&elsewhere), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // from から to への相対パス（同じドライブのときだけ。どちらも canonicalize した `\\?\` の形）
+    #[cfg(windows)]
+    fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        if from.first() != to.first() {
+            return None;
+        }
+        let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+        let mut relative = PathBuf::new();
+        for _ in common..from.len() {
+            relative.push("..");
+        }
+        for part in &to[common..] {
+            relative.push(part.as_os_str());
+        }
+        Some(relative)
+    }
+
+    // 確かめられないときに飛ばす。ただし ci（環境変数 CI がある）なら、理由を書いて落とす（段階 4 T5 の追加。CI のログでは、
+    // 飛ばして通ったのか確かめて通ったのかが見分けられないため）
+    #[cfg(windows)]
+    fn skip_unless_ci(reason: &str, ci: bool) {
+        if ci {
+            panic!("CI では飛ばしません（確かめられないため）：{reason}");
+        }
+        eprintln!("{reason}ので、確かめずに飛ばします");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn skips_only_outside_ci() {
+        skip_unless_ci("偽の理由", false);
+        let result = std::panic::catch_unwind(|| skip_unless_ci("偽の理由", true));
+        assert!(result.is_err(), "CI なのに飛ばした");
+    }
+
+    // 段階 4 T5：rust-toolchain.toml で、rust-analyzer の component のない toolchain を選んだパッケージでは、起動せずに案内を返す。
+    // toolchain の版は決め打ちにせず、このリポジトリの src-tauri/rust-toolchain.toml の channel を使う（手元と CI の Windows には
+    // その版が入っていて、rust-analyzer の component はない見込み）。代理がない、またはその版に component が入っているときは飛ばす
+    #[cfg(windows)]
+    #[test]
+    fn refuses_a_toolchain_without_rust_analyzer() {
+        let manifest = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-toolchain.toml"),
+        )
+        .unwrap();
+        let channel = manifest
+            .lines()
+            .find_map(|line| {
+                let value = line
+                    .trim()
+                    .strip_prefix("channel")?
+                    .trim()
+                    .strip_prefix('=')?;
+                Some(value.trim().trim_matches('"').to_string())
+            })
+            .expect("rust-toolchain.toml に channel がない");
+        let package = temp_dir("rust-analyzer-missing");
+        std::fs::write(
+            package.join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = \"{channel}\"\n"),
+        )
+        .unwrap();
+        // CI（環境変数 CI がある）では飛ばさずに落とす（飛ばすと、CI のログの「ok」からは確かめたかが分からないため）
+        let ci = std::env::var_os("CI").is_some();
+        let Ok(program) = find_rust_analyzer() else {
+            skip_unless_ci("rustup の代理（rust-analyzer.exe）がない", ci);
+            return;
+        };
+        // component があるかは、テストの中で別に確かめる（IDE と同じ命令で --version を動かす）
+        let present = toolchain::cargo_command(&program, &package)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if present {
+            let _ = std::fs::remove_dir_all(&package);
+            skip_unless_ci(
+                &format!("{channel} に rust-analyzer の component が入っている"),
+                ci,
+            );
+            return;
+        }
+        let error = match rust_analyzer(package.clone(), vec![package.clone()]) {
+            Ok(_) => panic!("component のない toolchain なのに、起動の前に断らなかった"),
+            Err(error) => error,
+        };
+        assert!(error.contains("rust-analyzer が入っていません"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "rustup component add rust-analyzer rust-src --toolchain {channel}"
+            )),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&package);
+    }
+
+    // 段階 4 T2（9.1 の追加 41）：作業領域が UNC（ネットワークの場所）なら、言語サーバーは使えないと知らせる
+    #[cfg(windows)]
+    #[test]
+    fn refuses_a_network_workspace() {
+        for root in [r"\\?\UNC\server\share\ws", r"\\server\share\ws"] {
+            let error = refuse_network_root(Path::new(root)).unwrap_err();
+            assert!(error.contains("ネットワークの場所"), "{error}");
+        }
+        assert!(refuse_network_root(Path::new(r"\\?\C:\ws")).is_ok());
+        assert!(refuse_network_root(Path::new(r"C:\ws")).is_ok());
+    }
+
+    // テストのジャンクションは win.rs の TestJunction（段階 4 T3 で移した）
+    #[cfg(windows)]
+    use crate::win::TestJunction as Junction;
+
+    // file:///C:/… の形の URI の、ドライブ名を小文字にしたもの・`:` を %3A にしたもの
+    #[cfg(windows)]
+    fn lower_drive(uri: &str) -> String {
+        let (head, tail) = uri.split_at("file:///C".len());
+        format!("{}{tail}", head.to_ascii_lowercase())
+    }
+
+    #[cfg(windows)]
+    fn percent_colon(uri: &str) -> String {
+        let at = "file:///C".len();
+        format!("{}%3A{}", &uri[..at], &uri[at + 1..])
+    }
+
+    // 段階 4 T2 の前の file_uri（`\\?\` を含むパスをそのまま符号にした）の形
+    #[cfg(windows)]
+    fn old_file_uri(path: &Path) -> String {
+        let mut uri = String::from("file://");
+        for byte in path.to_string_lossy().as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    uri.push(*byte as char)
+                }
+                _ => uri.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        uri
+    }
+
+    // checks_messages_against_the_allow_list の Windows 版（段階 4 T2）。リンクはジャンクション（フォルダへのもの）。
+    // 失敗の文には、利用者のフォルダの名前を含む URI を出さず、番号だけを出す
+    #[cfg(windows)]
+    #[test]
+    fn checks_messages_against_the_allow_list_on_windows() {
+        let root = temp_dir("allow-root-win");
+        let outside = temp_dir("allow-outside-win");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(outside.join("secret.rs"), "").unwrap();
+        let link = root.join("link");
+        let _junction = Junction::new(&link, &outside);
+        let inside = file_uri(&root.join("src/main.rs"));
+        let open = |uri: &str, text: &str| {
+            json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen",
+                    "params": { "textDocument": { "uri": uri, "languageId": "rust", "version": 0, "text": text } } })
+        };
+        let close = |uri: &str| {
+            json!({ "jsonrpc": "2.0", "method": "textDocument/didClose",
+                    "params": { "textDocument": { "uri": uri } } })
+        };
+        // 通るもの：あるファイル（ドライブ名が小文字・%3A の形も）
+        for (n, uri) in [inside.clone(), lower_drive(&inside), percent_colon(&inside)]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                check_message(&open(uri, "fn main() {}"), &root).is_ok(),
+                "{n}"
+            );
+        }
+        assert!(check_message(&json!({ "jsonrpc": "2.0", "id": 3, "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": inside }, "position": { "line": 0, "character": 0 } } }), &root).is_ok());
+        assert!(
+            check_message(
+                &json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 3 } }),
+                &root
+            )
+            .is_ok()
+        );
+        // 通るもの：まだないファイルの didClose（ドライブ名だけ小文字、%3A、消したフォルダの中、フォルダの大文字・小文字の違い）
+        let gone = file_uri(&root.join("src/gone.rs"));
+        let upper = format!("file:///{}", gone["file:///".len()..].to_ascii_uppercase());
+        for (n, uri) in [
+            gone.clone(),
+            lower_drive(&gone),
+            percent_colon(&gone),
+            file_uri(&root.join("deleted/folder/x.rs")),
+            upper,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(check_message(&close(uri), &root).is_ok(), "{n}");
+        }
+        // 通さないもの：許可にない方法
+        for method in [
+            "workspace/executeCommand",
+            "workspace/didChangeConfiguration",
+            "textDocument/rename",
+        ] {
+            let message = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "textDocument": { "uri": inside } } });
+            assert!(check_message(&message, &root).is_err(), "{method}");
+        }
+        // 通さないもの（開く・閉じるの両方で）
+        let rejected = |uri: &str| {
+            check_message(&open(uri, ""), &root).is_err()
+                && check_message(&close(uri), &root).is_err()
+        };
+        let base = file_uri(&root);
+        let out_name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        for (n, uri) in [
+            // 0〜1：外（あるファイル・まだないファイル）
+            file_uri(&outside.join("secret.rs")),
+            file_uri(&outside.join("none.rs")),
+            // 2〜5：外を指すジャンクションの先（あるファイル・まだないファイル・さらに下のまだないフォルダの中・その小文字のドライブ名）
+            file_uri(&link.join("secret.rs")),
+            file_uri(&link.join("none.rs")),
+            file_uri(&link.join("deeper/none/x.rs")),
+            lower_drive(&file_uri(&link.join("deeper/none/x.rs"))),
+            // 6〜8：.. で外に出るもの（あるファイル・まだないファイル）と、.. で中に戻るまだないファイル（今までどおり断る）
+            format!("{base}/../{out_name}/secret.rs"),
+            format!("{base}/../{out_name}/none.rs"),
+            format!("{base}/src/../src/gone.rs"),
+            // 9：%5C で作る ..
+            format!("{base}/src/..%5C..%5C{out_name}%5Csecret.rs"),
+            // 10〜11：2 つ目より後ろの部分の :
+            format!("{inside}:x"),
+            format!("{base}/src/main.rs%3Ax"),
+            // 12〜14：\\?\ を URI に入れたもの
+            format!("file:////?/{}", &inside["file:///".len()..]),
+            old_file_uri(&root.join("src/main.rs")),
+            format!(
+                "file:///{}",
+                &old_file_uri(&root.join("src/main.rs"))["file://".len()..]
+            ),
+            // 15〜18：予約名
+            format!("{base}/src/NUL"),
+            format!("{base}/src/nul.txt"),
+            format!("{base}/src/con.rs"),
+            format!("{base}/src/COM1"),
+            // 19：末尾の .
+            format!("{base}/src/main.rs."),
+            // 20〜22：UNC、ドライブのない URI
+            "file://server/share/src/main.rs".to_string(),
+            "file:////server/share/src/main.rs".to_string(),
+            "file:///src/main.rs".to_string(),
+            // 23：file: でない
+            "untitled:a.rs".to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(rejected(uri), "{n} 番目を通した");
+        }
+        assert!(
+            check_message(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "textDocument/hover", "params": {} }),
+                &root
+            )
+            .is_err()
+        );
+        assert!(check_message(&json!({ "jsonrpc": "2.0", "id": 1 }), &root).is_err());
+        // 本文の大きさ
+        let limit = "a".repeat(MAX_FILE_SIZE as usize);
+        assert!(check_message(&open(&inside, &limit), &root).is_ok());
+        assert!(check_message(&open(&inside, &(limit.clone() + "a")), &root).is_err());
+    }
+
+    // locates_files_inside_the_workspace の Windows 版（段階 4 T2）。リンクはジャンクション
+    #[cfg(windows)]
+    #[test]
+    fn locates_files_inside_the_workspace_on_windows() {
+        let root = temp_dir("locate-root-win");
+        let outside = temp_dir("locate-outside-win");
+        std::fs::create_dir_all(root.join("src/bin")).unwrap();
+        std::fs::write(root.join("src/bin/a.rs"), "").unwrap();
+        std::fs::write(root.join("src/日本 語.rs"), "").unwrap();
+        std::fs::write(outside.join("secret.rs"), "").unwrap();
+        let link = root.join("link");
+        let _junction = Junction::new(&link, &outside);
+        let locate = |uri: &str| locate_in_workspace(&root, uri);
+        let a = file_uri(&root.join("src/bin/a.rs"));
+        // ドライブ名が小文字・%3A の URI も、同じ場所になる
+        for (n, uri) in [a.clone(), lower_drive(&a), percent_colon(&a)]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(locate(uri), Some("src/bin/a.rs".to_string()), "{n}");
+        }
+        assert_eq!(
+            locate(&file_uri(&root.join("src/日本 語.rs"))),
+            Some("src/日本 語.rs".to_string())
+        );
+        // .. を含んでも、中のファイルなら中
+        let base = file_uri(&root);
+        assert_eq!(
+            locate(&format!("{base}/src/../src/bin/a.rs")),
+            Some("src/bin/a.rs".to_string())
+        );
+        // 外、ジャンクションで外を指すもの、フォルダ、ないファイル、.. で外に出るもの、\\?\ を入れた URI、: のあるもの
+        let out_name = outside.file_name().unwrap().to_string_lossy().into_owned();
+        for (n, uri) in [
+            file_uri(&outside.join("secret.rs")),
+            file_uri(&link.join("secret.rs")),
+            file_uri(&root.join("src")),
+            file_uri(&root.join("src/none.rs")),
+            format!("{base}/../{out_name}/secret.rs"),
+            format!("{base}/src/..%5C..%5C..%5C{out_name}%5Csecret.rs"),
+            old_file_uri(&root.join("src/bin/a.rs")),
+            format!("{a}:x"),
+            "untitled:a.rs".to_string(),
+            "https://example.com/a.rs".to_string(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(locate(uri), None, "{n} 番目");
+        }
     }
 
     #[cfg(unix)]
@@ -1323,6 +2478,261 @@ mod tests {
         control.stop();
     }
 
+    // 段階 4 T9：Windows の偽のサーバー（examples/test_child.rs の lsp-server。perl の偽のサーバーと同じ動き）。
+    // 先に grandchild:<held> で孫を作る（孫は held のファイルを開いたままにし、終わると消える。pid を使わずに、
+    // 孫が残っていないかを held が消えたかで見る。孫は 30 秒で自分で終わる）
+    #[cfg(windows)]
+    fn fake_server_on_windows(ignore_shutdown: bool, held: &Path) -> Command {
+        let mut command = crate::process::command(crate::process::test_child_path());
+        command.arg(format!("grandchild:{}", held.display()));
+        command.arg(if ignore_shutdown {
+            "lsp-server:ignore-shutdown"
+        } else {
+            "lsp-server"
+        });
+        command
+    }
+
+    // 孫の印のファイル（テストごとに別の場所。前の回のものがあれば消す）
+    #[cfg(windows)]
+    fn held_file(name: &str) -> PathBuf {
+        let path = temp_dir(&format!("held-{name}")).join("grandchild.lock");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[cfg(windows)]
+    fn exits(events: &Arc<Mutex<Vec<LspEvent>>>) -> Vec<Option<i32>> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                LspEvent::Exited { code } => Some(*code),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // stop を別のスレッドで動かし、limit までに終わらなければ、分かる文で panic する。終わればかかった時間を返す（段階 4 T9）。
+    // panic したときは止まらないスレッドが残るが、テストのプログラムが終われば Job のハンドルが閉じ、偽のサーバーと孫も止まる
+    #[cfg(windows)]
+    fn stop_within(control: &Arc<LspControl>, limit: Duration) -> Duration {
+        let (done, finished) = mpsc::channel();
+        let target = control.clone();
+        let started = Instant::now();
+        thread::spawn(move || {
+            target.stop();
+            let _ = done.send(());
+        });
+        if finished.recv_timeout(limit).is_err() {
+            panic!(
+                "言語サーバーを止める処理が {limit:?} たっても終わらない（サーバーか、その子孫が止まっていない見込み）"
+            );
+        }
+        started.elapsed()
+    }
+
+    // relays_messages_and_stops_gracefully の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn relays_messages_and_stops_gracefully_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("graceful-win");
+        let held = held_file("graceful");
+        assert!(
+            !control
+                .start_with(
+                    fake_server_on_windows(false, &held),
+                    dir.clone(),
+                    dir.clone(),
+                    "a".to_string(),
+                    sink.clone()
+                )
+                .unwrap()
+        );
+        assert!(wait_until(|| held.exists()), "孫ができない");
+        control
+            .send_unchecked(r#"{"jsonrpc":"2.0","id":1,"method":"hello"}"#)
+            .unwrap();
+        // サーバーからの workspace/configuration には Rust 側で答え、画面には送らない
+        control
+            .send_unchecked(r#"{"jsonrpc":"2.0","method":"ask"}"#)
+            .unwrap();
+        assert!(
+            wait_until(|| {
+                events.lock().unwrap().iter().any(|event| matches!(event, LspEvent::Message { text } if text.contains("linkedProjects")))
+            }),
+            "configuration の答えが偽のサーバーに届かない"
+        );
+        // 同じパッケージなら起動し直さない
+        assert!(
+            control
+                .start_with(
+                    fake_server_on_windows(false, &held),
+                    dir.clone(),
+                    dir.clone(),
+                    "a".to_string(),
+                    sink
+                )
+                .unwrap()
+        );
+        let started = Instant::now();
+        control.stop();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "正式な終了で終わっていない（{elapsed:?}）"
+        );
+        let events_now = events.lock().unwrap().clone();
+        assert!(events_now.contains(&LspEvent::Message {
+            text: r#"{"echo":"hello","body":null}"#.to_string()
+        }));
+        assert!(!events_now.iter().any(|event| matches!(event, LspEvent::Message { text } if text.contains("workspace/configuration"))));
+        // 終わったことは 1 回だけ、終了コード 0 で知らせる
+        assert_eq!(exits(&events), vec![Some(0)]);
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+        assert!(control.send("{}").is_err());
+    }
+
+    // keeps_the_order_of_messages の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn keeps_the_order_of_messages_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("order-win");
+        let held = held_file("order");
+        control
+            .start_with(
+                fake_server_on_windows(false, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        for n in 0..200 {
+            control
+                .send_unchecked(&format!(r#"{{"jsonrpc":"2.0","method":"m{n}"}}"#))
+                .unwrap();
+        }
+        let echoed = |events: &[LspEvent]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    LspEvent::Message { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(wait_until(|| echoed(&events.lock().unwrap()).len() == 200));
+        let expected: Vec<String> = (0..200)
+            .map(|n| format!(r#"{{"echo":"m{n}","body":null}}"#))
+            .collect();
+        assert_eq!(echoed(&events.lock().unwrap()), expected);
+        control.stop();
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
+    // kills_server_that_ignores_shutdown の Windows 版（段階 4 T9）。止めたときの終了コードは、Unix ではシグナルなので None、
+    // Windows では TerminateJobObject に渡す KILLED_EXIT_CODE（win.rs）。
+    // 止める処理（Job で止める所）が壊れると、shutdown に答えない偽のサーバーが残り、stop が戻らない。テストが止まらずに
+    // 時間切れまで分からないので、stop_within で上限（STOP_WAIT + 10 秒）を付けて落とす。上限は止まらないときのためだけで、
+    // かかった時間の確かめ（STOP_WAIT 以上・+2 秒未満）は今までどおり
+    #[cfg(windows)]
+    #[test]
+    fn kills_server_that_ignores_shutdown_on_windows() {
+        let control = Arc::new(LspControl::default());
+        let (sink, events) = collector();
+        let dir = temp_dir("ignore-win");
+        let held = held_file("ignore");
+        control
+            .start_with(
+                fake_server_on_windows(true, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        assert!(wait_until(|| held.exists()), "孫ができない");
+        let elapsed = stop_within(&control, STOP_WAIT + Duration::from_secs(10));
+        assert!(
+            elapsed >= STOP_WAIT && elapsed < STOP_WAIT + Duration::from_secs(2),
+            "止めるのにかかった時間：{elapsed:?}"
+        );
+        let codes = exits(&events);
+        eprintln!("止めたときの Exited の code：{codes:?}");
+        assert_eq!(
+            codes,
+            vec![Some(crate::win::KILLED_EXIT_CODE as i32)],
+            "止めたときの Exited の code"
+        );
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
+    // reports_server_that_exits_by_itself の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn reports_server_that_exits_by_itself_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("quit-win");
+        let held = held_file("quit");
+        control
+            .start_with(
+                fake_server_on_windows(false, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        control
+            .send_unchecked(r#"{"jsonrpc":"2.0","method":"quit"}"#)
+            .unwrap();
+        assert!(
+            wait_until(|| exits(&events) == vec![Some(3)]),
+            "自分で終わったことを知らせない"
+        );
+        // 回収は次の停止のとき。ここでは 2 回目を知らせない。回収のときに孫も止める
+        control.stop();
+        assert_eq!(exits(&events), vec![Some(3)]);
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
+    // send_rejects_messages_outside_the_allow_list の Windows 版（段階 4 T9）
+    #[cfg(windows)]
+    #[test]
+    fn send_rejects_messages_outside_the_allow_list_on_windows() {
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        let dir = temp_dir("reject-win");
+        let held = held_file("reject");
+        control
+            .start_with(
+                fake_server_on_windows(false, &held),
+                dir.clone(),
+                dir,
+                "a".to_string(),
+                sink,
+            )
+            .unwrap();
+        let error = control
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"workspace/executeCommand","params":{"command":"x"}}"#)
+            .unwrap_err();
+        assert!(error.contains("workspace/executeCommand"), "{error}");
+        // 拒否したメッセージは偽のサーバーに届かない（届けば echo が返る）
+        thread::sleep(Duration::from_millis(200));
+        assert!(!events.lock().unwrap().iter().any(
+            |event| matches!(event, LspEvent::Message { text } if text.contains("executeCommand"))
+        ));
+        control.stop();
+        assert!(wait_until(|| !held.exists()), "孫のプロセスが残っている");
+    }
+
     // 偽のサーバー（perl）。受け取ったメッセージを、method と id だけにして返す。
     // 起動したら子（sleep）の pid を標準エラーに出す。shutdown には答え、exit で終わる。
     // ignore_shutdown なら shutdown に答えず、終わらない
@@ -1377,8 +2787,7 @@ mod tests {
         (sink, events)
     }
 
-    // 条件を満たすまで、2 秒まで待つ
-    #[cfg(unix)]
+    // 条件を満たすまで、2 秒まで待つ（段階 4 T9 から Windows の偽のサーバーのテストでも使う。前は cfg(unix)）
     fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
         (0..200).any(|_| {
             let met = condition();
@@ -1876,6 +3285,28 @@ mod tests {
         assert!(args.contains(&"--enable-config=false".to_string()));
     }
 
+    // 段階 4 T6：Windows では、--query-driver の glob の区切りを / で書く（\ の前に \ を置く形では、本物の clangd 23.1.0 が
+    // g++ のパスに合わせられず、bits/stdc++.h が見つからなかった）。glob の記号の前には、今までどおり \ を置く
+    #[cfg(windows)]
+    #[test]
+    fn writes_the_query_driver_with_slashes_on_windows() {
+        assert_eq!(
+            query_driver(Path::new(r"C:\Program Files\x\g++.exe")).unwrap(),
+            "C:/Program Files/x/g++.exe"
+        );
+        assert_eq!(
+            query_driver(Path::new(r"C:\Program Files (x86)\mingw64\bin\g++.exe")).unwrap(),
+            "C:/Program Files (x86)/mingw64/bin/g++.exe"
+        );
+        assert_eq!(
+            query_driver(Path::new(r"C:\x\[a]*\g++?")).unwrap(),
+            r"C:/x/\[a\]\*/g++\?"
+        );
+        assert!(query_driver(Path::new(r"C:\x,y\g++.exe")).is_err());
+        let args = clangd_args(Path::new(r"C:\mingw64\bin\g++.exe")).unwrap();
+        assert!(args.contains(&"--query-driver=C:/mingw64/bin/g++.exe".to_string()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn restarts_for_another_language() {
@@ -1917,7 +3348,9 @@ mod tests {
         control.stop();
     }
 
-    // 手元に clangd と g++-15 があるときだけ、本当の clangd で確かめる（D-210）
+    // 手元に clangd と g++-15 があるときだけ、本当の clangd で確かめる（D-210）。
+    // Windows では analyzes_cpp_with_local_clangd_on_windows（段階 4 T6。#[ignore] で、手で動かす）
+    #[cfg(not(windows))]
     #[test]
     fn analyzes_cpp_with_local_clangd() {
         let Ok(compiler) = crate::cpp::find_compiler(&crate::cpp::CppSettings::default()) else {
@@ -2014,7 +3447,175 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // 手元に basedpyright と CPython 3.13 があるときだけ、本当の basedpyright で確かめる（D-225）
+    // 段階 4 T6：本物の clangd（探す順で見つかるもの）と MinGW の g++ で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
+    // cargo test --lib -- --ignored --exact lsp::tests::analyzes_cpp_with_local_clangd_on_windows --nocapture
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、診断の数、子孫の exe の名前と数、かかった時間だけ
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "本物の clangd と MinGW の g++ を使う。手で 1 件だけ動かす（段階 4 T6）"]
+    fn analyzes_cpp_with_local_clangd_on_windows() {
+        let started = Instant::now();
+        let hide = |text: &str| {
+            let mut text = text.to_string();
+            for name in ["LOCALAPPDATA", "USERPROFILE"] {
+                if let Some(value) = std::env::var_os(name) {
+                    text = text.replace(&*value.to_string_lossy(), &format!("%{name}%"));
+                }
+            }
+            text
+        };
+        let compiler = crate::cpp::find_compiler(&crate::cpp::CppSettings::default())
+            .expect("g++.exe が見つからない");
+        let program = find_clangd("").expect("clangd が見つからない");
+        eprintln!("clangd：{}", hide(&program.to_string_lossy()));
+        eprintln!("g++：{}", hide(&compiler.to_string_lossy()));
+        eprintln!(
+            "--query-driver：{}",
+            hide(&query_driver(&compiler).unwrap())
+        );
+        let root = temp_dir("clangd-real-win");
+        let _ = std::fs::remove_dir_all(root.join("abc480"));
+        let package = root.join("abc480").join("abc480_a");
+        std::fs::create_dir_all(&package).unwrap();
+        let source = "#include <bits/stdc++.h>\nusing namespace std;\nint main() {\n    vector<int> a(3);\n    cout << a.size() << endl;\n}\nstruct P {\n    int f() { return 1; }\n};\n";
+        std::fs::write(package.join("main.cpp"), source).unwrap();
+        std::fs::write(package.join("compile_flags.txt"), "-std=gnu++23\n").unwrap();
+        let (dir, projects) = clangd_place(&root, &package);
+        let settings = crate::cpp::CppSettings::default();
+        let options = crate::cpp::compilation_database(&compiler, &projects, &settings);
+        let launch = clangd(dir, projects, &compiler, options, "").unwrap();
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        assert!(
+            !control
+                .start(root.clone(), launch, "a".to_string(), sink)
+                .unwrap()
+        );
+        let pid = control.server.lock().unwrap().as_ref().unwrap().child.id();
+        let uri = file_uri(&package.join("main.cpp"));
+        let wanted = path_of_uri(&uri);
+        let message = |text: String| control.send(&text).unwrap();
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "cpp", "version": 1, "text": source } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 3, "character": 6 } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 3, "method": "textDocument/documentSymbol", "params": { "textDocument": { "uri": uri } } }).to_string());
+        let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
+            events.lock().unwrap().iter().find_map(|event| match event {
+                LspEvent::Message { text } => {
+                    serde_json::from_str::<Value>(text).ok().filter(|m| pick(m))
+                }
+                _ => None,
+            })
+        };
+        let (mut diagnostics, mut definition, mut symbols) = (None, None, None);
+        for _ in 0..600 {
+            diagnostics = find(&|m| {
+                m["method"] == "textDocument/publishDiagnostics"
+                    && m["params"]["uri"].as_str().and_then(path_of_uri) == wanted
+            });
+            definition = find(&|m| m["id"] == 2);
+            symbols = find(&|m| m["id"] == 3);
+            if diagnostics.is_some() && definition.is_some() && symbols.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let diagnostics = diagnostics.expect("診断が届かない");
+        eprintln!(
+            "publishDiagnostics の URI の頭：{}",
+            drive_part(diagnostics["params"]["uri"].as_str().unwrap())
+        );
+        let list = diagnostics["params"]["diagnostics"].as_array().unwrap();
+        eprintln!("診断の数：{}", list.len());
+        for item in list.iter().take(3) {
+            eprintln!("  診断：{}", hide(item["message"].as_str().unwrap_or("")));
+        }
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
+        let (mut in_messages, mut in_logs) = (0, 0);
+        for event in events.lock().unwrap().iter() {
+            match event {
+                LspEvent::Message { text } => {
+                    in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Log { text } => {
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Exited { .. } => {}
+            }
+        }
+        eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        let children = crate::win::descendants(pid);
+        let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
+        names.sort();
+        eprintln!("止める前の子孫：{} 個 {names:?}", children.len());
+        control.stop();
+        assert!(!crate::win::has_job_record(pid), "Job の記録が残っている");
+        assert!(!crate::win::is_alive(pid), "clangd が残っている");
+        let gone = |child: u32| {
+            (0..100).any(|_| {
+                if crate::win::is_alive(child) {
+                    thread::sleep(Duration::from_millis(20));
+                    false
+                } else {
+                    true
+                }
+            })
+        };
+        let left: Vec<&str> = children
+            .iter()
+            .filter(|(child, _)| !gone(*child))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        // bits/stdc++.h が見つかり、診断は空（IDE の命令と --query-driver が効いている）
+        assert!(list.is_empty(), "診断が空でない（上の診断を見る）");
+        // vector の定義は MinGW の標準ヘッダーにあり、読み取り専用で開ける場所の中
+        let target = definition.expect("定義の答えが届かない")["result"][0]["uri"]
+            .as_str()
+            .expect("定義の答えに場所がない")
+            .to_string();
+        eprintln!("definition の URI の頭：{}", drive_part(&target));
+        let path = path_of_uri(&target).unwrap().canonicalize().unwrap();
+        assert!(
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .contains("/include/c++/"),
+            "標準ヘッダーの中でない"
+        );
+        let headers = crate::cpp::header_dirs(&compiler, None);
+        assert!(
+            crate::sources::read_source(&target, &headers, &[]).is_ok(),
+            "読み取り専用で読めない"
+        );
+        // 記号は入れ子の形。main と、P の中の f
+        let symbols = symbols.expect("記号の答えが届かない")["result"].clone();
+        let named = |list: &Value, name: &str| -> Value {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} がない"))
+        };
+        assert_eq!(
+            named(&symbols, "main")["selectionRange"]["start"]["line"],
+            2
+        );
+        assert_eq!(
+            named(&named(&symbols, "P")["children"], "f")["range"]["start"]["line"],
+            7
+        );
+        // パッケージ・コンテストのフォルダに .cache/ を作らない
+        assert!(!package.join(".cache").exists());
+        assert!(!root.join("abc480").join(".cache").exists());
+        eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 手元に basedpyright と CPython 3.13 があるときだけ、本当の basedpyright で確かめる（D-225）。
+    // Windows では analyzes_python_with_local_basedpyright_on_windows（段階 4 T7。#[ignore] で、手で動かす）
+    #[cfg(not(windows))]
     #[test]
     fn analyzes_python_with_local_basedpyright() {
         let Ok(interpreter) =
@@ -2141,6 +3742,389 @@ mod tests {
         };
         assert_eq!(names(&package), ["main.py"]);
         assert_eq!(names(&root.join("abc480")), ["abc480_a"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // URI の `file:///` のすぐあとの、ドライブ名と `:` の部分だけ（最大 8 文字。パスの残りは出さない）
+    #[cfg(windows)]
+    fn drive_part(uri: &str) -> String {
+        let rest = uri.strip_prefix("file:///").unwrap_or("");
+        let end = rest.find('/').unwrap_or(rest.len()).min(8);
+        format!("file:///{}", &rest[..end])
+    }
+
+    // 段階 4 T5：本物の rust-analyzer（stable の component）で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
+    // cargo test --lib -- --ignored --exact lsp::tests::analyzes_rust_with_local_rust_analyzer --nocapture
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、版、子孫の exe の名前と数だけ
+    // （作業領域のパスと利用者のフォルダの名前は出さない）
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "本物の rust-analyzer を使う（読み込みと cargo check が重い）。手で 1 件だけ動かす（段階 4 T5）"]
+    fn analyzes_rust_with_local_rust_analyzer() {
+        let started = Instant::now();
+        let root = temp_dir("rust-analyzer-real");
+        let package = root.join("abc480_a");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        // 依存クレートはない（cargo check がネットにつながない）
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"abc480_a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        let source = "fn main() {\n    let v: Vec<i32> = Vec::new();\n    let x: i32 = \"a\";\n    println!(\"{} {}\", v.len(), x);\n}\n";
+        std::fs::write(package.join("src/main.rs"), source).unwrap();
+        // IDE と同じ命令（toolchain::cargo_command）で版を見る。テストのプロセスに RUSTUP_TOOLCHAIN（src-tauri/rust-toolchain.toml
+        // の版）があっても外れて、既定の toolchain が選ばれる（rust-toolchain.toml の版には rust-analyzer の component がない見込み）
+        eprintln!(
+            "RUSTUP_TOOLCHAIN（テストのプロセス）：{}",
+            if std::env::var_os("RUSTUP_TOOLCHAIN").is_some() {
+                "あり"
+            } else {
+                "なし"
+            }
+        );
+        let program = find_rust_analyzer().expect("rust-analyzer（rustup の代理）が見つからない");
+        let version = toolchain::cargo_command(&program, &package)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            version.status.success(),
+            "rust-analyzer --version が失敗した（src-tauri/rust-toolchain.toml の版が選ばれたかもしれない）：{}",
+            String::from_utf8_lossy(&version.stderr).trim()
+        );
+        eprintln!(
+            "rust-analyzer の版：{}",
+            String::from_utf8_lossy(&version.stdout).trim()
+        );
+        // 起動の前の確かめ（check_rust_analyzer_component の --version）で、起動が遅れる時間を 5 回測る（段階 4 T5）
+        let times: Vec<String> = (0..5)
+            .map(|_| {
+                let begin = Instant::now();
+                check_rust_analyzer_component(&program, &package).unwrap();
+                format!("{:.0}", begin.elapsed().as_secs_f64() * 1000.0)
+            })
+            .collect();
+        eprintln!(
+            "起動の前の確かめにかかった時間（ミリ秒）：{}",
+            times.join("・")
+        );
+        let (dir, projects) = analyzer_place(&root, &package);
+        let launch = rust_analyzer(dir, projects).unwrap();
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        assert!(
+            !control
+                .start(root.clone(), launch, "a".to_string(), sink)
+                .unwrap()
+        );
+        let pid = control.server.lock().unwrap().as_ref().unwrap().child.id();
+        let uri = file_uri(&package.join("src/main.rs"));
+        let wanted = path_of_uri(&uri);
+        let message = |text: String| control.send(&text).unwrap();
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "rust", "version": 1, "text": source } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didSave", "params": { "textDocument": { "uri": uri } } }).to_string());
+        let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
+            events.lock().unwrap().iter().find_map(|event| match event {
+                LspEvent::Message { text } => {
+                    serde_json::from_str::<Value>(text).ok().filter(|m| pick(m))
+                }
+                _ => None,
+            })
+        };
+        // 型の誤り（cargo check の E0308）の診断が届くまで、120 秒まで待つ。診断の URI は、サーバーの返した形のまま
+        // path_of_uri で戻して比べる（ドライブ名の大文字・小文字や %3A の違いがあっても同じファイル）
+        let mut diagnostics = None;
+        for _ in 0..1200 {
+            diagnostics = find(&|m| {
+                m["method"] == "textDocument/publishDiagnostics"
+                    && m["params"]["uri"].as_str().and_then(path_of_uri) == wanted
+                    && m["params"]["diagnostics"]
+                        .as_array()
+                        .is_some_and(|list| !list.is_empty())
+            });
+            if diagnostics.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let diagnostics = diagnostics.expect("診断が届かない");
+        let diagnostic_uri = diagnostics["params"]["uri"].as_str().unwrap().to_string();
+        eprintln!(
+            "publishDiagnostics の URI の頭：{}",
+            drive_part(&diagnostic_uri)
+        );
+        eprintln!(
+            "診断の数：{}",
+            diagnostics["params"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len()
+        );
+        // サーバーの返した形の URI でも、作業領域の中と見なす
+        assert!(check_message(&json!({ "jsonrpc": "2.0", "method": "textDocument/didClose", "params": { "textDocument": { "uri": diagnostic_uri } } }), &root).is_ok());
+        // Vec の定義（標準ライブラリ。rust-src の中）。読み込みが終わる前は空の答えのことがあるので、10 回まで聞き直す
+        let mut target = None;
+        for attempt in 0..10 {
+            let id = 100 + attempt;
+            message(json!({ "jsonrpc": "2.0", "id": id, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 1, "character": 11 } } }).to_string());
+            let mut answer = None;
+            for _ in 0..300 {
+                answer = find(&|m| m["id"] == id);
+                if answer.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let first = &answer.expect("定義の答えが届かない")["result"][0];
+            target = first["uri"]
+                .as_str()
+                .or_else(|| first["targetUri"].as_str())
+                .map(str::to_string);
+            if target.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+        let target = target.expect("定義の答えに場所がない");
+        eprintln!("definition の URI の頭：{}", drive_part(&target));
+        let found = crate::sources::read_source(&target, &[], &[])
+            .expect("定義の行き先を読み取り専用で読めない");
+        assert!(found.content.contains("pub struct Vec"));
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
+        let (mut in_messages, mut in_logs) = (0, 0);
+        for event in events.lock().unwrap().iter() {
+            match event {
+                LspEvent::Message { text } => {
+                    in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Log { text } => {
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Exited { .. } => {}
+            }
+        }
+        eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        // 止めたあと、Job の記録と子孫のプロセス（rust-analyzer・cargo など）が残らない
+        let children = crate::win::descendants(pid);
+        let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
+        names.sort();
+        eprintln!("止める前の子孫：{} 個 {names:?}", children.len());
+        control.stop();
+        assert!(!crate::win::has_job_record(pid), "Job の記録が残っている");
+        assert!(
+            !crate::win::is_alive(pid),
+            "rust-analyzer（代理）が残っている"
+        );
+        // 2 秒まで、終わるのを待つ
+        let gone = |child: u32| {
+            (0..100).any(|_| {
+                if crate::win::is_alive(child) {
+                    thread::sleep(Duration::from_millis(20));
+                    false
+                } else {
+                    true
+                }
+            })
+        };
+        let left: Vec<&str> = children
+            .iter()
+            .filter(|(child, _)| !gone(*child))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 段階 4 T7：本物の basedpyright（探す順で見つかるもの）と CPython 3.13 で確かめる。重いので、いつもは動かさず、手で 1 件だけ動かす：
+    // cargo test --lib -- --ignored --exact lsp::tests::analyzes_python_with_local_basedpyright_on_windows --nocapture
+    // 出すのは、URI のドライブ名と : の部分、`\\?\`・%5C%5C%3F の形の件数、診断の数、子孫の exe の名前と数、かかった時間だけ
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "本物の basedpyright（node）と CPython を使う。手で 1 件だけ動かす（段階 4 T7）"]
+    fn analyzes_python_with_local_basedpyright_on_windows() {
+        let started = Instant::now();
+        let hide = |text: &str| {
+            let mut text = text.to_string();
+            for name in ["LOCALAPPDATA", "USERPROFILE"] {
+                if let Some(value) = std::env::var_os(name) {
+                    text = text.replace(&*value.to_string_lossy(), &format!("%{name}%"));
+                }
+            }
+            text
+        };
+        let interpreter =
+            crate::python::find_interpreter(&crate::python::PythonSettings::default())
+                .expect("CPython 3.13 が見つからない");
+        let program = find_basedpyright("").expect("basedpyright が見つからない");
+        eprintln!("basedpyright：{}", hide(&program.to_string_lossy()));
+        eprintln!("処理系：{}", hide(&interpreter.to_string_lossy()));
+        let typeshed = basedpyright_typeshed("").expect("typeshed が見つからない");
+        eprintln!("typeshed：{}", hide(&typeshed.to_string_lossy()));
+        let root = temp_dir("basedpyright-real-win");
+        let _ = std::fs::remove_dir_all(root.join("abc480"));
+        let package = root.join("abc480").join("abc480_a");
+        std::fs::create_dir_all(&package).unwrap();
+        let source = "import sys\nfrom collections import deque\n\n\ndef main():\n    n = int(input())\n    q = deque()\n    print(n + \"a\")\n\n\nmain()\n";
+        std::fs::write(package.join("main.py"), source).unwrap();
+        let (dir, projects) = basedpyright_place(&root, &package);
+        let launch = basedpyright(dir, projects, Some(&interpreter), "").unwrap();
+        let control = LspControl::default();
+        let (sink, events) = collector();
+        assert!(
+            !control
+                .start(root.clone(), launch, "a".to_string(), sink)
+                .unwrap()
+        );
+        let pid = control.server.lock().unwrap().as_ref().unwrap().child.id();
+        let uri = file_uri(&package.join("main.py"));
+        let wanted = path_of_uri(&uri);
+        let message = |text: String| control.send(&text).unwrap();
+        message(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": { "workspace": { "configuration": true } } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }).to_string());
+        message(json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": { "uri": uri, "languageId": "python", "version": 1, "text": source } } }).to_string());
+        let find = |pick: &dyn Fn(&Value) -> bool| -> Option<Value> {
+            events.lock().unwrap().iter().find_map(|event| match event {
+                LspEvent::Message { text } => {
+                    serde_json::from_str::<Value>(text).ok().filter(|m| pick(m))
+                }
+                _ => None,
+            })
+        };
+        // 処理系を受け取ってから調べるので、空でない診断が届いてから問い合わせる（60 秒まで待つ）
+        let mut diagnostics = None;
+        for _ in 0..600 {
+            diagnostics = find(&|m| {
+                m["method"] == "textDocument/publishDiagnostics"
+                    && m["params"]["uri"].as_str().and_then(path_of_uri) == wanted
+                    && m["params"]["diagnostics"]
+                        .as_array()
+                        .is_some_and(|list| !list.is_empty())
+            });
+            if diagnostics.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        message(json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": { "textDocument": { "uri": uri }, "position": { "line": 6, "character": 9 } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 3, "method": "textDocument/documentSymbol", "params": { "textDocument": { "uri": uri } } }).to_string());
+        message(json!({ "jsonrpc": "2.0", "id": 4, "method": "textDocument/inlayHint", "params": { "textDocument": { "uri": uri }, "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 11, "character": 0 } } } }).to_string());
+        let (mut definition, mut symbols, mut hints) = (None, None, None);
+        for _ in 0..600 {
+            definition = find(&|m| m["id"] == 2);
+            symbols = find(&|m| m["id"] == 3);
+            hints = find(&|m| m["id"] == 4);
+            if definition.is_some() && symbols.is_some() && hints.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let diagnostics = diagnostics.expect("診断が届かない");
+        eprintln!(
+            "publishDiagnostics の URI の頭：{}",
+            drive_part(diagnostics["params"]["uri"].as_str().unwrap())
+        );
+        let list = diagnostics["params"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .clone();
+        eprintln!("診断の数：{}", list.len());
+        // サーバーの答えとログに、`\\?\`・%5C%5C%3F の形が何回出たか（中身は出さない）
+        let (mut in_messages, mut in_logs) = (0, 0);
+        for event in events.lock().unwrap().iter() {
+            match event {
+                LspEvent::Message { text } => {
+                    in_messages += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Log { text } => {
+                    in_logs += text.matches(r"\\?\").count() + text.matches("%5C%5C%3F").count()
+                }
+                LspEvent::Exited { .. } => {}
+            }
+        }
+        eprintln!("\\\\?\\ の形の数：答え {in_messages}、ログ {in_logs}");
+        let children = crate::win::descendants(pid);
+        let mut names: Vec<&str> = children.iter().map(|(_, name)| name.as_str()).collect();
+        names.sort();
+        eprintln!("止める前の子孫：{} 個 {names:?}", children.len());
+        control.stop();
+        assert!(!crate::win::has_job_record(pid), "Job の記録が残っている");
+        assert!(!crate::win::is_alive(pid), "basedpyright が残っている");
+        let gone = |child: u32| {
+            (0..100).any(|_| {
+                if crate::win::is_alive(child) {
+                    thread::sleep(Duration::from_millis(20));
+                    false
+                } else {
+                    true
+                }
+            })
+        };
+        let left: Vec<&str> = children
+            .iter()
+            .filter(|(child, _)| !gone(*child))
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert!(left.is_empty(), "止めたあとも残っている子孫：{left:?}");
+        // standard の検査：型の誤りは誤り（1）、使っていない import は目立たない印（4）。既定の厳しい検査（2）は出ない
+        let lines: Vec<(u64, u64)> = list
+            .iter()
+            .map(|d| {
+                (
+                    d["range"]["start"]["line"].as_u64().unwrap(),
+                    d["severity"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(lines.contains(&(7, 1)), "型の誤りの診断がない");
+        assert!(lines.contains(&(0, 4)), "使っていない import の印がない");
+        assert!(
+            lines.iter().all(|(_, severity)| *severity != 2),
+            "厳しい検査の警告が出た"
+        );
+        // deque の定義は basedpyright の typeshed にあり、読み取り専用で開ける場所の中
+        let target = definition.expect("定義の答えが届かない")["result"][0]["uri"]
+            .as_str()
+            .expect("定義の答えに場所がない")
+            .to_string();
+        eprintln!("definition の URI の頭：{}", drive_part(&target));
+        let path = path_of_uri(&target).unwrap().canonicalize().unwrap();
+        assert!(path.starts_with(&typeshed), "typeshed の中でない");
+        assert!(
+            crate::sources::read_source(&target, &[], std::slice::from_ref(&typeshed))
+                .expect("読み取り専用で読めない")
+                .content
+                .contains("class deque")
+        );
+        // 記号は入れ子の形。main の中に n・q
+        let symbols = symbols.expect("記号の答えが届かない")["result"].clone();
+        assert_eq!(symbols[0]["name"], "main");
+        let children: Vec<&str> = symbols[0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(children, ["n", "q"]);
+        // インレイヒント（戻り値の型）
+        let hints = hints.expect("インレイヒントが届かない")["result"].to_string();
+        assert!(hints.contains("-> None"), "戻り値の型のヒントがない");
+        // パッケージ・コンテストのフォルダにファイルを作らない
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&package), ["main.py"]);
+        assert_eq!(names(&root.join("abc480")), ["abc480_a"]);
+        eprintln!("かかった時間：{:.1} 秒", started.elapsed().as_secs_f64());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
