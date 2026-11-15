@@ -1901,6 +1901,60 @@ PR と merge
 - 進め方は段階 4 と同じ：各コミットの前に報告して待つ。コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。
   時間を測るテストが落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する。止まらなくなるおそれのあるテストは、外から上限を付けて動かす
 
+結果（2026-11-15）
+
+T2（b172567）
+- lsp.rs の override_initialize の終わりに、capabilities.workspace がない・オブジェクトでないときは `{}` を作り、configuration を true にする行を足した（cfg なし。両方の OS）
+- 本物のテストの initialize は、画面と同じ道を通る（テストの control.send → LspControl::send → send_checked → Server::send → check_message → override_initialize。画面の lsp_send も同じ control.send）。コードを読んで確かめた
+- 直す前の失敗：overrides_initialize_on_windows（capabilities に workspace がない）、declares_workspace_configuration（新。4 つの形とも合わない）、
+  analyzes_python_with_local_basedpyright_on_windows（initialize を `{"capabilities": {}}` にした。「Python was not found」3 回で落ちた。severity 2 は 4 件、診断は 5 件）
+- 直したあと：上の 3 件が通った。本物の basedpyright は「Python was not found」0 回、severity 2 は 0 件、診断は 3 件（0.8 秒）
+- 外す確かめ：configuration を true にする行を消すと 2 件が落ち、workspace を作る所を消すと declares_workspace_configuration が落ちた（数の形で serde_json が panic）。
+  どちらも控えから戻し、ハッシュが外す前と同じことを確かめた
+- 本物の rust-analyzer（23.5 秒）・clangd（4.9 秒）のテストも通った。rust-analyzer に workspace/configuration の問い合わせが来るようになったかは、このテストでは見ていない
+- 手元の確かめ（AC 電源）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 398 通過・0 失敗・9 無視（lib 36.31 秒）、npm test 15 件・0 失敗、npm run build 通過
+
+push 1 と CI
+- cfe4cca・b172567 の 2 コミットを `git push -u origin lsp-workspace-configuration` で送った（新しいブランチ。--force なし。利用者の許可を得てから）。
+  push の前に、利用者が自分の窓で送る差分とメッセージを照らし合わせた。AtCoder のユーザー名・パスワードは 0 件。REVEL_SESSION は 1 件で、T1 の「…REVEL_SESSION で照らし合わせた（どれも 0 件）」の説明の行（Cookie の名前の語で、値ではない）だった
+- run #39（b172567）：macos-latest・windows-latest とも success（利用者がブラウザで見た）
+
+| OS | lib | 見たテスト |
+| --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out（34.94 秒） | overrides_initialize_and_answers_configuration ... ok、declares_workspace_configuration ... ok |
+| Windows | 398 通過・0 失敗・8 無視・1 filtered out（64.88 秒） | declares_workspace_configuration ... ok |
+
+- npm test は両方の OS で 15 件・0 失敗
+- cfg(unix) の overrides_initialize_and_answers_configuration は、直す前に落ちることは確かめていない（手元で動かないため）。直したあとに CI の macOS で通った
+
+画面の確かめ（T3。release の exe。利用者が操作した。ログインも提出もしていない）
+- 直す前：36fa3b2 から作った exe（2026-11-15 01:43:22・10,147,840 バイト。0927ed2 とコードが同じ）。直したあと：b172567 から作り直した exe
+  （`npm run tauri build -- --no-bundle`、AC 電源。2026-11-15 16:24:43・10,148,864 バイト。ビルドは 4 分 12 秒、error・warning の行は 0、ビルドのあとの git status は 0 行）
+- どちらの確かめの前と後も、アプリと言語サーバーのプロセスは 0、settings.json のハッシュは始める前と同じだった
+- 前提：p1/main.py で「実行」を押すと、どちらの exe でも TypeError（unsupported operand type(s) for +: 'int' and 'str'）が出た。IDE はローカルの CPython 3.13.7 を見つけている
+
+| 見たこと | 直す前 | 直したあと |
+| --- | --- | --- |
+| p1：実行ログの「[basedpyright] 起動しました：p1」のあとの「Python was not found」 | 3 回 | 0 回（起動しましたの 1 行だけ） |
+| p1：1 行目 `import sys` | 黄の下線・黄の背景・行末のメッセージ（警告） | 目に見える印なし |
+| p1：2 行目・4 行目 | 印なし | 印なし |
+| p1：8 行目 `q = deque()` | 黄の下線・黄の背景・行末のメッセージ（hover は「Type of "q" is partially unknown」など） | 印なし |
+| p1：9 行目 | 赤の下線・赤の背景・行末のメッセージ。hover は「Operator "+" not supported…」と「Argument type is unknown…」 | 赤の下線・赤の背景・行末のメッセージ。hover は「Operator "+" not supported…」だけ |
+| r1/src/main.rs | ⑤ の WARN notify error 2 回、準備完了。5 行目に赤の印。F12 で util.rs へ、Shift+F12 で main.rs の 6 行目と 1 行目 | 同じ。新しい WARN・ERROR の行はなし |
+| c1/main.cpp | ④ が 1 回。7 行目に赤の印 | 同じ |
+
+- 直したあとの p1 の印は、本物の basedpyright のテストの standard の検査（severity 2 が出ない）と合う
+- 1 行目の使っていない import は、本物のテストでは hint（severity 4）が出ているが、画面では目に見える印がなかった。画面の側で hint を捨てる所はない
+  （errorLens.ts:42 が背景とメッセージを誤りと警告だけに付けるだけ。下線は @codemirror/lint の決まりの色で描かれるはず）。見えなかった理由は未確認
+
+残ること
+- 処理系が見つからないとき（find_interpreter が Err）は、basedpyright_configuration が `"python": {}` を返すので、直したあとも basedpyright が PATH の python を探し、
+  「Python was not found」が残る見込み（推測。確かめていない）
+- macOS の画面と、macOS の本物の言語サーバーでは確かめていない（確かめたのは CI の macos-latest の単体のテストだけ。macOS 向けの本物の basedpyright のテストは CI では飛んでいる見込み）
+- rust-analyzer に workspace/configuration の問い合わせが来るようになったかは未確認（答えるのは Rust の側なので、テストの事象にも画面にも出ない）。本物のテストと画面の動きは変わらなかった
+- 画面で hint の印が目に見えなかった理由（上）
+- ①②⑥ は、この PR を merge したあとで、別のブランチで扱う
+
 ### 段階 5：提出
 
 何を変えるか
