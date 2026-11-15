@@ -2041,6 +2041,72 @@ CI（どちらも macos-latest・windows-latest とも success。数字は利用
 - 進め方は前と同じ：各コミットの前に報告して待つ。コミットの前に cargo fmt・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。
   時間を測るテストが落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する
 
+結果（2026-11-15）
+
+T2（a9984d5。①②）
+- src/editor/lspExit.ts（新）の exitReport が、終わりの行と状態を決める。IDE が止めた（endedByItself が false）なら「[名前] 止めました」（終了コードは付けない）で停止、
+  自分で終わったなら今までどおり（読み込みのあとは「止まりました（終了コード X）」、前は「起動に失敗しました…」）
+- lsp.ts：Log の受け口で「<接続のサーバーの名前> が終わりました」を受けたら connection.endedByItself を立てる（closed の確かめの外）。handleExit は exitReport を使い、
+  行と状態を終わった接続の名前（connection.server）で出す。標準エラーの行・送れないときの警告・開発者ツールの console の行（handleExit・Log の受け口・送れないとき）も接続の名前にした
+- 直す前の失敗：tests/lspExit.test.ts の ① のテストが、6 つの形（ready が false・true × 終了コード 0・-525598719・null）とも合わずに落ちた。外す確かめ（「IDE が止めた」の塊を外す）でも同じテストが落ちた
+- テストが守らないこと：Log の受け口で印を立てる所、handleExit が connection.server を渡す所、状態の表示が終わった接続の名前になること（画面で見た。下）
+
+T3（86dff70。⑥）
+- src/editor/lspSync.ts（新）の ServerFiles が、今つながっているサーバーに didOpen を送ったファイルだけを覚え、そのファイルを閉じるときだけ didClose を送ってよいとする。
+  workspace.ts の IdeWorkspace が、connected・disconnected（ライブラリの disconnect() の最後に呼ばれる空の関数の上書き）・openFile・closeFile で使う。lsp.ts の順番は変えていない
+- npm test から workspace.ts を読み込めるかは、コードを読んで決めた（動かして確かめていない。拡張子のない相対の import があり、Node の ESM では読み込めない見込み）。
+  そのため、判断を純粋なファイル（lspSync.ts）に分けて npm test で守った
+- 切れているあいだ（disconnect のあと、次の connect の前）に IdeWorkspace.openFile が呼ばれる道はない（コードを読んで確かめた）。LSP の拡張を付けるのは lsp.ts の attach の 1 か所だけで、
+  新しいサーバーのときは client.connect と initializing を待ったあと、すでに動いているときは current がある（つながっている）ときだけ。タブの状態を入れ替えるときは withoutLsp を通す（Editor.tsx）
+- 直す前の失敗：tests/lspSync.test.ts の 1 件が、6 つの並びのうち 3 つ（再起動、自分で終わって切れたあと、開いていないファイルと 2 回目の close）で合わずに落ちた。
+  外す確かめ（takeForClose をいつも true に戻す）でも同じ 3 つで落ちた
+- テストが守らないこと：workspace.ts の中で ServerFiles を使う所、ライブラリが disconnect() の最後に workspace.disconnected() を呼ぶこと（画面の ⑥ で見た。下）
+
+手元の確かめ（どちらのコミットも、AC 電源）：cargo fmt --check 差なし、cargo clippy --all-targets 警告 0、cargo test 398 通過・0 失敗・9 無視、npm test は T2 で 19 件・T3 で 20 件とも 0 失敗、npm run build 通過（tsc を含む）
+
+push の前の照らし合わせ（やり方を変えた）
+- 利用者の cmd の findstr が、日本語（UTF-8）のすぐあとの英字を見落とした。`git log -p … | findstr /i /c:"REVEL_SESSION"` は、chcp 65001 にしても 0 件だったが、
+  PowerShell で数えると 2 行（T1 のメッセージと計画書の説明の行）あった。前の字が「（」「。」のためと見ている（推測）
+- そこで、git 自身に探させる形に変えた：中身は `git log -S"<語>" --format=%h <範囲>`、メッセージは `git log -i --grep="<語>" --format=%h <範囲>`。範囲は origin/main..lsp-log-fixes と 92adb32..lsp-log-fixes
+- 結果：REVEL_SESSION（やり方の確かめ）は、-S も --grep も a98656c だけ（T1 の説明の行。値ではない）。AtCoder のユーザー名・パスワードは、Claude が書いたコミットのメッセージとファイルの中身のどちらにも 0 件
+- これからの照らし合わせも、git log -S と -i --grep の形で行う
+
+push 1 と CI
+- a98656c・a9984d5・86dff70 の 3 コミットを `git push -u origin lsp-log-fixes` で送った（新しいブランチ。--force なし。利用者の許可を得てから）
+- run #43（86dff70）：macos-latest・windows-latest とも success（利用者がブラウザで見た）
+
+| OS | lib | npm test |
+| --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out（43.49 秒） | 20 件・0 失敗 |
+| Windows | 398 通過・0 失敗・8 無視・1 filtered out（70.65 秒） | 20 件・0 失敗 |
+
+- Annotations は Node.js 20 の非推奨の warning（両方の OS）と macOS の runner の混雑の知らせだけ
+
+画面の確かめ（T4。release の exe。利用者が操作した。ログインも提出もしていない）
+- 直す前：b172567 から作った exe（2026-11-15 16:24:43・10,148,864 バイト）。b172567 と 00a3637 のあいだで変わったのは計画書だけ（`git diff --stat b172567 00a3637`）なので、今の main とコードが同じ。
+  直したあと：86dff70 から作り直した exe（`npm run tauri build -- --no-bundle`、AC 電源。2026-11-15 21:10:29・10,148,864 バイト、SHA-256 344A58F6BB3ED84F398EC40BC88C02BA8842CBD59AF9412A909D34145ECE7716。
+  ビルドは 4 分 43 秒、error・warning の行は 0、ビルドのあとの git status は 0 行）。大きさが直す前と同じなのは、画面のコードだけの変更で、縮めて exe に入るためと見ている（推測）。
+  新しい画面が入っていることは、「止めました」の行が出たことで確かめた
+- どちらの確かめの前と後も、アプリと言語サーバーのプロセスは 0、settings.json のハッシュは始める前と同じだった
+
+| 見たこと | 直す前 | 直したあと |
+| --- | --- | --- |
+| ①：r1/src/main.rs を開き、読み込み中に acd-t10-lsp を開き直す（どちらも 1 回目で間に合った） | 「[rust-analyzer] 起動しました：r1」→「ERROR orphan DidCloseTextDocument: …\c1\main.cpp」→「[rust-analyzer] 起動に失敗しました。読み込みが終わる前に止まりました（終了コード -525598719）」。状態は「起動に失敗」 | 「[rust-analyzer] 起動しました：r1」→「[rust-analyzer] 止めました」→「[clangd] 起動しました：c1」→「[clangd] 止めました」→「[rust-analyzer] 起動しました：r1」→「[rust-analyzer] 止めました」。状態は「停止」。orphan も「起動に失敗」も出なかった |
+| ②：r1 のあとに c1/main.cpp を開く | 「[clangd] 止まりました（終了コード 0）」→「[clangd] 起動しました：c1」→ ④ | 「[rust-analyzer] 止めました」→「[clangd] 起動しました：c1」→ ④ |
+| ②：そのあとに p1/main.py を開く | 「[basedpyright] 止まりました（終了コード 0）」→「[basedpyright] 起動しました：p1」。状態は数秒「読み込み中」のあと「準備完了」 | 「[clangd] 止めました」→「[basedpyright] 起動しました：p1」。状態は同じ |
+| ⑥：r1 で「準備完了」まで待ち、「言語サーバーを再起動」 | 「[rust-analyzer] 再起動します」→「[rust-analyzer] 起動しました：r1」→「ERROR orphan DidCloseTextDocument: …\r1\src\main.rs」→ ⑤ が 2 回。再起動のあとも 5 行目に赤の印 | 「[rust-analyzer] 再起動します」→「[rust-analyzer] 起動しました：r1」→ ⑤ が 2 回。orphan は出なかった。再起動のあとも 5 行目に赤の印（didOpen が新しいサーバーに届いている） |
+
+- ① の直す前の c1/main.cpp の orphan は、起動のときに前の C++ のタブが開き直されていて、r1 に切り替えたときの didClose が新しい rust-analyzer に届いたものと見ている（推測。⑥ と同じ仕組み）。
+  直したあとは出なかった。直したあとの ① で行が多いのは、起動のときに前のタブが開き直されてサーバーが入れ替わったため（推測）
+- ⑥ の再起動では、直したあとも「止めました」の行は出ない。restartLsp は、止める前に current を外すので、前のサーバーの終わりの知らせは handleExit に届かない（コードを読んで確かめた。直す前も同じ）
+
+残ること
+- 実行ログの ④（clangd の「System include extraction: driver clang not found in PATH」）・⑤（rust-analyzer の「WARN notify error…」）・⑦（参照の一覧の見出しのドライブ名の形）は、この直しの範囲の外で、残る
+- Tauri のチャンネルが、送った順に届くこと（自分で終わったときに、Log が Exited より先に届くこと）の決まりは未確認。画面では、自分で終わる場合を起こしていないので見ていない（下）
+- 状態の表示が、終わった接続の名前（例「rust-analyzer：停止」）を一瞬出すことは、速くて読めなかった（② の c1 のとき）。① では「停止」と読めた
+- サーバーが自分で終わったとき（読み込みのあとの「止まりました」、前の「起動に失敗しました」）を、画面では起こしていない（npm test の exitReport のテストだけ）
+- macOS の画面では確かめていない（確かめたのは CI の macos-latest の npm test だけ）
+
 ### 段階 5：提出
 
 何を変えるか
