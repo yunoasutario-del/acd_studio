@@ -13,6 +13,7 @@ import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { IS_WINDOWS } from "../panels/logLinks";
 import { canonicalUri } from "./lspUri";
+import { ServerFiles } from "./lspSync";
 
 class IdeFile implements WorkspaceFile {
   constructor(
@@ -54,6 +55,8 @@ function canonical(uri: string): string {
 export class IdeWorkspace extends Workspace {
   files: IdeFile[] = [];
   private fileVersions: Record<string, number> = Object.create(null);
+  // 今のサーバーに開いたファイル（didClose を送ってよいか。実行ログの直し ⑥）
+  private readonly serverFiles = new ServerFiles();
 
   constructor(
     client: ConstructorParameters<typeof Workspace>[0],
@@ -100,23 +103,35 @@ export class IdeWorkspace extends Workspace {
     const file = new IdeFile(uri, languageId, this.nextFileVersion(uri), view.state.doc, view);
     this.files.push(file);
     this.client.didOpen(file);
+    this.serverFiles.markOpened(file.uri);
   }
 
   closeFile(uri: string) {
     const file = this.getFile(uri);
     if (file?.getView()) {
       this.files = this.files.filter((other) => other !== file);
-      this.client.didClose(uri);
+      // 今のサーバーに開いたファイルだけ閉じる。切れているあいだに頼むと、次のサーバーに届くため（⑥）
+      if (this.serverFiles.takeForClose(file.uri)) {
+        this.client.didClose(uri);
+      }
     }
   }
 
-  // 接続したら、開いているファイル（ビューがあるもの）だけを rust-analyzer に知らせる
+  // 接続したら、開いているファイル（ビューがあるもの）だけを言語サーバーに知らせる
   connected() {
+    const opened: string[] = [];
     for (const file of this.files) {
       if (file.getView()) {
         this.client.didOpen(file);
+        opened.push(file.uri);
       }
     }
+    this.serverFiles.connected(opened);
+  }
+
+  // 切れた（ライブラリの disconnect() の最後に呼ばれる）。このあとの closeFile では didClose を送らない（⑥）
+  disconnected() {
+    this.serverFiles.disconnected();
   }
 
   // 仮のファイル（ディスクの内容）を足す。すでにあれば何もしない
