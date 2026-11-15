@@ -37,6 +37,7 @@ import { inlayHints, QUIESCENT_EVENT } from "./inlayHints";
 import { sanitizeDocHTML } from "./sanitize";
 import { isCppPath, isPythonPath } from "./language";
 import { toOutline, type OutlineNode } from "./breadcrumbTrail";
+import { exitReport } from "./lspExit";
 
 // 開いているファイルを言語サーバーにつないだ合図。パンくずリストが記号を聞き直す（Phase 18 作業 2。D-216）
 export const ATTACHED_EVENT = "lsp-attached";
@@ -78,17 +79,28 @@ function languageIdFor(path: string): string {
   return isCppPath(path) ? "cpp" : isPythonPath(path) ? "python" : "rust";
 }
 
+// 行頭の [サーバーの名前]。接続についての行（終わり・標準エラー・送れない）は、その接続の名前で出す（②）
+function tagFor(server: string): string {
+  return `[${server}]`;
+}
+
+// 今つなぐ（つないでいる）サーバーについての行
 function tag(): string {
-  return `[${serverName}]`;
+  return tagFor(serverName);
 }
 
 function setStatus(status: LspStatus) {
   emit({ kind: "status", status, server: serverName });
 }
 
-// 実行ログに 1 行足す
+// 実行ログに 1 行足す（server のサーバーの行として）
+function logLineFor(server: string, text: string) {
+  emit({ kind: "log", text: `${tagFor(server)} ${text}\n` });
+}
+
+// 実行ログに 1 行足す（今のサーバーの行として）
 function logLine(text: string) {
-  emit({ kind: "log", text: `${tag()} ${text}\n` });
+  logLineFor(serverName, text);
 }
 
 // 1 回の起動で実行ログに出すサーバーの標準エラーの行数。超えたら省略する
@@ -199,6 +211,8 @@ type Connection = {
   ready: boolean;
   // 終わりの知らせが届いた。current にする前に届くことがある（すぐ終わったとき）ので、覚えておく
   exited: boolean;
+  // サーバーが自分で終わった（Rust 側が「<名前> が終わりました」の Log を出した）。IDE が止めたときは false のまま（①）
+  endedByItself: boolean;
   exitCode: number | null;
   // 実行ログに出した標準エラーの行数
   logged: number;
@@ -218,6 +232,7 @@ function connectionFor(channel: Channel<LspEvent>, server: string): Connection {
     closed: false,
     ready: false,
     exited: false,
+    endedByItself: false,
     exitCode: null,
     logged: 0,
     transport: {
@@ -225,7 +240,7 @@ function connectionFor(channel: Channel<LspEvent>, server: string): Connection {
         if (connection.closed) {
           return;
         }
-        lspSend(message).catch((e) => console.warn(tag(), "送れません", e));
+        lspSend(message).catch((e) => console.warn(tagFor(server), "送れません", e));
       },
       subscribe(handler) {
         handlers.add(handler);
@@ -243,14 +258,21 @@ function connectionFor(channel: Channel<LspEvent>, server: string): Connection {
         }
         break;
       case "log":
-        console.log(tag(), event.text);
-        // 古いサーバーの標準エラーは出さない（終わったものは connection.closed）
-        if (!connection.closed && event.text !== `${connection.server}${EXIT_LOG}`) {
+        console.log(tagFor(connection.server), event.text);
+        if (event.text === `${connection.server}${EXIT_LOG}`) {
+          // 自分で終わった。Rust 側は、IDE が止めたとき（stop）にはこの Log を出さない（①）。
+          // 前のサーバーとして閉じたあと（closed が true）に届いても覚える。画面には出さない（今までどおり）
+          connection.endedByItself = true;
+        } else if (!connection.closed) {
+          // 古いサーバーの標準エラーは出さない（終わったものは connection.closed）
           connection.logged += 1;
           if (connection.logged <= MAX_LOG_LINES) {
-            logLine(event.text);
+            logLineFor(connection.server, event.text);
           } else if (connection.logged === MAX_LOG_LINES + 1) {
-            logLine(`標準エラーは ${MAX_LOG_LINES} 行までしか出しません（以降は省略します。開発者ツールの console にはすべて出ます）`);
+            logLineFor(
+              connection.server,
+              `標準エラーは ${MAX_LOG_LINES} 行までしか出しません（以降は省略します。開発者ツールの console にはすべて出ます）`,
+            );
           }
         }
         break;
@@ -269,18 +291,24 @@ function connectionFor(channel: Channel<LspEvent>, server: string): Connection {
   return connection;
 }
 
-// 起動して使っていたサーバーが終わった。読み込みが終わる前なら起動の失敗、あとなら停止として知らせる（D-130）。
+// 起動して使っていたサーバーが終わった。IDE が止めたなら「止めました」、自分で終わったなら、読み込みが終わる前は起動の失敗、
+// あとは停止として知らせる（D-130。lspExit.ts。実行ログの直し ①）。行と状態は、終わった接続のサーバーの名前で出す（②）。
 // Rust 側は、自分で終わったサーバーを、次に止めるか起動し直すまで回収しない（04 §2）ので、ここで止めて回収する
 function handleExit(connection: Connection) {
-  const code = connection.exitCode === null ? "なし" : String(connection.exitCode);
-  console.info(tag(), "止まりました。終了コード：", connection.exitCode);
-  if (connection.ready) {
-    logLine(`止まりました（終了コード ${code}）`);
-    setStatus("stopped");
-  } else {
-    logLine(`起動に失敗しました。読み込みが終わる前に止まりました（終了コード ${code}）`);
-    setStatus("failed");
-  }
+  console.info(
+    tagFor(connection.server),
+    "止まりました。終了コード：",
+    connection.exitCode,
+    "自分で終わった：",
+    connection.endedByItself,
+  );
+  const report = exitReport(connection.server, {
+    ready: connection.ready,
+    endedByItself: connection.endedByItself,
+    code: connection.exitCode,
+  });
+  emit({ kind: "log", text: `${report.line}\n` });
+  emit({ kind: "status", status: report.status, server: connection.server });
   if (current === connection) {
     current = null;
     client.disconnect();
