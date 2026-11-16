@@ -2107,6 +2107,26 @@ push 1 と CI
 - サーバーが自分で終わったとき（読み込みのあとの「止まりました」、前の「起動に失敗しました」）を、画面では起こしていない（npm test の exitReport のテストだけ）
 - macOS の画面では確かめていない（確かめたのは CI の macos-latest の npm test だけ）
 
+push 2 と merge（2026-11-16。段階 5 の T1 で書いた）
+- push 2：86dff70..294d4e2 の 1 コミット（294d4e2。この節の結果）。--force なし。利用者の許可を得てから
+- push 2 の前の照らし合わせ（範囲は origin/lsp-log-fixes..lsp-log-fixes。git log -S と git log -i --grep で、利用者が自分の cmd で行った）：
+  やり方の確かめの REVEL_SESSION は、-S で 294d4e2（「push の前の照らし合わせ（やり方を変えた）」の説明の行。Cookie の名前の語で、値ではない）。AtCoder のユーザー名・パスワードは、どちらのやり方でも 0 件
+- PR 8：base は利用者のリポジトリの main、compare は lsp-log-fixes。元の開発者のリポジトリには出していない
+- merge：b4128a7。「Merge pull request」の形（題には GitHub の名前が入るので、ここには写さない）。親は 00a3637 と 294d4e2 で、tree は 294d4e2 と同じ。1 回で Merged になった。
+  lsp-log-fixes のブランチは消していない。手元の main は `git fetch origin` のあと `git merge --ff-only origin/main` で合わせ、origin/main と同じ b4128a7 になった
+- 86dff70 と b4128a7 のあいだで変わったのは docs/windows-port-plan.md だけ（`git diff --stat 86dff70 b4128a7`）。そのため、86dff70 から作った release の exe（2026-11-15 21:10:29・10,148,864 バイト、
+  SHA-256 344A58F6BB3ED84F398EC40BC88C02BA8842CBD59AF9412A909D34145ECE7716）は、b4128a7 とコードが同じ
+
+CI（どちらも macos-latest・windows-latest とも success。数字は利用者がログインしたブラウザで見た。run の id〔長い番号〕は控えていない）
+
+| run | コミット | macOS の lib | Windows の lib |
+| --- | --- | --- | --- |
+| #44 | 294d4e2（push 2） | 309 通過・0 失敗・0 無視・1 filtered out（58.46 秒） | 398 通過・0 失敗・8 無視・1 filtered out（61.94 秒） |
+| #46 | b4128a7（merge のあとの main） | 309 通過・0 失敗・0 無視・1 filtered out（50.36 秒） | 398 通過・0 失敗・8 無視・1 filtered out（65.83 秒） |
+
+- npm test はどちらも両方の OS で 20 件・0 失敗。Annotations は、どちらも Node.js 20 の非推奨の warning（両方の OS）と macOS の runner の混雑の知らせだけ
+- CI の Windows の lib のテストは 61〜66 秒で、9.1 の追加 36 の「100 秒を超えたら考え直す」には届いていない
+
 ### 段階 5：提出
 
 何を変えるか
@@ -2118,6 +2138,87 @@ push 1 と CI
 - session.rs・submit.rs の単体テスト（手元の http の口に送るもの）を Windows で通す（段階 3 の T6 で通した）
 - 実際に練習用のコンテストの問題へ提出し、判定が提出結果の欄に出るまで追える。Cookie の入れ替えで資格情報が更新される
 - 確認のダイアログ：Windows でのボタンの文字、「キャンセル」や窓を閉じたときに送られないこと、Enter を押したときに選ばれるボタン（『提出する』が選ばれるかもしれない。推測）。どれも段階 3 では未確認のまま（「提出についての注意」の節）
+
+段階 5 の計画（2026-11-16。T1 で書いた）
+
+ブランチは main の b4128a7 から作った windows-port-stage5（`git fetch origin` のあと、HEAD と origin/main がどちらも b4128a7 であることを確かめてから作った）。
+決めたことは 9.1 の追加 44
+
+コードを読んで分かったこと（どれも動かしていない）
+- 提出の時刻の表示：Windows では、もう置き換えてある（submit.rs の local_time の cfg(windows) の版が、win.rs の local_month_day_time を呼ぶ。テストは win.rs の converts_unix_time_to_local_time）。
+  段階 5 では、確認のダイアログの「最後のテスト」の時刻を画面で見るだけ
+- 提出の順番（submit.rs の submit_flow）：開催期間（ログインなしでコンテストのページを読む）→ ログイン → 提出のフォーム（Turnstile があれば送らない。言語の選択肢）→ 確認のダイアログ → 送る。
+  開催期間の外では、ダイアログの前に止まり、何も送らない。その前に、submit は、testBeforeSubmit が true でサンプルテストが通っていなければ止める
+- 確認のダイアログ：tauri-plugin-dialog 2.8.3 は、rfd 0.16.0 を common-controls-v6 の feature 付きで使う（どちらも Cargo.lock の版。手元の cargo のソースで確かめた）。
+  Windows では、TaskDialogIndirect に独自のボタン「提出する」（ID 1000）と「キャンセル」（ID 1001）を渡す。
+  - TDF_ALLOW_DIALOG_CANCELLATION が付いているので、「×」・Esc・Alt+F4 は IDCANCEL になり、プラグインは false を返す（送らない）見込み
+  - nDefaultButton は 0 なので、最初のボタン「提出する」が既定になり、Enter で提出される見込み（推測）。根拠は、Microsoft の Win32 の資料の TASKDIALOGCONFIG の構造体の nDefaultButton の説明
+    （0 のとき、またはどのボタンの ID とも合わないときは、ダイアログの最初のボタンが既定になる、という意味の書き方）。ただし、この資料は T1 を書くときに開いておらず、覚えている中身から書いた（未確認）。
+    macOS の NSAlert も、最初のボタンが既定になる見込み（推測）
+- ダイアログが省かれる条件（submit.rs の dialog_skip）：settings.json の submit.confirmDialog が false で、サンプルテストが通っていて、注意の文がないとき。
+  storage.rs では、settings.json が読めない・submit の節がない・値がない・値が true か false でない、のどれでも true として扱う（submit_settings・parse_submit・flag）。
+  そのため、省かれるのは `"confirmDialog": false` と書いてあるときだけ
+- Python の import の検査：prepare_python が canonicalize したパス（Windows では `\\?\` が付く見込み）を、`-X utf8 -I -B -c` で python に渡す。
+  prepares_a_python_submission は Windows でも動いているが、手元で CPython の枝まで動いているか（「python3.13 がないので…飛ばします」になっていないか）は未確認（T2 で見る）
+- C++ の準備のテスト prepares_a_cpp_submission は cfg(unix)（ファイルのシンボリックリンクを使うため）で、Windows 版はない
+- フォルダの名前から問題を決める所（problem.rs の package_problem）：`practice_1`・`practice/practice_1`・`rust/practice_1` のどれも、コンテスト practice・問題 practice_1 になる
+  （親のフォルダ名と比べて同じならそれ、違えば最後の `_` より前）。提出で使うのは画面が渡すコンテストと問題で、フォルダから決まる値は、違うときの知らせに使う
+
+作業の分け方
+
+| 順 | まとまり | 中身 |
+| --- | --- | --- |
+| T1 | 文書 | 寄り道 2 の push 2 と merge、この節、9.1 の追加 44 |
+| T2 | テスト（cfg(windows)） | prepares_a_cpp_submission の Windows 版（作業領域の外を指すリンクはジャンクション。段階 4 の T2 と同じ形）、CRLF のソースでの提出の前の検査（C++ の #include・Rust の mod・Python の import）、Python の検査が CPython の枝まで動くかの確かめ（1 件だけ --nocapture で）。落ちたら不具合として、直す前の失敗を書いてから直す |
+| push 1 | T1・T2 を push | 照らし合わせ（git log -S と -i --grep）と利用者の許可のあと。--force なし |
+| T3 | 画面（送らない） | 終わったコンテストで「提出」→ 期間の外の知らせ →「コードをコピーして公式の提出ページを開く」 |
+| T4 | 画面（ログインして、送らない） | 確認のダイアログ（Rust・C++・Python）、「ログアウト」の説明文 |
+| T5 | 画面（本物の提出 1 回） | practice_1 に Rust で 1 回。判定を追う、「詳細」、資格情報の大きさと LastWritten。最後にログアウト |
+| T6 | 文書 | T3〜T5 の結果 |
+| push 2 | T3〜T6 を push | push 1 と同じ |
+
+- 各コミットの前に報告して待つ。コミットの前に cargo fmt --check・cargo clippy --all-targets（警告なし）・cargo test・npm test・npm run build を AC 電源で通す。
+  時間を測るテストが落ちたら、余裕は広げず 1 回だけ動かし直し、両方の結果を報告する
+- 本番のコードは、T2 でテストが落ちないかぎり変えない見込み
+
+画面の確かめの決まり（T3・T4・T5）
+- release の exe は、T2 のあとの HEAD から `npm run tauri build -- --no-bundle`（AC 電源）で作り直して使う
+- 各手順の前と後に、読むだけの命令で確かめる：settings.json の submit.confirmDialog・submit.testBeforeSubmit の値（ほかの値は出さない）とハッシュ、
+  アプリと言語サーバーのプロセスの数、git status、`cmdkey /list | findstr /i "acdstudio atcoder"`
+- confirmDialog が false のとき、または settings.json が JSON として読めないときは、そこで止めて相談する。値がないとき（アプリは true として扱う）は、そう報告する
+- 手順の頭に書くこと：「提出」を押してよい所と回数の合計、「提出する」を押してよいか、提出の確認のダイアログで Enter を押さないこと（閉じるのは「キャンセル」のクリックか「×」）
+- 手順の文は、コードと照らしてから出す。利用者が画面を操作している間は、ファイル・設定・プロセスに触る命令を動かさない
+- 画面に出る AtCoder のユーザー名は、会話にも文書にも書かない（「出た」とだけ書く）。パスワードは利用者が入力し、会話には出さない
+
+T3（送らない。終わったコンテスト）
+- 使うもの：コンテスト abc401、問題 abc401_a（段階 3 の T8・T10 で使った t1 のパッケージ。abc401_a に結び付いている）
+- 始める前に、利用者がブラウザでコンテストのページを開き、終了の日時が過ぎていることを確かめる。ログインしているか（資格情報の項目があるか）も cmdkey で確かめる
+- 「提出」を押すのは、手順に書いた 1 回だけ。「提出する」は押さない
+- 見込み：期間の外の知らせが出て、ダイアログは出ず、何も送らない。「コードをコピーして公式の提出ページを開く」で、既定のブラウザに提出のページが開く。開いた提出のページでは、ブラウザから送らない
+- t1 のサンプルテストが通らないときは、期間を見る前に「サンプルテストが通っていないので、提出しません」で止まる（送らない）。そのときは、期間の外の知らせは見られないので、そう書いて相談する
+
+T4（送らない。ログインして、練習用のコンテストで）
+- T4 の前に本物のログインをする
+- 同じ作業領域に rust/practice_1・cpp/practice_1・py/practice_1 を置く。手順の一つひとつに、どのフォルダのどのファイルを開いて「提出」を押すかを書く。
+  手順の頭に、「提出」を押す回数の合計（たとえば Rust 2 回・C++ 1 回・Python 1 回）と、「提出する」は T4 では一度も押さないことを並べて書く
+- Rust：ダイアログのボタンの文字、どちらのボタンに枠が付いているか（Enter は押さない）、「最後のテスト」の時刻、注意の文を見て「キャンセル」をクリック。もう一度出して「×」で閉じる
+- C++・Python：ダイアログの中身を見て「キャンセル」をクリック
+- どの場合も送られないこと（画面の知らせと、ブラウザの「自分の提出」の件数が増えていないこと）。「ログアウト」の説明文を見る
+- ダイアログの前に止まったとき（開催期間・Turnstile・参加の登録・言語の選択肢）は、出た文をそのまま書いて相談する。ほかのコンテストは試さない
+
+T5（本物の提出。practice_1 に Rust で 1 回だけ）
+- 手順の頭に「提出してよいのは practice_1 に Rust で 1 回だけ」と書く。手順と解答の全文を見せ、利用者の許可を得てから始める。提出は「提出する」のクリックで行い、Enter は押さない
+- 提出の前：サンプルテストが全部 AC、ダイアログの中身（コンテスト・問題・ファイル・言語・最後のテスト・注意）、ブラウザの「自分の提出」の件数
+- 提出のあと：判定が提出結果の欄で決まるまで追えること、「詳細」のボタン、「自分の提出」の件数が 1 だけ増えたこと、
+  資格情報の大きさと LastWritten の前後（Cookie が入れ替わるかは未確認。変わらなくても、そのとおりに書く）
+- 資格情報の大きさと LastWritten を出すスクリプトは、新しく作業用の場所に作る（段階 3 のものは使わない。リポジトリに入れない）。出すのは、項目があるか・大きさ・LastWritten だけ。
+  .ps1 に日本語を書かない。動かす前に全文と SHA-256 を見せて待つ
+- 最後にログアウトし、`cmdkey /list | findstr /i "acdstudio atcoder"` で項目がないことを、直後・1 分後・アプリを起動し直したあとの 3 回見る
+
+今回は行わないこと
+- 期限切れの確かめ（4.1 の手順 C の 2。本物の項目を壊れた値に書き換えるもの）。未確認のまま残す
+- 確認のダイアログで Enter を押すこと。Enter のふるまいは、T4 で見た枠から推測して書く
+- Python・C++ の提出（ダイアログを見てキャンセルするだけ）
 
 ### 段階 6：デバッグ
 
@@ -2239,6 +2340,7 @@ push 1 と CI
 | 追加 41（2026-11-13） | 作業領域が UNC（`\\server\share`）のとき、言語サーバーは「使えません」と知らせるだけにする。知らせることはテストで確かめる。push は T4・T9・T11 のあとの 3 回で、どれも利用者の許可のあと。--force なし | 段階 4 |
 | 追加 42（2026-11-15） | workspace.configuration の件は、段階 4 では直さず、段階 4 の merge のあと、段階 5 の前に、別のブランチ（lsp-workspace-configuration）と PR で直す。「macOS / Unix の経路は cfg を付ける・場所を移す以外は変えない」の例外で、変えるのは lsp.rs の override_initialize（initialize の capabilities.workspace.configuration）とそのテストだけ。理由は、IDE が渡すつもりの basedpyright の設定（D-225）が、両方の OS で届いていないため。macOS でも、basedpyright の診断の数と種類が変わり（standard になり、pythonPath が届く）、rust-analyzer に workspace/configuration の問い合わせが来るようになる見込み。macOS の確かめは CI の macos-latest の単体のテストだけで、macOS の画面と、macOS の本物の言語サーバーでは確かめられない。①②⑥（lsp.ts）は、この PR を merge したあとで別のブランチにする | 段階 4 のあとの直し |
 | 追加 43（2026-11-15） | 実行ログの ①②⑥ を、段階 5 の前に、別のブランチ（lsp-log-fixes）と PR で直す。「macOS / Unix の経路は cfg を付ける・場所を移す以外は変えない」の例外で、変えるのは画面の側（src/editor/lsp.ts・src/editor/workspace.ts・新しい src/editor/lspExit.ts とそのテスト）だけ。Rust は変えない。① は案 A（画面が「<名前> が終わりました」の Log で、サーバーが自分で終わったかを見分ける。終了コードは使わない）で、IDE が止めたときの文は「止めました」（終了コードを付けない）。⑥ も一緒に直すが、手間がふくらむときは止めて相談する。macOS でも、実行ログの文（① の「止めました」、② の名前）と再起動のあとの didClose（⑥）が変わる。macOS の確かめは CI の macos-latest の npm test だけで、macOS の画面では確かめられない | 実行ログの直し |
+| 追加 44（2026-11-16） | 段階 5 の進め方。ブランチは main の b4128a7 から作った windows-port-stage5（作る前に git fetch origin をした）。T2 で足すテストは cfg(windows) にし、macOS の経路は変えない。本物の提出は、練習用のコンテスト practice の practice_1 に Rust で 1 回だけ。Python・C++ は、確認のダイアログを出して中身を見たら「キャンセル」をクリックするだけ。ダイアログでは Enter を押さない。Enter で選ばれるボタンは、T4 でどちらのボタンに枠が付いているかを見るだけにし、「枠から見た推測」として書く。T3（終わったコンテストで、期間の外の知らせと公式の提出ページを開く所）では「提出」を押してよい（使うコンテストと問題を書く、終了の日時をページで先に確かめる、開いた提出のページで送らない）。T3・T4・T5 の前に、settings.json の submit.confirmDialog が true であることを読むだけの命令で確かめ、false なら止めて相談する。T4 の前に本物のログインをし、最後にログアウトする。期限切れの確かめ（本物の項目を壊れた値に書き換えるもの）は行わず、未確認のまま残す。前の会話の作業用の場所は、段階 5 のあとで利用者が決める | 段階 5 |
 
 ---
 
