@@ -2403,6 +2403,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // prepares_a_cpp_submission の Windows 版（段階 5 T2）。作業領域の外を指すリンクは、ファイルのシンボリックリンクの
+    // 代わりに、フォルダのジャンクション（win.rs の TestJunction）で作る。値は Unix 版と同じ偽のもの
+    #[cfg(windows)]
+    #[test]
+    fn prepares_a_cpp_submission_on_windows() {
+        let base = std::env::temp_dir().join(format!(
+            "atcoder-studio-submit-cpp-win-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "atcoder-studio-submit-cpp-win-outside-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(base.join("abc480/abc480_a")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = base.canonicalize().unwrap();
+        let dir = root.join("abc480/abc480_a");
+        let source = "#include <bits/stdc++.h>\n  # include \"lib/x.hpp\"\n// #include \"y.hpp\" も行ごとに見る\n#include<atcoder/all>\nint main() {}\n";
+        std::fs::write(dir.join("main.cpp"), source).unwrap();
+        let prepared = prepare_cpp(&root, &dir, Some("15.2.0")).unwrap();
+        assert_eq!(prepared.language, Language::Cpp);
+        // Windows でも、作業領域からのパスは `/` でつなぐ
+        assert_eq!(prepared.file, "abc480/abc480_a/main.cpp");
+        assert_eq!(prepared.source, source);
+        assert_eq!(
+            prepared.warnings,
+            [
+                "自分のヘッダーを読む #include（#include \"lib/x.hpp\"）があります。ジャッジには、このファイルだけが置かれます"
+            ]
+        );
+        // 手元の GCC の版が違うと知らせる
+        std::fs::write(dir.join("main.cpp"), "int main() {}\n").unwrap();
+        assert_eq!(
+            prepare_cpp(&root, &dir, Some("14.2.0")).unwrap().warnings,
+            ["手元の GCC（14.2.0）は、ジャッジ（15.2.0）と版が違います"]
+        );
+        assert!(prepare_cpp(&root, &dir, None).unwrap().warnings.is_empty());
+        // 大きすぎる
+        std::fs::write(dir.join("main.cpp"), vec![b'a'; SOURCE_LIMIT + 1]).unwrap();
+        assert!(
+            prepare_cpp(&root, &dir, None)
+                .unwrap_err()
+                .contains("512 KiB")
+        );
+        // 作業領域の外を指すリンク：abc480_b を、外のフォルダへのジャンクションにする
+        std::fs::write(outside.join("main.cpp"), "int main() {}\n").unwrap();
+        let linked = root.join("abc480/abc480_b");
+        let junction = crate::win::TestJunction::new(&linked, &outside);
+        assert!(
+            prepare_cpp(&root, &linked, None)
+                .unwrap_err()
+                .contains("作業領域の外")
+        );
+        // 先にジャンクションだけを消す（あとの remove_dir_all が、指す先をたどらないように）
+        drop(junction);
+        // ない
+        std::fs::remove_file(dir.join("main.cpp")).unwrap();
+        assert!(
+            prepare_cpp(&root, &dir, None)
+                .unwrap_err()
+                .contains("main.cpp が見つかりません")
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn chooses_the_cpp_option_and_note() {
         // 言語の選択肢に C++ を足したフォーム。C++ は C++23 (GCC 15.2.0) だけを選ぶ
