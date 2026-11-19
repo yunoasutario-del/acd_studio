@@ -44,10 +44,17 @@ function snippetSource(language: Language) {
   };
 }
 
+// 出どころは言語ごとに 1 度だけ作り、毎回同じものを返す。@codemirror/autocomplete は、取引のたびに読み直した
+// 出どころを前のものと同じ関数かどうかで突き合わせるため、読むたびに作り直すと結果が捨てられて候補に出ない
+function languageDataFor(language: Language) {
+  const data = [{ autocomplete: snippetSource(language) }];
+  return EditorState.languageData.of(() => data);
+}
+
 const completions: Record<Language, ReturnType<typeof EditorState.languageData.of>> = {
-  rust: EditorState.languageData.of(() => [{ autocomplete: snippetSource("rust") }]),
-  cpp: EditorState.languageData.of(() => [{ autocomplete: snippetSource("cpp") }]),
-  python: EditorState.languageData.of(() => [{ autocomplete: snippetSource("python") }]),
+  rust: languageDataFor("rust"),
+  cpp: languageDataFor("cpp"),
+  python: languageDataFor("python"),
 };
 
 export function snippetCompletions(language: Language) {
