@@ -2493,9 +2493,25 @@ exe の作り直し
 - 設定のフォルダは、%APPDATA% の下の名前が `.acdstudio` で終わるフォルダ（1 つ）として探した。フォルダの名前（識別子）は書いていない
 - snippet_test を消すかは、利用者が決める
 
+### スニペットの補完の直しの push と merge（2026-11-20。windows-stage6-python の T1 で書いた）
+
+- windows-fix-snippet-completion の push（9b8e7db）の run #54 は、macos-latest と windows-latest のどちらも success（利用者がブラウザで見た）
+
+| OS | lib | 時間 | npm test |
+| --- | --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out | 35.92 秒 | 26 件・26 通過・0 失敗 |
+| Windows | 399 通過・0 失敗・8 無視・1 filtered out | 63.82 秒 | 26 件・26 通過・0 失敗 |
+
+- run #54 の Annotations は、Node.js 20 の非推奨の warning（macOS の分）と、macOS の runner の混雑の notice だけ
+- PR #11（base は利用者のリポジトリの main。0058571・9b8e7db の 2 commits）の run #55 は、All checks have passed・No conflicts
+- merge は 12c2400（Create a merge commit。ブランチは消していない）。親は 12e756b と 9b8e7db、tree は 9b8e7db と同じ（d78c2619fbe58680b267c3d0e30fe9e9a564973b）。
+  手元の main は、git fetch origin のあと、親と tree を確かめ、git switch main と git merge --ff-only origin/main で 12c2400 に合わせた
+- デスクトップの exe（%USERPROFILE%\Desktop\atcoder-studio.exe）は、0058571 から作った release の exe（10,148,864 バイト・B99BBA6A…0226）に入れ替えた（前は 0D11006A…2A2D）
+
 ### 段階 6：デバッグ
 
 **今回の移植には含めない（9 章 12。2026-10-29 に決めた）。** 段階 1 では、デバッグのコードは Windows でコンパイルが通るようにするだけで、動かさない。以下は後で行うときのための記録。
+→ 2026-11-20 に段階 6 を始めた（9.1 の追加 48。12 は書き換えていない）。Python（debugpy）の計画は、下の「段階 6 の Python（debugpy）の計画」。
 
 何を変えるか
 - 6 章で選んだ方式のアダプターの探索と起動、DAP の違いの吸収
@@ -2511,6 +2527,96 @@ exe の作り直し
 - debug.rs の本物のアダプターを使うテスト（debugs_with_real_lldb_dap・debugs_cpp_with_real_lldb_dap にあたるもの）を、選んだアダプターで書き直して通す
 - ブレークポイント・ステップ・変数・式の評価・panic と例外と abort で止まる・止めたあとにプロセスが残らない
 - アダプターを止めたあと（shutdown と、つなげなかったとき）に、JOBS に記録が残らない（lsp.rs の forgets_the_job_record_after_stopping_on_windows と同じ形のテスト）
+
+### 段階 6 の Python（debugpy）の計画（2026-11-20。windows-stage6-python）
+
+範囲（9.1 の追加 48）
+- Windows で使えるデバッグは、まず Python（CPython）だけにする。C++・Rust はまだ（6 章の方式を選んでいない）。PyPy の debugpy は、あとで決める
+- 言語の順は Python → C++ → Rust で、言語ごとにブランチと PR を分ける。この節は Python の分
+- 利用者向けの docs/usage.md には、T4 で、Windows で使えるデバッグの範囲を 1 段落足す
+
+元の版との対応
+- 元の版の段階：Phase 20 作業 6（デバッグ。2026-10-29 に完了）。D-番号：D-226（Python のデバッグ）。土台は D-145（lldb-dap を Rust 側の DAP クライアントで使う）と D-146（デバッグの細部）
+- コミット：元の版の記録に、作業 6 のコミットのハッシュは書かれていない（未確認）。このリポジトリでは、元の版の全体を最初に取り込んだ 309895d（2026-10-29）に入っている
+- 元の版の debugpy は 1.8.22（試しのときの版。作業 6 では CPython・PyPy の両方に入れた）。元の版の受け入れ条件は AC20-04〜06
+- 元の版では、Windows のデバッグは対象外（P-07-8）。元の開発者の総合開発仕様書 8.2 は、Windows ではデバッグの対応範囲を明示することを求めている → 上の「範囲」と追加 48 に書いた
+
+今の流れ（debug.rs。行の番号は main の 12c2400 のもの。6 章・4.4 などに書いた debug.rs の行の番号には、今とずれているものがある）
+1. アダプター：find_session_adapter（1544–1561）が python::find_interpreter（Windows は段階 2 S7 の探し方）と find_debugpy（255–270）を呼ぶ。
+   debugpy は、アプリの設定のフォルダの python\cpython（PyPy は python\pypy）の下の debugpy\__init__.py で見つける。なければ入れ方の文（266）を出して止まる
+2. 標準入力：choose_input（446–483）。ケースの `.in`、なければ input.txt、どちらもなければ `/dev/null`（476）
+3. 起動：Client::spawn_debugpy（912–980）。空いているポート（273–278）、入力のファイルを File::open（922）、debugpy_command（282–304：
+   `-E -B -X int_max_str_digits=0 -X frozen_modules=off -c <DEBUGPY_BOOT> <debugpy の場所> --listen 127.0.0.1:<ポート> --wait-for-client main.py`）、
+   process_group(0)（Windows は CREATE_NO_WINDOW | CREATE_SUSPENDED）、Windows だけ start_in_job（938–940）。最大 15 秒、TCP でつなぐ（947–961）
+4. セッション：start_session（1585–1671）。initialize → attach → setBreakpoints（パスは workspace::resolve の canonicalize の結果）→ setExceptionBreakpoints（uncaught）→ configurationDone
+5. 止める：shutdown（1212–1242）。disconnect → 最大 2 秒 → kill_group（1225）→ child.wait（1231）
+
+変えること（どれも Windows だけ）
+
+| # | 所 | 変えること | 理由 | 状況 |
+| --- | --- | --- | --- | --- |
+| W1 | choose_input（476） | 入力がないときは `NUL` | Windows に `/dev/null` はなく、File::open（922）が失敗してデバッグが始まらない見込み（推測。テスト A1 で確かめる） | 未確認 |
+| W2 | debugpy_command | 先頭に `-X utf8`（python.rs の UTF8_MODE を pub(crate) にして使う。check_command と同じ置き方） | 4.4・9.1 の 7。付けないと CPython はパイプへ cp932 で出し、デバッグの出力（from_utf8_lossy で読む）の日本語が化ける見込み | 実行では確認済み（段階 2 S7）／デバッグでは未確認 |
+| W3 | spawn_debugpy のつなげなかったとき（964–967） | kill_group → wait の 2 行を小さな関数に移し、wait のあとに release_job | 段階 2 S13 で見つけた Job の記録（「段階 6：デバッグ」の節）。lsp.rs の Server::stop と同じ形。関数に移すのはテスト A4 のため（「場所を移す」。Unix の動きは同じ） | コードで確認済み |
+| W4 | shutdown（1231） | wait のあとに release_job | 同上 | コードで確認済み |
+| W5 | 入れ方の文（266） | Windows だけ、PowerShell 向けに先頭に `& ` を付ける。Unix の文はそのまま | PowerShell では、引用符で始まる命令の前に & が要る（4.8。推測） | 未確認 |
+| W6 | cwd とブレークポイントのパス | root が canonicalize の結果なので `\\?\` の形で debugpy に渡っている。テスト A5 の結果を見てから、without_verbatim を通すかを決める | debugpy がこの形のパスでブレークポイントを合わせるか、`\\?\` の cwd で os.getcwd が何を返すかは未確認 | 未確認 |
+
+- 変えない見込み（コードを読んだ限り。推測）：処理系の探し方、構文の確かめ、exited_without_reaping・kill_group（Windows は has_exited・kill_job）、
+  in_workspace（root も canonicalize の結果なので合う）、file_uri（without_verbatim を通す）、TCP のつなぎ方と DAP の中身、`-E`
+- デバッグ対象の出力の改行：CPython の print はパイプで CRLF（4.3）。コードは変えず、Windows のテストでは `\r\n` を期待する。画面で `\r` が見えるかは T4 で見る
+- debugpy の `--listen` は、デバッグ対象の中から別のプロセス（アダプター）を起動する（推測）。止めたあとに子孫が残らないこと（Job に入ること）と、コンソールの窓が出ないこと（4.6）を確かめる
+
+macOS への影響
+- W1〜W6 は cfg(windows) で足す。Unix の行は変えない。W3 の関数に移す 2 行は、Unix でも同じ動き（場所を移すだけ）
+- cfg の付いていない共通のテスト（chooses_input・reports_missing_debugpy）は Windows でも動くので、W1・W2・W5 で落ちる所に、Windows の期待値を cfg で足す（Unix の期待値は変えない）
+- 本物の debugpy のテストの定数（PYTHON_SOLUTION など。今は cfg(unix)）を Windows のテストでも使うなら、cfg を外す（中身は変えない）
+- 画面の TypeScript は変えない。デバッグコンソールの文（DebugConsole.tsx の CONSOLE_NOTICE と入力欄の説明）は Python のときも「LLDB」のままで、
+  元の版の usage.md の「LLDB のコマンドは使えません」と食い違うが、macOS と共通の画面の文なので、段階 6 では直さず記録だけにする
+- 確かめは CI の macos-latest（ビルド・clippy・テスト）。macOS の画面は未確認
+
+先に書くテスト（どれも cfg(windows)。直す前に落ちることを確かめ、直したあとに新しい行を一時的に外して落ちることも確かめる）
+
+| # | テスト（名前は案） | 中身 | 直す前の見込み |
+| --- | --- | --- | --- |
+| A1 | opens_an_empty_input_without_input_files_on_windows | input.txt もケースもないとき、choose_input の返すパスを開けて、読むと 0 バイト | 開けずに落ちる（推測） |
+| A2 | passes_utf8_mode_to_debugpy_on_windows | debugpy_command の引数に `-X utf8` がある | ないので落ちる |
+| A3 | forgets_the_job_record_after_debug_shutdown_on_windows | テスト用の子のプログラム（sleep:30000）を Job に入れて起動し、偽のつなぎ先で作ったクライアントの shutdown のあと、win::has_job_record が false | 記録が残って落ちる |
+| A4 | forgets_the_job_record_when_debugpy_does_not_start_on_windows | W3 で移した関数を、テスト用の子のプログラムで試す | 記録が残って落ちる |
+| A5 | debugs_python_with_real_debugpy_on_windows | Unix の debugs_python_with_real_debugpy と同じ 4 つの場面に、日本語の出力と input.txt のない場面を足す。止めたあとは win::descendants が空で has_job_record が false。debugpy が入っていなければ飛ぶ（CI では飛ぶ） | W1・W2・W6 の分だけ落ちる見込み（推測）。何で落ちるかを記録する |
+
+順番（コミット）
+- T1：この節と 9.1 の追加 48（と、スニペットの補完の直しの push と merge の記録）
+- T2：テスト A1〜A4 と W1〜W5
+- T2 のあと：release の exe を作り、debugpy がない状態で AC20-06 を画面で確かめる
+- そのあと：debugpy（CPython の分）を入れる（利用者がアプリを閉じたあと、許可を得てから）
+- T3：テスト A5 と W6
+- T4：画面の確かめ（AC20-04・05）の結果と、usage.md の 1 段落
+
+画面の確かめの基準（元の版の AC20-04〜06 を Windows 向けに読み替えたもの）
+
+| # | 元の版の期待結果 | Windows での確かめ方 |
+| --- | --- | --- |
+| AC20-04 | ブレークポイントで止まり、変数・ウォッチ式・コールスタック・ステップ・デバッグコンソールが Rust と同じく使える。入力のファイルが input() で読める | Windows では Rust のデバッグがまだ動かないので、Unix の本物の debugpy のテストが確かめていること（止まる行・変数の値・式・ステップ）を基準にする。日本語の出力が化けないこと（W2）と、input.txt がないとき入力を待たずに終わること（W1）を足す |
+| AC20-05 | 捕まえていない例外の行で止まる。止めると、対象もアダプターも残らない | 止めたあと、python.exe の数がデバッグの前と同じか（読むだけの命令）。コンソールの窓が出ないこと |
+| AC20-06 | debugpy がないと入れ方の案内が出る（元の版は手元のテストだけ） | debugpy を入れる前に、T2 のあとの exe で画面で見る。案内が PowerShell 向け（先頭に &）で、入れる場所がアプリの設定のフォルダの python\cpython であること |
+
+道具（2026-11-20 に読むだけの命令で確かめた）
+- CPython 3.13.7（PEP 514 の HKCU。%LOCALAPPDATA%\Programs\Python\Python313\python.exe）、pip 25.2、AMD64。処理系の本体には debugpy がない。
+  PATH の python.exe は WindowsApps の実行エイリアスだけ。settings.json の python の節は、interpreter が cpython で、cpython・pypy の場所の指定は空
+- PyPy は PATH にない（段階 2 で試したときの場所は未確認）。gdb.exe は C:\Program Files (x86)\mingw64\bin にある。lldb-dap・lldb はない
+- アプリの設定のフォルダに python\cpython・python\pypy はなく、debugpy は入っていない
+- debugpy：PyPI の最新は 1.8.22（元の版と同じ版。pip index versions で確かめた）。debugpy-1.8.22-cp313-cp313-win_amd64.whl（5,400,362 バイト、
+  SHA-256 F49B1D6CECF326B63C06D7F517E4A6642777F758C58CB799E7BC5A6DD74721C2）を、作業用の場所の空のフォルダに pip download で落とした（まだ入れていない）。
+  入れるときは、この wheel から `--no-index --no-deps --target` で入れる。利用者に見せる入れ方の文は、元の版と同じく版を指定しない
+
+未確認（10 章にも書いた）
+- `/dev/null` を Windows で開けないこと（推測）
+- debugpy が `\\?\` のパスでブレークポイントを合わせるか、`\\?\` の cwd での os.getcwd
+- debugpy のアダプターのプロセスが Job に入るか、コンソールの窓が出るか
+- PowerShell で入れ方の文に & が要ること（推測）
+- Windows の PyPy でのデバッグ（入れない）
+- debugpy の起動の時間（CONNECT_WAIT 15 秒・LAUNCH_WAIT 30 秒は変えない。A5 で測った時間を記録する）
 
 ---
 
@@ -2617,6 +2723,7 @@ exe の作り直し
 | 追加 45（2026-11-17） | T4 で practice の提出のページの Turnstile のため送れなかったので、段階 5 は T3・T4（Turnstile で止まった）とログアウトの確かめまでで T6 にまとめ、push 2・PR・merge まで進める（形 A）。デイリーコンテストでの T4 の続き（ダイアログを見て「キャンセル」、もう一度出して「×」）と T5（本物の提出 1 回）は、merge のあとに新しいブランチで行う。追加 44 と段階 5 の計画の「ほかのコンテストは試さない」は、AtCoder Daily Training に限って変える：使うのは 2026-11-18 20:00〜21:00 の回。参加の登録は利用者がブラウザで先に行う（レーティングは変わらない。利用者が見た）。本物の提出は Rust で 1 回だけで、手順と解答の全文を見せ、許可のあと、「提出する」のクリックで送る。ほかの条件（ダイアログで Enter を押さない、settings.json の submit.confirmDialog の確かめ、前と後の確かめ、資格情報のスクリプトは新しく作って全文と SHA-256 を見せる、など）は追加 44 と同じ。T3 では t1 の代わりに acd-t5（%USERPROFILE%\Documents\acd-t5）を使った。acd-t5 は、段階 5 の PR が merge されるまで残し、そのあと利用者の許可で消す | 段階 5（T6） |
 | 追加 46（2026-11-18） | デイリーコンテストでの追加の確かめは、デイリーコンテスト（コンテスト ID awc0203。正式な名前は未確認）の 20:00〜21:00 の回で行った。追加 45 の「AtCoder Daily Training に限って」は、実際には awc0203 で行った（名前は未確認）。作業領域は、利用者が作った %USERPROFILE%\Documents\teisyutu_test（acd-t5 は使わなかった）。時間がないので、exe は作り直さず（03e41f5 から作ったもの。merge で変わったのは計画書だけ）、資格情報の大きさと LastWritten のスクリプトは作らずに未確認とし、前と後の確かめは cmdkey の行の数・アプリのプロセス・confirmDialog だけにした。解答は、生成 AI のルールのため、利用者が自分で書いた（作業する側は問題文を読まず、解答も書かず、助言もしない）。結果は、main（61a07f7）から作った windows-port-stage5-followup で計画書に書く。teisyutu_test と acd-t5 を消すかは、利用者が決める | 段階 5 のあと |
 | 追加 47（2026-11-19） | スニペットの補完が出ない不具合は、origin/main（12e756b）から作った windows-fix-snippet-completion と PR で直す。変えるのは、共通の TypeScript（src/editor/snippets.ts）と新しいテスト（tests/snippets.test.ts）だけで、Rust は変えない。共通のコードなので、macOS でもスニペットが補完に出るように変わる見込み。macOS の確かめは CI の macos-latest の npm test だけで、macOS の画面は未確認。原因は、テストで確かめたもの（出どころの関数が読まれるたびに作り直され、@codemirror/autocomplete が結果を捨てていた）と、元の開発者の見当（はじめは clangd の更新、のちに gcc の更新で、新しい方も見るようにしたら直った。その直しの中身は未確認）の両方を書く。画面の確かめは C++ だけにし、Rust・Python はテスト 1 で確かめた。作業領域は試し用の %USERPROFILE%\Documents\snippet_test。決めたことは、windows-features-plan.md がまだないので、この計画書に書く（windows-features-plan.md は新しい機能を始めるときに作る）。この PR では、run #51・#52 の数字と、awc0204 での C++ の提出の結果も書く | 段階 5 のあとの直し |
+| 追加 48（2026-11-20） | 段階 6（デバッグ）を始める（12 は書き換えない）。言語の順は Python → C++ → Rust で、言語ごとにブランチと PR を分ける。Windows で使えるデバッグは、まず Python（CPython）だけ。C++・Rust はまだで、PyPy の debugpy はあとで決める。範囲は「段階 6 の Python（debugpy）の計画」の節に書き、docs/usage.md には T4 で 1 段落足す。debugpy は CPython の分だけ利用者の手元に入れる（版・命令の全文・入れる場所を見せ、利用者がアプリを閉じたあと、許可を得てから。版は 1.8.22）。Windows の入れ方の案内文は PowerShell 向け（先頭に &）で、Unix の文はそのまま。spawn_debugpy のつなげなかったときの 2 行（kill_group → wait）は、テストのために小さな関数に移す（「場所を移す」。Unix の動きは同じ）。`\\?\` のパス（W6）は、本物の debugpy のテストの結果を見てから決める。デバッグコンソールの文が Python でも「LLDB」なのは、macOS と共通の画面の文なので直さない。段階 6 の計画と決めたことは、この計画書に書く。ブランチは origin/main（12c2400）から作った windows-stage6-python | 段階 6 |
 
 ---
 
@@ -2657,6 +2764,8 @@ exe の作り直し
 - macOS の S7（Python）・S8（C++）の経路が CI で本当に動いたか（g++-15・python3.13 がなければテストは自分で飛ぶ。runner に何が入っているかは未確認）。
   段階 2 の全体は run #23（e800d5d）で通り、S10b とその直しのテスト、対話テスト、npm test は macos-latest のログで確認済み（「段階 2 の結果」）
 - 6 章：すべてのデバッグの方式（LLVM の lldb-dap の有無、CodeLLDB のライセンス、gdb の Python と DAP）
+- 段階 6 の Python（「段階 6 の Python（debugpy）の計画」）：`/dev/null` を Windows で開けないこと（推測）、debugpy が `\\?\` のパスでブレークポイントを合わせるか、
+  debugpy のアダプターのプロセスが Job に入るか・コンソールの窓が出るか、PowerShell で入れ方の文に & が要ること（推測）、Windows の PyPy でのデバッグ
 - 段階 3 で確かめること：残りなし（ShellExecuteW を COM の初期化なしで呼んで URL とフォルダを開けることは T8 で確認済み。提出の処理を始めずに提出のページを開ける経路がないことは T8 でコードで確認済み。InPrivate と on_navigation の制限のもとでログインが通ること〔Turnstile が出たかは記録していない〕と、cookies() が WebView2 で REVEL_SESSION を返すこと〔HttpOnly かは見ていない〕は T9 で、CI の Windows で資格情報を書けることは run 42378818906 で確認済み。アプリが記録をファイルに書かないことは T9 の前にコードで確認済み）。あとの段階へ残したものは「段階 3 の結果」の「残る未確認」にある
 - curl の .curlrc：Windows の curl.exe は --disable で読まない（段階 3 T10。テストで確認済み）。macOS の curl には付けていない（.curlrc が Cookie の入った要求に効くかは推測のまま）。
   Cookie を渡す経路を --disable の付いた exe で本物のログインの画面で確かめることは、段階 5
