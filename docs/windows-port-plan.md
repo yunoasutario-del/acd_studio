@@ -2405,6 +2405,94 @@ Turnstile
 - 変わった：trusted.json は 292 → 349 バイト（teisyutu_test を信頼した）。history.json は 39,931 バイト
 - teisyutu_test は、ファイル 240（target の下 224）、リンク 0。teisyutu_test と acd-t5 を消すかは、利用者が決める
 
+### 段階 5 のあとの push と merge（2026-11-19。windows-fix-snippet-completion の T2 で書いた）
+
+- windows-port-stage5-followup の push（5ed18ec）の run #51 は、macos-latest と windows-latest のどちらも success（利用者がブラウザで見た）。
+  macos-latest は runner が割り当てられず、Re-run を数回したあとの結果
+
+| OS | lib | 時間 | npm test |
+| --- | --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out | 30.43 秒 | 20 件・0 失敗 |
+| Windows | 399 通過・0 失敗・8 無視・1 filtered out | 66.02 秒 | 20 件・0 失敗 |
+
+- run #51 の Annotations は、Node.js 20 の非推奨（macOS の分）と、macOS の runner の混雑の知らせだけ
+- PR #10（base は利用者のリポジトリの main。1 commit）は All checks have passed。PR の run #52 は、どちらも success（数字は見ていない。未確認）
+- merge は 12e756b（Create a merge commit。ブランチは消していない）。親は 61a07f7 と 5ed18ec、tree は 5ed18ec と同じ（c3cb1ad5bf0f3092fad973e39706424e886ac542）。
+  手元の main は、git fetch origin のあと、git switch main と git merge --ff-only origin/main で 12e756b に合わせた
+- 片づけ：acd-t5 と teisyutu_test は、2026-11-19 に利用者の許可で消した（消す前に、中の一覧とリンクが 0 であることを見て、Remove-Item -LiteralPath で 2 つのフォルダだけを消した）
+
+### 普段使いでの C++ の提出（2026-11-19。利用者が操作した）
+
+- デイリーコンテスト awc0204 の A「Does the Current Flow?」に、C++ で提出した
+- exe は、デスクトップにコピーしたもの（%USERPROFILE%\Desktop\atcoder-studio.exe。SHA-256 0D11006A…2A2D。03e41f5 から作ったもの）
+- 設定の「この問題を作る」の言語を C++ にして、パッケージを作った
+- 確認のダイアログの言語は C++23 で、注意の行はなかった
+- 判定は AC
+- 解答は、利用者が自分で書いた（生成 AI のルールのため。作業する側は、問題文を読まず、解答も書かず、助言もしていない）
+- 提出の時刻・得点・実行時間・メモリ・作業領域は、聞いていない（未確認）
+
+### スニペットの補完の直し（2026-11-19。windows-fix-snippet-completion）
+
+不具合
+- 設定の「スニペット」で VS Code の C++ のスニペット（%APPDATA%\Code\User\snippets\cpp.json）を取り込み、設定の画面では読めていた。
+  それでも、C++ のファイル（main.cpp）で、呼び出す文字「temp」（記号はない）と打つと、補完の一覧には clangd の候補だけが出て、スニペットの「temp」は出なかった（利用者が普段使いの exe で見た）
+- 元の開発者によると、元の版（macOS）でも同じように、スニペットがエディタの補完に出ない
+
+調べたこと（読むだけ）
+- npm ls で、@codemirror/state 6.7.6・@codemirror/autocomplete 6.20.3・@codemirror/view 6.43.14・@codemirror/language 6.13.1・@codemirror/lsp-client 6.3.0 は、
+  どれも 1 つの版だけだった（ほかは deduped）。2 つの版が別々に動いている、という見当は当たらない
+- 原因：src/editor/snippets.ts の `EditorState.languageData.of(() => [{ autocomplete: snippetSource(...) }])` が、読まれるたびに新しい出どころの関数を作っていた。
+  - @codemirror/state の languageDataAt（dist/index.js:2826-2835）は、呼ばれるたびに登録された関数を呼び直す
+  - @codemirror/autocomplete の CompletionState.update（dist/index.js:892-898）は、取引のたびに出どころを読み直し、前の状態と同じ関数かどうか（`s.source == source`）で突き合わせる
+  - 問い合わせの結果は、問い合わせたときの関数に結び付けて作られ（1240 行）、受け取る所（ActiveSource.update の setActiveEffect。982-985 行）は同じ関数かどうかで比べる。
+    関数が作り直されているので一致せず、結果が捨てられて、スニペットが候補に出なかった
+  - 対比：@codemirror/lsp-client の serverCompletion（dist/index.js:846-847）は、data を 1 度だけ作って毎回同じものを返すので、clangd の候補は出ていた
+  - 行の番号は、今入っている版のもの
+- この見当なら、clangd を使わない Rust・Python のタブでも、言語サーバーにつながないときでも、スニペットは出ない（テスト 1 で 3 つの言語とも確かめた。画面では見ていない）
+- 元の開発者の見当は、はじめは clangd の更新、のちに gcc の更新（新しい方も見るようにしたら直った）。その直しの中身は未確認。
+  コードの上では、clangd や gcc の更新でアプリのスニペットの候補だけが消える道筋は見つからなかった（clangd の問い合わせが失敗すると一覧ごと閉じる。
+  候補の数の上限で押し出されることは、完全には否定できないが、「temp」は打った文字と完全に合うので順位は上のはず。推測）
+
+直し（T1。0058571）
+- 言語ごとに出どころを 1 度だけ作り、毎回同じものを返す（languageDataFor。lsp-client と同じ書き方）。snippets.ts のほかの所と、Rust のコードは変えていない
+- 共通の TypeScript なので、macOS でもスニペットが補完に出るように変わる見込み（macOS の画面は未確認。確かめは CI の macos-latest の npm test）
+- テスト：tests/snippets.test.ts（rust・cpp・python ごとに 2 つ、合わせて 6 件。値は偽のもの）
+  - テスト 1：補完の出どころが、読み直しても、文字を打ったあとも同じ関数か。直す前は 3 つの言語とも落ちた
+    （「同じ状態で 2 回読んだ出どころが、違う関数になっている」。tests 26・pass 23・fail 3）
+  - テスト 2：temp と打つと、スニペットの temp が候補に入るか。直す前も通った
+  - 外す確かめ：直した snippets.ts の控えを作業用の場所に取り、git restore で HEAD（12e756b）のもの〔HEAD の中身と同じことを確かめた〕に戻すと、テスト 1 の 3 件が同じ文で落ちた。
+    控えから絶対パスで戻し、更新時刻を今にして、戻したファイルと控えの SHA-256 が同じ（3D835113…27BF）こと、リポジトリの中に写しがないこと（作業ツリーは 2 行だけ）を見たあと、26 件とも通った
+- 確かめ（AC 電源）：cargo fmt --check 差 0、cargo clippy --all-targets 警告 0（12.95 秒）、cargo test は lib 399 通過・0 失敗・9 無視（37.68 秒）、
+  npm test 26 件・0 失敗、npm run build 通過（2.47 秒）
+
+exe の作り直し
+- 0058571 から `npm run tauri build -- --no-bundle` で作った（AC 電源。4 分 39 秒）。10,148,864 バイト、SHA-256 B99BBA6A…0226（前の exe は 0D11006A…2A2D。大きさは同じ）
+- デスクトップの exe（0D11006A…2A2D）は入れ替えていない（入れ替えるかは利用者が決める）
+
+画面の確かめ（C++ だけ。利用者が操作した。提出・ログインはしていない）
+- exe は作り直したもの（target\release。B99BBA6A…0226）を使い、デスクトップの exe は使っていない。作業領域は、利用者が作った試し用の `%USERPROFILE%\Documents\snippet_test`（空）
+- 手順と結果
+  - snippet_test を開くと、信頼するかを聞かれたので「信頼する」
+  - 設定の「スニペット」の C++ に「temp」があった
+  - ファイル一覧の「新しいファイル」で main.cpp を作って開き、状態の欄で clangd が準備完了になった
+  - temp と打つと、スニペットの「temp」（✂ の印・「（スニペット）」の説明）と、clangd の候補の両方が出た。いちばん上がスニペットの temp で、その下に clangd の候補
+  - 矢印で選んで Tab で確定すると、スニペットの本文が展開された
+  - 打った文字を消し、アプリを × で閉じた（何も出なかった）
+- 直す前は clangd の候補だけで、スニペットの temp は出なかったので、Windows の C++ では、この直しで解決したと見る。gcc の件は、Windows でスニペットを出すためには要らなかった
+- Rust・Python の画面は見ていない（テスト 1 で 3 つの言語とも確かめたため）
+
+| 確かめ（読むだけ） | 前 | 後 |
+| --- | --- | --- |
+| settings.json | 3,406 バイト・838ADD95…0E2B | 同じ |
+| trusted.json | 403 バイト・E2506CB5…3E48 | 459 バイト・2E2B779A…E04A（snippet_test を信頼した） |
+| スニペットの C++ のファイル（snippets-cpp.json） | 34,419 バイト・36E2F99C…0F5A | 同じ |
+| アプリ・clangd のプロセス | 0・0 | 0・0 |
+| acd_studio | windows-fix-snippet-completion・0058571・作業ツリー 0 行 | 同じ |
+| snippet_test | ファイル 0・リンク 0 | main.cpp（0 バイト）だけ・リンク 0 |
+
+- 設定のフォルダは、%APPDATA% の下の名前が `.acdstudio` で終わるフォルダ（1 つ）として探した。フォルダの名前（識別子）は書いていない
+- snippet_test を消すかは、利用者が決める
+
 ### 段階 6：デバッグ
 
 **今回の移植には含めない（9 章 12。2026-10-29 に決めた）。** 段階 1 では、デバッグのコードは Windows でコンパイルが通るようにするだけで、動かさない。以下は後で行うときのための記録。
@@ -2528,6 +2616,7 @@ Turnstile
 | 追加 44（2026-11-16） | 段階 5 の進め方。ブランチは main の b4128a7 から作った windows-port-stage5（作る前に git fetch origin をした）。T2 で足すテストは cfg(windows) にし、macOS の経路は変えない。本物の提出は、練習用のコンテスト practice の practice_1 に Rust で 1 回だけ。Python・C++ は、確認のダイアログを出して中身を見たら「キャンセル」をクリックするだけ。ダイアログでは Enter を押さない。Enter で選ばれるボタンは、T4 でどちらのボタンに枠が付いているかを見るだけにし、「枠から見た推測」として書く。T3（終わったコンテストで、期間の外の知らせと公式の提出ページを開く所）では「提出」を押してよい（使うコンテストと問題を書く、終了の日時をページで先に確かめる、開いた提出のページで送らない）。T3・T4・T5 の前に、settings.json の submit.confirmDialog が true であることを読むだけの命令で確かめ、false なら止めて相談する。T4 の前に本物のログインをし、最後にログアウトする。期限切れの確かめ（本物の項目を壊れた値に書き換えるもの）は行わず、未確認のまま残す。前の会話の作業用の場所は、段階 5 のあとで利用者が決める | 段階 5 |
 | 追加 45（2026-11-17） | T4 で practice の提出のページの Turnstile のため送れなかったので、段階 5 は T3・T4（Turnstile で止まった）とログアウトの確かめまでで T6 にまとめ、push 2・PR・merge まで進める（形 A）。デイリーコンテストでの T4 の続き（ダイアログを見て「キャンセル」、もう一度出して「×」）と T5（本物の提出 1 回）は、merge のあとに新しいブランチで行う。追加 44 と段階 5 の計画の「ほかのコンテストは試さない」は、AtCoder Daily Training に限って変える：使うのは 2026-11-18 20:00〜21:00 の回。参加の登録は利用者がブラウザで先に行う（レーティングは変わらない。利用者が見た）。本物の提出は Rust で 1 回だけで、手順と解答の全文を見せ、許可のあと、「提出する」のクリックで送る。ほかの条件（ダイアログで Enter を押さない、settings.json の submit.confirmDialog の確かめ、前と後の確かめ、資格情報のスクリプトは新しく作って全文と SHA-256 を見せる、など）は追加 44 と同じ。T3 では t1 の代わりに acd-t5（%USERPROFILE%\Documents\acd-t5）を使った。acd-t5 は、段階 5 の PR が merge されるまで残し、そのあと利用者の許可で消す | 段階 5（T6） |
 | 追加 46（2026-11-18） | デイリーコンテストでの追加の確かめは、デイリーコンテスト（コンテスト ID awc0203。正式な名前は未確認）の 20:00〜21:00 の回で行った。追加 45 の「AtCoder Daily Training に限って」は、実際には awc0203 で行った（名前は未確認）。作業領域は、利用者が作った %USERPROFILE%\Documents\teisyutu_test（acd-t5 は使わなかった）。時間がないので、exe は作り直さず（03e41f5 から作ったもの。merge で変わったのは計画書だけ）、資格情報の大きさと LastWritten のスクリプトは作らずに未確認とし、前と後の確かめは cmdkey の行の数・アプリのプロセス・confirmDialog だけにした。解答は、生成 AI のルールのため、利用者が自分で書いた（作業する側は問題文を読まず、解答も書かず、助言もしない）。結果は、main（61a07f7）から作った windows-port-stage5-followup で計画書に書く。teisyutu_test と acd-t5 を消すかは、利用者が決める | 段階 5 のあと |
+| 追加 47（2026-11-19） | スニペットの補完が出ない不具合は、origin/main（12e756b）から作った windows-fix-snippet-completion と PR で直す。変えるのは、共通の TypeScript（src/editor/snippets.ts）と新しいテスト（tests/snippets.test.ts）だけで、Rust は変えない。共通のコードなので、macOS でもスニペットが補完に出るように変わる見込み。macOS の確かめは CI の macos-latest の npm test だけで、macOS の画面は未確認。原因は、テストで確かめたもの（出どころの関数が読まれるたびに作り直され、@codemirror/autocomplete が結果を捨てていた）と、元の開発者の見当（はじめは clangd の更新、のちに gcc の更新で、新しい方も見るようにしたら直った。その直しの中身は未確認）の両方を書く。画面の確かめは C++ だけにし、Rust・Python はテスト 1 で確かめた。作業領域は試し用の %USERPROFILE%\Documents\snippet_test。決めたことは、windows-features-plan.md がまだないので、この計画書に書く（windows-features-plan.md は新しい機能を始めるときに作る）。この PR では、run #51・#52 の数字と、awc0204 での C++ の提出の結果も書く | 段階 5 のあとの直し |
 
 ---
 
@@ -2587,6 +2676,8 @@ Turnstile
     「ケースごとの結果：取得できません」と出た理由と、資格情報の大きさと LastWritten は未確認）
   - 「この問題を作る」のあとの知らせの文が画面に見えなかった理由（推測：ProblemPane.tsx の、問題が変わったときの setNotice(null)）
   - C++・Python の確認のダイアログの中身と、その提出（段階 5 でも awc0203 でも見ていない）
+    （→ C++ は 2026-11-19 の awc0204 の A で確認済み：ダイアログの言語は C++23、注意の行なし、判定 AC〔利用者が普段使いで操作した〕。Python は未確認）
+- スニペットの補完の直しの macOS の画面（共通のコードなので、macOS でも出るようになる見込み。CI の npm test だけで確かめた。「スニペットの補完の直し」）
 - 段階 4 で確かめること：「段階 4」の節の下調べの表（15 項目）。言語サーバーが返す URI の形（ドライブ名の大文字・小文字と `%3A`）、clangd の `--query-driver` の読み方、pip 版の basedpyright の typeshed の場所
 - （「不明」にあった「実際の REVEL_SESSION の長さ」は、段階 3 T9 で 299 バイトと測ったので消した〔4.1 の表〕。値は記録していない）
 - macOS の動きを壊していないこと（CI の macos-latest でビルド・clippy・テストが通ったことは確認済み〔run 41023624709。段階 2 は run 42210961555〕。clippy の警告は run 42210961555 のログで 0 件。debugs_with_real_lldb_dap と画面の操作は macOS の機械で確かめる。利用者の手元に Mac がないので、macOS の画面は確かめていない）
