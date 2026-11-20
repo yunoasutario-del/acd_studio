@@ -252,6 +252,7 @@ fn debugpy_dir(tools: &Path, kind: Interpreter) -> PathBuf {
 }
 
 // debugpy を見つける。なければ、入れ方（その処理系の pip で --target に入れる命令）を返す
+#[cfg(not(windows))]
 pub fn find_debugpy(
     tools: Option<&Path>,
     kind: Interpreter,
@@ -269,6 +270,26 @@ pub fn find_debugpy(
     ))
 }
 
+// Windows（段階 6 W5）：探し方は同じ。入れ方の文は PowerShell 向けにし、引用符で始まる命令の前に & を付ける
+// （付けないと、PowerShell は引用符の中を文字列として読み、命令として動かさない。推測。docs/windows-port-plan.md 4.8）
+#[cfg(windows)]
+pub fn find_debugpy(
+    tools: Option<&Path>,
+    kind: Interpreter,
+    interpreter: &Path,
+) -> Result<PathBuf, String> {
+    let tools = tools.ok_or_else(|| "アプリのフォルダが分かりません".to_string())?;
+    let dir = debugpy_dir(tools, kind);
+    if dir.join("debugpy").join("__init__.py").is_file() {
+        return Ok(dir);
+    }
+    Err(format!(
+        "Python のデバッグには debugpy が要ります（IDE は入れません）。PowerShell で次を実行して入れてください：\n& \"{}\" -m pip install --target \"{}\" debugpy",
+        interpreter.display(),
+        dir.display()
+    ))
+}
+
 // 空いているポートを借りて、すぐ返す（debugpy に渡す。借りてから debugpy が使うまでの短い間の競合は残る）
 fn free_port() -> Result<u16, String> {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -281,6 +302,10 @@ fn free_port() -> Result<u16, String> {
 // -E・-B・-X int_max_str_digits=0 は実行と同じ。-X frozen_modules=off は debugpy がブレークポイントを見落とさないように
 fn debugpy_command(interpreter: &Path, debugpy: &Path, port: u16, script: &str) -> Command {
     let mut command = Command::new(interpreter);
+    // Windows は -X utf8 も付ける（段階 6 W2。実行の python::program・check_command と同じ。付けないと、CPython は
+    // パイプへ cp932 で出し、デバッグの出力の日本語が化ける）
+    #[cfg(windows)]
+    command.args(python::UTF8_MODE);
     command
         .args([
             "-E",
@@ -473,7 +498,11 @@ fn choose_input(
             }
             // 指定しないと lldb-dap の端末になり、入力を待ち続けるので、空の入力を渡す（01 §4）
             None => Ok((
+                #[cfg(not(windows))]
                 PathBuf::from("/dev/null"),
+                // Windows に /dev/null はなく、開けない（段階 6 W1。テスト A1 で確かめた）。NUL は空の入力になる
+                #[cfg(windows)]
+                PathBuf::from("NUL"),
                 format!(
                     "入力ファイルなし（空の標準入力で実行）。入力が必要なら {folder}/input.txt を作ってください\n"
                 ),
@@ -847,6 +876,16 @@ fn spawn_stderr_reader(
     });
 }
 
+// 起動した子のグループ（Windows は Job）を止めてから回収する。debugpy につなげなかったときに使う
+// （Windows 移植の段階 6。テストのために spawn_debugpy の中の 2 行をここに移した。動きは同じ）
+fn stop_and_reap(child: &mut Child) {
+    kill_group(child.id() as Pid);
+    let _ = child.wait();
+    // Windows：回収したので、Job の記録（プロセスのハンドルの写し）を消す（段階 6 W3。lsp.rs の Server::stop と同じ）
+    #[cfg(windows)]
+    let _ = crate::win::release_job(child.id());
+}
+
 impl Client {
     fn spawn(
         adapter: &Path,
@@ -962,8 +1001,7 @@ impl Client {
         let stream = match stream {
             Ok(stream) => stream,
             Err(message) => {
-                kill_group(pid);
-                let _ = child.wait();
+                stop_and_reap(&mut child);
                 return Err(message);
             }
         };
@@ -1229,6 +1267,9 @@ impl Client {
             stop_debuggee(debuggee);
         }
         let status = child.wait().ok();
+        // Windows：回収したので、Job の記録（プロセスのハンドルの写し）を消す（段階 6 W4。lsp.rs の Server::stop と同じ）
+        #[cfg(windows)]
+        let _ = crate::win::release_job(child.id());
         if self.shared.adapter == "debugpy" && ended {
             let mut state = self.shared.lock_state();
             if state.exit_code.is_none() {
@@ -1788,10 +1829,17 @@ mod tests {
         fs::create_dir_all(&test).unwrap();
         // input.txt がなければ /dev/null
         let (path, shown) = choose_input(&dir, Some(&test), "test", None).unwrap();
+        #[cfg(not(windows))]
         assert_eq!(path, PathBuf::from("/dev/null"));
+        // Windows は NUL（段階 6 W1）
+        #[cfg(windows)]
+        assert_eq!(path, PathBuf::from("NUL"));
         assert!(shown.contains("test/input.txt を作ってください"), "{shown}");
         let (path, _) = choose_input(&dir, None, "test", None).unwrap();
+        #[cfg(not(windows))]
         assert_eq!(path, PathBuf::from("/dev/null"));
+        #[cfg(windows)]
+        assert_eq!(path, PathBuf::from("NUL"));
         write(&test.join("input.txt"), "1\n");
         let (path, shown) = choose_input(&dir, Some(&test), "test", None).unwrap();
         assert_eq!(path, test.join("input.txt"));
@@ -1827,6 +1875,100 @@ mod tests {
         let error = choose_input(&dir, Some(&test), "test", Some("sample-9")).unwrap_err();
         assert!(error.contains("test/sample-9.in"), "{error}");
         assert!(choose_input(&dir, None, "test", Some("sample-2")).is_err());
+    }
+
+    // ---- Windows 移植の段階 6（Python。docs/windows-port-plan.md「段階 6 の Python（debugpy）の計画」） ----
+
+    // A1：input.txt もケースもないとき、標準入力にするパスを開けて、読むと空（入力を待たない）
+    #[cfg(windows)]
+    #[test]
+    fn opens_an_empty_input_without_input_files_on_windows() {
+        let ws = workspace("empty-input");
+        let dir = ws.0.join("pkg");
+        let test = dir.join("test");
+        fs::create_dir_all(&test).unwrap();
+        for test_dir in [Some(test.as_path()), None] {
+            let (path, _) = choose_input(&dir, test_dir, "test", None).unwrap();
+            let mut file = fs::File::open(&path).unwrap_or_else(|error| {
+                panic!(
+                    "標準入力にするパス {} を開けません：{error}",
+                    path.display()
+                )
+            });
+            let mut read = Vec::new();
+            file.read_to_end(&mut read).unwrap();
+            assert!(read.is_empty(), "空でない：{} バイト", read.len());
+        }
+    }
+
+    // A2：debugpy を動かす命令に -X utf8 が付く（付けないと、CPython はパイプへ cp932 で出す。4.4）
+    #[cfg(windows)]
+    #[test]
+    fn passes_utf8_mode_to_debugpy_on_windows() {
+        let command = debugpy_command(Path::new("python.exe"), Path::new("tools"), 5678, "main.py");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-X" && pair[1] == "utf8"),
+            "-X utf8 がない：{args:?}"
+        );
+    }
+
+    // テスト用の子のプログラム（30 秒眠るだけ）を、IDE と同じく Job に入れて起動する
+    #[cfg(windows)]
+    fn sleeping_child_in_job() -> Child {
+        let mut command = crate::process::command(crate::process::test_child_path());
+        command
+            .arg("sleep:30000")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        crate::win::start_in_job(&child).unwrap();
+        assert!(
+            crate::win::has_job_record(child.id()),
+            "起動したのに記録がない"
+        );
+        child
+    }
+
+    // A3：shutdown で止めたあと、Job の記録（win.rs の JOBS。プロセスのハンドルの写しを持つ）が残らない。
+    // debugpy の代わりに、テスト用の子のプログラムと、どこにもつながらないクライアントを使う（disconnect に答えないので約 2 秒）
+    #[cfg(windows)]
+    #[test]
+    fn forgets_the_job_record_after_debug_shutdown_on_windows() {
+        let mut child = sleeping_child_in_job();
+        let pid = child.id();
+        let channel = Channel::new(|_| Ok(()));
+        let (client, _notices) = Client::connect(
+            "debugpy",
+            std::io::sink(),
+            std::io::empty(),
+            Path::new("."),
+            &channel,
+        );
+        assert!(client.shutdown(&mut child), "強制的に止めたはず");
+        assert!(
+            !crate::win::has_job_record(pid),
+            "止めたあとも JOBS に pid {pid} の記録が残っている"
+        );
+    }
+
+    // A4：debugpy につなげなかったときの止め方（stop_and_reap）のあと、Job の記録が残らない
+    #[cfg(windows)]
+    #[test]
+    fn forgets_the_job_record_when_debugpy_does_not_start_on_windows() {
+        let mut child = sleeping_child_in_job();
+        let pid = child.id();
+        stop_and_reap(&mut child);
+        assert!(
+            !crate::win::has_job_record(pid),
+            "止めたあとも JOBS に pid {pid} の記録が残っている"
+        );
     }
 
     #[test]
@@ -2642,6 +2784,15 @@ main()
             )),
             "{message}"
         );
+        // Windows は PowerShell 向けの文で、命令の先頭に & が付く（段階 6 W5）
+        #[cfg(windows)]
+        assert!(
+            message.contains(&format!(
+                "PowerShell で次を実行して入れてください：\n& \"/opt/homebrew/bin/pypy3.11\" -m pip install --target \"{}\" debugpy",
+                dir.display()
+            )),
+            "{message}"
+        );
         write(&dir.join("debugpy/__init__.py"), "");
         assert_eq!(
             find_debugpy(Some(&ws.0), Interpreter::Pypy, Path::new("/x")).unwrap(),
@@ -2655,6 +2806,12 @@ main()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        // Windows は先頭に -X utf8 が付く（段階 6 W2）。残りは Unix と同じ
+        #[cfg(windows)]
+        let args = {
+            assert_eq!(args[..2], ["-X", "utf8"], "{args:?}");
+            args[2..].to_vec()
+        };
         assert_eq!(
             args[..6],
             [
