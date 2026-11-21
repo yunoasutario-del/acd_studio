@@ -1121,6 +1121,10 @@ impl Client {
             return Err("行の番号は 1 からです".to_string());
         }
         let breakpoints: Vec<Value> = lines.iter().map(|line| json!({ "line": line })).collect();
+        // Windows（段階 6 W6）：canonicalize の結果の `\\?\C:\…` のままだと、debugpy は verified で答えるのに止まらない
+        // （動いている main.py は、`\\?\` のない cwd からの相対で扱われるため。調べで確かめた）。`\\?\` を外して送る
+        #[cfg(windows)]
+        let file = crate::trust::without_verbatim(&file);
         let body = self.request(
             "setBreakpoints",
             json!({ "source": { "path": file }, "breakpoints": breakpoints }),
@@ -2229,10 +2233,18 @@ fn main() {
                         return (index + 1, event["event"].clone());
                     }
                 }
+                #[cfg(not(windows))]
                 assert!(
                     Instant::now() < until,
                     "待っている知らせが来ません：{:?}",
                     self.events.lock().unwrap()
+                );
+                // Windows（段階 6 T3）：失敗の文に、アプリの識別子とユーザーのフォルダの名前を出さない
+                #[cfg(windows)]
+                assert!(
+                    Instant::now() < until,
+                    "待っている知らせが来ません：{}",
+                    hide_names(&format!("{:?}", self.events.lock().unwrap()))
                 );
                 thread::sleep(Duration::from_millis(20));
             }
@@ -2693,7 +2705,7 @@ int main() {
 
     // ---- 本物の debugpy を使うテスト（D-226）。処理系と、アプリのフォルダの python/<処理系> の debugpy が要る ----
 
-    #[cfg(unix)]
+    // （PYTHON_SOLUTION・PY_LINE_*・python_session は、Windows 移植の段階 6 T3 で cfg(unix) を外し、Windows のテストでも使う）
     const PYTHON_SOLUTION: &str = "import sys
 
 
@@ -2721,11 +2733,8 @@ def main():
 main()
 ";
     // 行番号（PYTHON_SOLUTION の中）
-    #[cfg(unix)]
     const PY_LINE_TOTAL: u32 = 7;
-    #[cfg(unix)]
     const PY_LINE_RETURN: u32 = 8;
-    #[cfg(unix)]
     const PY_LINE_KEY_ERROR: u32 = 17;
 
     // 利用者がアプリのフォルダに入れた debugpy（なければ None）
@@ -2736,7 +2745,38 @@ main()
         tools.is_dir().then_some(tools)
     }
 
-    #[cfg(unix)]
+    // Windows（段階 6 T3）：アプリの識別子（tauri.conf.json の identifier。ここには書き写さない）
+    #[cfg(windows)]
+    fn app_identifier() -> Option<String> {
+        let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).ok()?;
+        config["identifier"].as_str().map(str::to_string)
+    }
+
+    // Windows（段階 6 T3）：利用者がアプリの設定のフォルダ（%APPDATA%\<識別子>）の python に入れた debugpy（なければ None）
+    #[cfg(windows)]
+    fn installed_python_tools() -> Option<PathBuf> {
+        let tools = PathBuf::from(std::env::var_os("APPDATA")?)
+            .join(app_identifier()?)
+            .join("python");
+        tools.is_dir().then_some(tools)
+    }
+
+    // Windows（段階 6 T3）：テストの失敗の文に、アプリの識別子とユーザーのフォルダの名前を出さない
+    #[cfg(windows)]
+    fn hide_names(text: &str) -> String {
+        let mut text = text.to_string();
+        if let Some(identifier) = app_identifier() {
+            text = text.replace(&identifier, "<識別子>");
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let home = home.to_string_lossy();
+            // {:?} で書くと `\` が 2 つになるので、その形も伏せる
+            text = text.replace(&home.replace('\\', "\\\\"), "%USERPROFILE%");
+            text = text.replace(&*home, "%USERPROFILE%");
+        }
+        text
+    }
+
     fn python_session(
         pkg: &Path,
         root: &Path,
@@ -2986,6 +3026,188 @@ main()
                 "{label}"
             );
             assert!(!pkg.join("__pycache__").exists(), "{label}");
+        }
+        eprintln!("debugpy で試した処理系：{tried}");
+    }
+
+    // A5（Windows 移植の段階 6 T3）：本物の debugpy（Windows）。Unix の debugs_python_with_real_debugpy と同じ 4 つの場面と、
+    // 5. 入力のファイルがないとき（W1）・日本語の出力（W2）。止めたあとは、子孫（debugpy のアダプター）と Job の記録が残らない。
+    // 処理系と、アプリの設定のフォルダの python\<処理系> の debugpy がなければ飛ぶ（CI では飛ぶ）。
+    // 失敗の文には、アプリの識別子とユーザーのフォルダの名前を出さない（hide_names）
+    #[cfg(windows)]
+    #[test]
+    fn debugs_python_with_real_debugpy_on_windows() {
+        let Some(tools) = installed_python_tools() else {
+            eprintln!("アプリのフォルダに debugpy がないので飛ばします");
+            return;
+        };
+        let mut tried = 0;
+        for interpreter in [Interpreter::Cpython, Interpreter::Pypy] {
+            let settings = python::PythonSettings {
+                interpreter,
+                ..python::PythonSettings::default()
+            };
+            let Ok(found) = python::find_interpreter(&settings) else {
+                eprintln!("{} がないので飛ばします", interpreter.label());
+                continue;
+            };
+            if find_debugpy(Some(&tools), interpreter, &found).is_err() {
+                eprintln!("{} の debugpy がないので飛ばします", interpreter.label());
+                continue;
+            }
+            tried += 1;
+            let ws = workspace(&format!("debugpy-windows-{}", interpreter.label()));
+            let pkg = ws.0.join("pkg");
+            write(&pkg.join("main.py"), PYTHON_SOLUTION);
+            write(&pkg.join("test/input.txt"), "5\n");
+            write(&pkg.join("test/sample-1.in"), "7\n");
+            write(&pkg.join("test/sample-2.in"), "9\n");
+            write(&pkg.join("test/sample-3.in"), "11\n");
+            let label = interpreter.label();
+
+            // 1. ブレークポイント（作業領域のルートは `\\?\` の付いた形。W6 で外して送ると止まり、作業領域の中のファイルと分かるか）
+            let started = Instant::now();
+            let session = python_session(&pkg, &ws.0, None, &[PY_LINE_TOTAL], interpreter, &tools);
+            let (since, stopped) = session.wait_stopped(0);
+            eprintln!("{label}：始めてから止まるまで {:?}", started.elapsed());
+            assert_eq!(stopped["reason"], "breakpoint", "{label}");
+            let log = session.log();
+            assert!(
+                log.contains("デバッグアダプター：debugpy 1."),
+                "{}",
+                hide_names(&log)
+            );
+            assert!(log.contains(PYTHON_DEBUG_NOTE), "{}", hide_names(&log));
+            assert!(
+                log.contains("標準入力：test/input.txt"),
+                "{}",
+                hide_names(&log)
+            );
+            let client = session.client();
+            let stack = client.stack().unwrap();
+            let shown = hide_names(&format!("{stack:?}"));
+            assert_eq!(stack[0].name, "solve", "{label}：{shown}");
+            assert_eq!(stack[0].line, PY_LINE_TOTAL as u64, "{shown}");
+            assert_eq!(
+                stack[0].workspace_path.as_deref(),
+                Some("pkg/main.py"),
+                "{shown}"
+            );
+            assert!(
+                stack
+                    .iter()
+                    .all(|frame| frame.source.as_deref() != Some("<string>")),
+                "{shown}"
+            );
+            assert_eq!(stack.last().unwrap().name, "<module>", "{shown}");
+            let scopes = client.scopes(stack[0].id).unwrap();
+            let locals = client.variables(scopes[0].variables_reference).unwrap();
+            let value = |name: &str| {
+                locals
+                    .iter()
+                    .find(|v| v.name == name)
+                    .map(|v| v.value.clone())
+                    .unwrap_or_else(|| panic!("{name} がない：{locals:?}"))
+            };
+            assert_eq!(value("n"), "5");
+            assert_eq!(value("xs"), "[0, 1, 4, 9, 16]");
+            let watch = client
+                .evaluate("n + len(xs)", Some(stack[0].id), EvaluateContext::Watch)
+                .unwrap();
+            assert_eq!(watch.result, "10");
+            let repl = client
+                .evaluate("s.upper()", Some(stack[0].id), EvaluateContext::Repl)
+                .unwrap();
+            assert_eq!(repl.result, "'ABC'");
+            client.step(StepAction::Next).unwrap();
+            let (since, _) = session.wait_stopped(since);
+            assert_eq!(client.stack().unwrap()[0].line, PY_LINE_RETURN as u64);
+            client.set_breakpoints("pkg/main.py", &[]).unwrap();
+            client.step(StepAction::Continue).unwrap();
+            let (_, exited) = session.wait(since, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 0, "{label}");
+            // 出力は 1 回だけ。CPython の print はパイプで CRLF（docs/windows-port-plan.md 4.3）
+            assert_eq!(session.output(), "30\r\n", "{label}");
+            assert!(
+                !session.log().contains("debugpy：30"),
+                "{}",
+                hide_names(&session.log())
+            );
+            drop(client);
+            assert!(matches!(
+                session.finish(),
+                Finish::Debugged {
+                    exit_code: Some(0),
+                    stopped: false
+                }
+            ));
+
+            // 2. 捕まえていない例外で、その行で止まる
+            let session = python_session(&pkg, &ws.0, Some("sample-1"), &[], interpreter, &tools);
+            let (since, stopped) = session.wait_stopped(0);
+            assert_eq!(stopped["reason"], "exception", "{label}");
+            let client = session.client();
+            assert_eq!(client.stack().unwrap()[0].line, PY_LINE_KEY_ERROR as u64);
+            client.step(StepAction::Continue).unwrap();
+            let (_, exited) = session.wait(since, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 1, "{label}");
+            drop(client);
+            session.finish();
+
+            // 3. exit(3) では止まらず、終了コード 3
+            let session = python_session(&pkg, &ws.0, Some("sample-2"), &[], interpreter, &tools);
+            let (_, exited) = session.wait(0, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 3, "{label}");
+            assert!(
+                !session
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["type"] == "debug" && e["event"]["kind"] == "stopped"),
+                "{label}"
+            );
+            session.finish();
+
+            // 4. 回り続けているところを止める。デバッグ対象と、その子孫（debugpy のアダプター）と、Job の記録が残らない
+            let session = python_session(&pkg, &ws.0, Some("sample-3"), &[], interpreter, &tools);
+            let pid = loop {
+                if let Some(pid) = session.debuggee_pid() {
+                    break pid;
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            thread::sleep(Duration::from_millis(500));
+            session.cancel.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                session.finish(),
+                Finish::Debugged { stopped: true, .. }
+            ));
+            assert_gone(pid);
+            let left = crate::win::descendants(pid as u32);
+            assert!(left.is_empty(), "{label}：子孫が残っている：{left:?}");
+            assert!(
+                !crate::win::has_job_record(pid as u32),
+                "{label}：Job の記録が残っている"
+            );
+            assert!(!pkg.join("__pycache__").exists(), "{label}");
+
+            // 5. 入力のファイルがないとき（NUL。W1）は入力を待たずに終わり、日本語の出力が化けない（-X utf8。W2）
+            write(
+                &pkg.join("main.py"),
+                "import sys\nprint(\"あいう\")\nprint(len(sys.stdin.read()))\n",
+            );
+            fs::remove_file(pkg.join("test/input.txt")).unwrap();
+            let session = python_session(&pkg, &ws.0, None, &[], interpreter, &tools);
+            let (_, exited) = session.wait(0, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 0, "{label}");
+            assert!(
+                session.log().contains("入力ファイルなし"),
+                "{}",
+                hide_names(&session.log())
+            );
+            assert_eq!(session.output(), "あいう\r\n0\r\n", "{label}");
+            session.finish();
         }
         eprintln!("debugpy で試した処理系：{tried}");
     }
