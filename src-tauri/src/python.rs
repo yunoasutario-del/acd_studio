@@ -631,8 +631,9 @@ pub fn program(interpreter: &Path, script: &str) -> Program {
 
 // Windows（段階 2 S7。4.4）：Python に付ける -X utf8。付けないと、CPython は標準入出力（パイプ）を cp932 で読み書きし、
 // 日本語は化け、cp932 にない文字は UnicodeEncodeError になる。ほかの引数より前に置く
+// （段階 6 W2：debug.rs の debugpy_command でも使う）
 #[cfg(windows)]
-const UTF8_MODE: [&str; 2] = ["-X", "utf8"];
+pub(crate) const UTF8_MODE: [&str; 2] = ["-X", "utf8"];
 
 // 構文を確かめる小さな命令（compile だけで、動かさず、__pycache__ も作らない）。
 // 誤りなら「行<TAB>列<TAB>メッセージ」を 1 行出して 1 で終わる

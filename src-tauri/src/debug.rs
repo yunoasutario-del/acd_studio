@@ -252,6 +252,7 @@ fn debugpy_dir(tools: &Path, kind: Interpreter) -> PathBuf {
 }
 
 // debugpy を見つける。なければ、入れ方（その処理系の pip で --target に入れる命令）を返す
+#[cfg(not(windows))]
 pub fn find_debugpy(
     tools: Option<&Path>,
     kind: Interpreter,
@@ -269,6 +270,26 @@ pub fn find_debugpy(
     ))
 }
 
+// Windows（段階 6 W5）：探し方は同じ。入れ方の文は PowerShell 向けにし、引用符で始まる命令の前に & を付ける
+// （付けないと、PowerShell は引用符の中を文字列として読み、命令として動かさない。推測。docs/windows-port-plan.md 4.8）
+#[cfg(windows)]
+pub fn find_debugpy(
+    tools: Option<&Path>,
+    kind: Interpreter,
+    interpreter: &Path,
+) -> Result<PathBuf, String> {
+    let tools = tools.ok_or_else(|| "アプリのフォルダが分かりません".to_string())?;
+    let dir = debugpy_dir(tools, kind);
+    if dir.join("debugpy").join("__init__.py").is_file() {
+        return Ok(dir);
+    }
+    Err(format!(
+        "Python のデバッグには debugpy が要ります（IDE は入れません）。PowerShell で次を実行して入れてください：\n& \"{}\" -m pip install --target \"{}\" debugpy",
+        interpreter.display(),
+        dir.display()
+    ))
+}
+
 // 空いているポートを借りて、すぐ返す（debugpy に渡す。借りてから debugpy が使うまでの短い間の競合は残る）
 fn free_port() -> Result<u16, String> {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -281,6 +302,15 @@ fn free_port() -> Result<u16, String> {
 // -E・-B・-X int_max_str_digits=0 は実行と同じ。-X frozen_modules=off は debugpy がブレークポイントを見落とさないように
 fn debugpy_command(interpreter: &Path, debugpy: &Path, port: u16, script: &str) -> Command {
     let mut command = Command::new(interpreter);
+    // Windows は -X utf8 も付ける（段階 6 W2。実行の python::program・check_command と同じ。付けないと、CPython は
+    // パイプへ cp932 で出し、デバッグの出力の日本語が化ける）。
+    // -u も付ける（段階 6 W7。付けないと、パイプへの標準出力がまとめて書かれ、止まっている間や強制的に止めたときに届かない）。
+    // -E があるので PYTHONUNBUFFERED は効かない。そのため -u で渡す
+    #[cfg(windows)]
+    {
+        command.args(python::UTF8_MODE);
+        command.arg("-u");
+    }
     command
         .args([
             "-E",
@@ -473,7 +503,11 @@ fn choose_input(
             }
             // 指定しないと lldb-dap の端末になり、入力を待ち続けるので、空の入力を渡す（01 §4）
             None => Ok((
+                #[cfg(not(windows))]
                 PathBuf::from("/dev/null"),
+                // Windows に /dev/null はなく、開けない（段階 6 W1。テスト A1 で確かめた）。NUL は空の入力になる
+                #[cfg(windows)]
+                PathBuf::from("NUL"),
                 format!(
                     "入力ファイルなし（空の標準入力で実行）。入力が必要なら {folder}/input.txt を作ってください\n"
                 ),
@@ -847,6 +881,16 @@ fn spawn_stderr_reader(
     });
 }
 
+// 起動した子のグループ（Windows は Job）を止めてから回収する。debugpy につなげなかったときに使う
+// （Windows 移植の段階 6。テストのために spawn_debugpy の中の 2 行をここに移した。動きは同じ）
+fn stop_and_reap(child: &mut Child) {
+    kill_group(child.id() as Pid);
+    let _ = child.wait();
+    // Windows：回収したので、Job の記録（プロセスのハンドルの写し）を消す（段階 6 W3。lsp.rs の Server::stop と同じ）
+    #[cfg(windows)]
+    let _ = crate::win::release_job(child.id());
+}
+
 impl Client {
     fn spawn(
         adapter: &Path,
@@ -962,8 +1006,7 @@ impl Client {
         let stream = match stream {
             Ok(stream) => stream,
             Err(message) => {
-                kill_group(pid);
-                let _ = child.wait();
+                stop_and_reap(&mut child);
                 return Err(message);
             }
         };
@@ -1083,6 +1126,10 @@ impl Client {
             return Err("行の番号は 1 からです".to_string());
         }
         let breakpoints: Vec<Value> = lines.iter().map(|line| json!({ "line": line })).collect();
+        // Windows（段階 6 W6）：canonicalize の結果の `\\?\C:\…` のままだと、debugpy は verified で答えるのに止まらない
+        // （動いている main.py は、`\\?\` のない cwd からの相対で扱われるため。調べで確かめた）。`\\?\` を外して送る
+        #[cfg(windows)]
+        let file = crate::trust::without_verbatim(&file);
         let body = self.request(
             "setBreakpoints",
             json!({ "source": { "path": file }, "breakpoints": breakpoints }),
@@ -1229,6 +1276,9 @@ impl Client {
             stop_debuggee(debuggee);
         }
         let status = child.wait().ok();
+        // Windows：回収したので、Job の記録（プロセスのハンドルの写し）を消す（段階 6 W4。lsp.rs の Server::stop と同じ）
+        #[cfg(windows)]
+        let _ = crate::win::release_job(child.id());
         if self.shared.adapter == "debugpy" && ended {
             let mut state = self.shared.lock_state();
             if state.exit_code.is_none() {
@@ -1788,10 +1838,17 @@ mod tests {
         fs::create_dir_all(&test).unwrap();
         // input.txt がなければ /dev/null
         let (path, shown) = choose_input(&dir, Some(&test), "test", None).unwrap();
+        #[cfg(not(windows))]
         assert_eq!(path, PathBuf::from("/dev/null"));
+        // Windows は NUL（段階 6 W1）
+        #[cfg(windows)]
+        assert_eq!(path, PathBuf::from("NUL"));
         assert!(shown.contains("test/input.txt を作ってください"), "{shown}");
         let (path, _) = choose_input(&dir, None, "test", None).unwrap();
+        #[cfg(not(windows))]
         assert_eq!(path, PathBuf::from("/dev/null"));
+        #[cfg(windows)]
+        assert_eq!(path, PathBuf::from("NUL"));
         write(&test.join("input.txt"), "1\n");
         let (path, shown) = choose_input(&dir, Some(&test), "test", None).unwrap();
         assert_eq!(path, test.join("input.txt"));
@@ -1827,6 +1884,118 @@ mod tests {
         let error = choose_input(&dir, Some(&test), "test", Some("sample-9")).unwrap_err();
         assert!(error.contains("test/sample-9.in"), "{error}");
         assert!(choose_input(&dir, None, "test", Some("sample-2")).is_err());
+    }
+
+    // ---- Windows 移植の段階 6（Python。docs/windows-port-plan.md「段階 6 の Python（debugpy）の計画」） ----
+
+    // A1：input.txt もケースもないとき、標準入力にするパスを開けて、読むと空（入力を待たない）
+    #[cfg(windows)]
+    #[test]
+    fn opens_an_empty_input_without_input_files_on_windows() {
+        let ws = workspace("empty-input");
+        let dir = ws.0.join("pkg");
+        let test = dir.join("test");
+        fs::create_dir_all(&test).unwrap();
+        for test_dir in [Some(test.as_path()), None] {
+            let (path, _) = choose_input(&dir, test_dir, "test", None).unwrap();
+            let mut file = fs::File::open(&path).unwrap_or_else(|error| {
+                panic!(
+                    "標準入力にするパス {} を開けません：{error}",
+                    path.display()
+                )
+            });
+            let mut read = Vec::new();
+            file.read_to_end(&mut read).unwrap();
+            assert!(read.is_empty(), "空でない：{} バイト", read.len());
+        }
+    }
+
+    // A2：debugpy を動かす命令に -X utf8 が付く（付けないと、CPython はパイプへ cp932 で出す。4.4）
+    #[cfg(windows)]
+    #[test]
+    fn passes_utf8_mode_to_debugpy_on_windows() {
+        let command = debugpy_command(Path::new("python.exe"), Path::new("tools"), 5678, "main.py");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-X" && pair[1] == "utf8"),
+            "-X utf8 がない：{args:?}"
+        );
+    }
+
+    // A6：debugpy を動かす命令に -u が、-c より前（処理系への指定）に付く（段階 6 W7。付けないと、パイプへの標準出力が
+    // まとめて書かれ、止まっている間や強制的に止めたときに出力が届かない）
+    #[cfg(windows)]
+    #[test]
+    fn passes_unbuffered_to_debugpy_on_windows() {
+        let command = debugpy_command(Path::new("python.exe"), Path::new("tools"), 5678, "main.py");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let unbuffered = args.iter().position(|arg| arg == "-u");
+        let script = args.iter().position(|arg| arg == "-c");
+        assert!(
+            matches!((unbuffered, script), (Some(u), Some(c)) if u < c),
+            "-c より前に -u がない：{args:?}"
+        );
+    }
+
+    // テスト用の子のプログラム（30 秒眠るだけ）を、IDE と同じく Job に入れて起動する
+    #[cfg(windows)]
+    fn sleeping_child_in_job() -> Child {
+        let mut command = crate::process::command(crate::process::test_child_path());
+        command
+            .arg("sleep:30000")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        crate::win::start_in_job(&child).unwrap();
+        assert!(
+            crate::win::has_job_record(child.id()),
+            "起動したのに記録がない"
+        );
+        child
+    }
+
+    // A3：shutdown で止めたあと、Job の記録（win.rs の JOBS。プロセスのハンドルの写しを持つ）が残らない。
+    // debugpy の代わりに、テスト用の子のプログラムと、どこにもつながらないクライアントを使う（disconnect に答えないので約 2 秒）
+    #[cfg(windows)]
+    #[test]
+    fn forgets_the_job_record_after_debug_shutdown_on_windows() {
+        let mut child = sleeping_child_in_job();
+        let pid = child.id();
+        let channel = Channel::new(|_| Ok(()));
+        let (client, _notices) = Client::connect(
+            "debugpy",
+            std::io::sink(),
+            std::io::empty(),
+            Path::new("."),
+            &channel,
+        );
+        assert!(client.shutdown(&mut child), "強制的に止めたはず");
+        assert!(
+            !crate::win::has_job_record(pid),
+            "止めたあとも JOBS に pid {pid} の記録が残っている"
+        );
+    }
+
+    // A4：debugpy につなげなかったときの止め方（stop_and_reap）のあと、Job の記録が残らない
+    #[cfg(windows)]
+    #[test]
+    fn forgets_the_job_record_when_debugpy_does_not_start_on_windows() {
+        let mut child = sleeping_child_in_job();
+        let pid = child.id();
+        stop_and_reap(&mut child);
+        assert!(
+            !crate::win::has_job_record(pid),
+            "止めたあとも JOBS に pid {pid} の記録が残っている"
+        );
     }
 
     #[test]
@@ -2087,10 +2256,18 @@ fn main() {
                         return (index + 1, event["event"].clone());
                     }
                 }
+                #[cfg(not(windows))]
                 assert!(
                     Instant::now() < until,
                     "待っている知らせが来ません：{:?}",
                     self.events.lock().unwrap()
+                );
+                // Windows（段階 6 T3）：失敗の文に、アプリの識別子とユーザーのフォルダの名前を出さない
+                #[cfg(windows)]
+                assert!(
+                    Instant::now() < until,
+                    "待っている知らせが来ません：{}",
+                    hide_names(&format!("{:?}", self.events.lock().unwrap()))
                 );
                 thread::sleep(Duration::from_millis(20));
             }
@@ -2551,7 +2728,7 @@ int main() {
 
     // ---- 本物の debugpy を使うテスト（D-226）。処理系と、アプリのフォルダの python/<処理系> の debugpy が要る ----
 
-    #[cfg(unix)]
+    // （PYTHON_SOLUTION・PY_LINE_*・python_session は、Windows 移植の段階 6 T3 で cfg(unix) を外し、Windows のテストでも使う）
     const PYTHON_SOLUTION: &str = "import sys
 
 
@@ -2579,11 +2756,8 @@ def main():
 main()
 ";
     // 行番号（PYTHON_SOLUTION の中）
-    #[cfg(unix)]
     const PY_LINE_TOTAL: u32 = 7;
-    #[cfg(unix)]
     const PY_LINE_RETURN: u32 = 8;
-    #[cfg(unix)]
     const PY_LINE_KEY_ERROR: u32 = 17;
 
     // 利用者がアプリのフォルダに入れた debugpy（なければ None）
@@ -2594,7 +2768,38 @@ main()
         tools.is_dir().then_some(tools)
     }
 
-    #[cfg(unix)]
+    // Windows（段階 6 T3）：アプリの識別子（tauri.conf.json の identifier。ここには書き写さない）
+    #[cfg(windows)]
+    fn app_identifier() -> Option<String> {
+        let config: Value = serde_json::from_str(include_str!("../tauri.conf.json")).ok()?;
+        config["identifier"].as_str().map(str::to_string)
+    }
+
+    // Windows（段階 6 T3）：利用者がアプリの設定のフォルダ（%APPDATA%\<識別子>）の python に入れた debugpy（なければ None）
+    #[cfg(windows)]
+    fn installed_python_tools() -> Option<PathBuf> {
+        let tools = PathBuf::from(std::env::var_os("APPDATA")?)
+            .join(app_identifier()?)
+            .join("python");
+        tools.is_dir().then_some(tools)
+    }
+
+    // Windows（段階 6 T3）：テストの失敗の文に、アプリの識別子とユーザーのフォルダの名前を出さない
+    #[cfg(windows)]
+    fn hide_names(text: &str) -> String {
+        let mut text = text.to_string();
+        if let Some(identifier) = app_identifier() {
+            text = text.replace(&identifier, "<識別子>");
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let home = home.to_string_lossy();
+            // {:?} で書くと `\` が 2 つになるので、その形も伏せる
+            text = text.replace(&home.replace('\\', "\\\\"), "%USERPROFILE%");
+            text = text.replace(&*home, "%USERPROFILE%");
+        }
+        text
+    }
+
     fn python_session(
         pkg: &Path,
         root: &Path,
@@ -2642,6 +2847,15 @@ main()
             )),
             "{message}"
         );
+        // Windows は PowerShell 向けの文で、命令の先頭に & が付く（段階 6 W5）
+        #[cfg(windows)]
+        assert!(
+            message.contains(&format!(
+                "PowerShell で次を実行して入れてください：\n& \"/opt/homebrew/bin/pypy3.11\" -m pip install --target \"{}\" debugpy",
+                dir.display()
+            )),
+            "{message}"
+        );
         write(&dir.join("debugpy/__init__.py"), "");
         assert_eq!(
             find_debugpy(Some(&ws.0), Interpreter::Pypy, Path::new("/x")).unwrap(),
@@ -2655,6 +2869,12 @@ main()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        // Windows は先頭に -X utf8（段階 6 W2）と -u（段階 6 W7）が付く。残りは Unix と同じ
+        #[cfg(windows)]
+        let args = {
+            assert_eq!(args[..3], ["-X", "utf8", "-u"], "{args:?}");
+            args[3..].to_vec()
+        };
         assert_eq!(
             args[..6],
             [
@@ -2829,6 +3049,203 @@ main()
                 "{label}"
             );
             assert!(!pkg.join("__pycache__").exists(), "{label}");
+        }
+        eprintln!("debugpy で試した処理系：{tried}");
+    }
+
+    // 1 つの output の知らせが、標準出力で、text に word を含むか（段階 6 T4。A5 の W7 の確かめ用。
+    // wait の条件の中で呼ぶので、events のロックは取らない）
+    #[cfg(windows)]
+    fn stdout_contains(event: &Value, word: &str) -> bool {
+        event["kind"] == "output"
+            && event["category"] == "stdout"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(word))
+    }
+
+    // A5（Windows 移植の段階 6 T3）：本物の debugpy（Windows）。Unix の debugs_python_with_real_debugpy と同じ 4 つの場面と、
+    // 5. 入力のファイルがないとき（W1）・日本語の出力（W2）。止めたあとは、子孫（debugpy のアダプター）と Job の記録が残らない。
+    // 処理系と、アプリの設定のフォルダの python\<処理系> の debugpy がなければ飛ぶ（CI では飛ぶ）。
+    // 失敗の文には、アプリの識別子とユーザーのフォルダの名前を出さない（hide_names）
+    #[cfg(windows)]
+    #[test]
+    fn debugs_python_with_real_debugpy_on_windows() {
+        let Some(tools) = installed_python_tools() else {
+            eprintln!("アプリのフォルダに debugpy がないので飛ばします");
+            return;
+        };
+        let mut tried = 0;
+        for interpreter in [Interpreter::Cpython, Interpreter::Pypy] {
+            let settings = python::PythonSettings {
+                interpreter,
+                ..python::PythonSettings::default()
+            };
+            let Ok(found) = python::find_interpreter(&settings) else {
+                eprintln!("{} がないので飛ばします", interpreter.label());
+                continue;
+            };
+            if find_debugpy(Some(&tools), interpreter, &found).is_err() {
+                eprintln!("{} の debugpy がないので飛ばします", interpreter.label());
+                continue;
+            }
+            tried += 1;
+            let ws = workspace(&format!("debugpy-windows-{}", interpreter.label()));
+            let pkg = ws.0.join("pkg");
+            write(&pkg.join("main.py"), PYTHON_SOLUTION);
+            write(&pkg.join("test/input.txt"), "5\n");
+            write(&pkg.join("test/sample-1.in"), "7\n");
+            write(&pkg.join("test/sample-2.in"), "9\n");
+            write(&pkg.join("test/sample-3.in"), "11\n");
+            let label = interpreter.label();
+
+            // 1. ブレークポイント（作業領域のルートは `\\?\` の付いた形。W6 で外して送ると止まり、作業領域の中のファイルと分かるか）
+            let started = Instant::now();
+            let session = python_session(&pkg, &ws.0, None, &[PY_LINE_TOTAL], interpreter, &tools);
+            let (since, stopped) = session.wait_stopped(0);
+            eprintln!("{label}：始めてから止まるまで {:?}", started.elapsed());
+            assert_eq!(stopped["reason"], "breakpoint", "{label}");
+            let log = session.log();
+            assert!(
+                log.contains("デバッグアダプター：debugpy 1."),
+                "{}",
+                hide_names(&log)
+            );
+            assert!(log.contains(PYTHON_DEBUG_NOTE), "{}", hide_names(&log));
+            assert!(
+                log.contains("標準入力：test/input.txt"),
+                "{}",
+                hide_names(&log)
+            );
+            let client = session.client();
+            let stack = client.stack().unwrap();
+            let shown = hide_names(&format!("{stack:?}"));
+            assert_eq!(stack[0].name, "solve", "{label}：{shown}");
+            assert_eq!(stack[0].line, PY_LINE_TOTAL as u64, "{shown}");
+            assert_eq!(
+                stack[0].workspace_path.as_deref(),
+                Some("pkg/main.py"),
+                "{shown}"
+            );
+            assert!(
+                stack
+                    .iter()
+                    .all(|frame| frame.source.as_deref() != Some("<string>")),
+                "{shown}"
+            );
+            assert_eq!(stack.last().unwrap().name, "<module>", "{shown}");
+            let scopes = client.scopes(stack[0].id).unwrap();
+            let locals = client.variables(scopes[0].variables_reference).unwrap();
+            let value = |name: &str| {
+                locals
+                    .iter()
+                    .find(|v| v.name == name)
+                    .map(|v| v.value.clone())
+                    .unwrap_or_else(|| panic!("{name} がない：{locals:?}"))
+            };
+            assert_eq!(value("n"), "5");
+            assert_eq!(value("xs"), "[0, 1, 4, 9, 16]");
+            let watch = client
+                .evaluate("n + len(xs)", Some(stack[0].id), EvaluateContext::Watch)
+                .unwrap();
+            assert_eq!(watch.result, "10");
+            let repl = client
+                .evaluate("s.upper()", Some(stack[0].id), EvaluateContext::Repl)
+                .unwrap();
+            assert_eq!(repl.result, "'ABC'");
+            client.step(StepAction::Next).unwrap();
+            let (since, _) = session.wait_stopped(since);
+            assert_eq!(client.stack().unwrap()[0].line, PY_LINE_RETURN as u64);
+            client.set_breakpoints("pkg/main.py", &[]).unwrap();
+            client.step(StepAction::Continue).unwrap();
+            let (_, exited) = session.wait(since, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 0, "{label}");
+            // 出力は 1 回だけ。CPython の print はパイプで CRLF（docs/windows-port-plan.md 4.3）
+            assert_eq!(session.output(), "30\r\n", "{label}");
+            assert!(
+                !session.log().contains("debugpy：30"),
+                "{}",
+                hide_names(&session.log())
+            );
+            drop(client);
+            assert!(matches!(
+                session.finish(),
+                Finish::Debugged {
+                    exit_code: Some(0),
+                    stopped: false
+                }
+            ));
+
+            // 2. 捕まえていない例外で、その行で止まる
+            let session = python_session(&pkg, &ws.0, Some("sample-1"), &[], interpreter, &tools);
+            let (since, stopped) = session.wait_stopped(0);
+            assert_eq!(stopped["reason"], "exception", "{label}");
+            // 止まっている間に、止まる前の出力（91）が届いている（W7。止まった知らせより前に届くので、0 から探す）
+            session.wait(0, |event| stdout_contains(event, "91"));
+            let client = session.client();
+            assert_eq!(client.stack().unwrap()[0].line, PY_LINE_KEY_ERROR as u64);
+            client.step(StepAction::Continue).unwrap();
+            let (_, exited) = session.wait(since, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 1, "{label}");
+            drop(client);
+            session.finish();
+
+            // 3. exit(3) では止まらず、終了コード 3
+            let session = python_session(&pkg, &ws.0, Some("sample-2"), &[], interpreter, &tools);
+            let (_, exited) = session.wait(0, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 3, "{label}");
+            assert!(
+                !session
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["type"] == "debug" && e["event"]["kind"] == "stopped"),
+                "{label}"
+            );
+            session.finish();
+
+            // 4. 回り続けているところを止める。デバッグ対象と、その子孫（debugpy のアダプター）と、Job の記録が残らない
+            let session = python_session(&pkg, &ws.0, Some("sample-3"), &[], interpreter, &tools);
+            let pid = loop {
+                if let Some(pid) = session.debuggee_pid() {
+                    break pid;
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            // 止める前に、回り始める前の出力（385）が届いている（W7）
+            session.wait(0, |event| stdout_contains(event, "385"));
+            thread::sleep(Duration::from_millis(500));
+            session.cancel.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                session.finish(),
+                Finish::Debugged { stopped: true, .. }
+            ));
+            assert_gone(pid);
+            let left = crate::win::descendants(pid as u32);
+            assert!(left.is_empty(), "{label}：子孫が残っている：{left:?}");
+            assert!(
+                !crate::win::has_job_record(pid as u32),
+                "{label}：Job の記録が残っている"
+            );
+            assert!(!pkg.join("__pycache__").exists(), "{label}");
+
+            // 5. 入力のファイルがないとき（NUL。W1）は入力を待たずに終わり、日本語の出力が化けない（-X utf8。W2）
+            write(
+                &pkg.join("main.py"),
+                "import sys\nprint(\"あいう\")\nprint(len(sys.stdin.read()))\n",
+            );
+            fs::remove_file(pkg.join("test/input.txt")).unwrap();
+            let session = python_session(&pkg, &ws.0, None, &[], interpreter, &tools);
+            let (_, exited) = session.wait(0, |event| event["kind"] == "exited");
+            assert_eq!(exited["code"], 0, "{label}");
+            assert!(
+                session.log().contains("入力ファイルなし"),
+                "{}",
+                hide_names(&session.log())
+            );
+            assert_eq!(session.output(), "あいう\r\n0\r\n", "{label}");
+            session.finish();
         }
         eprintln!("debugpy で試した処理系：{tried}");
     }
