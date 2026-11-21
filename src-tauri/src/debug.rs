@@ -303,9 +303,14 @@ fn free_port() -> Result<u16, String> {
 fn debugpy_command(interpreter: &Path, debugpy: &Path, port: u16, script: &str) -> Command {
     let mut command = Command::new(interpreter);
     // Windows は -X utf8 も付ける（段階 6 W2。実行の python::program・check_command と同じ。付けないと、CPython は
-    // パイプへ cp932 で出し、デバッグの出力の日本語が化ける）
+    // パイプへ cp932 で出し、デバッグの出力の日本語が化ける）。
+    // -u も付ける（段階 6 W7。付けないと、パイプへの標準出力がまとめて書かれ、止まっている間や強制的に止めたときに届かない）。
+    // -E があるので PYTHONUNBUFFERED は効かない。そのため -u で渡す
     #[cfg(windows)]
-    command.args(python::UTF8_MODE);
+    {
+        command.args(python::UTF8_MODE);
+        command.arg("-u");
+    }
     command
         .args([
             "-E",
@@ -1921,6 +1926,24 @@ mod tests {
         );
     }
 
+    // A6：debugpy を動かす命令に -u が、-c より前（処理系への指定）に付く（段階 6 W7。付けないと、パイプへの標準出力が
+    // まとめて書かれ、止まっている間や強制的に止めたときに出力が届かない）
+    #[cfg(windows)]
+    #[test]
+    fn passes_unbuffered_to_debugpy_on_windows() {
+        let command = debugpy_command(Path::new("python.exe"), Path::new("tools"), 5678, "main.py");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let unbuffered = args.iter().position(|arg| arg == "-u");
+        let script = args.iter().position(|arg| arg == "-c");
+        assert!(
+            matches!((unbuffered, script), (Some(u), Some(c)) if u < c),
+            "-c より前に -u がない：{args:?}"
+        );
+    }
+
     // テスト用の子のプログラム（30 秒眠るだけ）を、IDE と同じく Job に入れて起動する
     #[cfg(windows)]
     fn sleeping_child_in_job() -> Child {
@@ -2846,11 +2869,11 @@ main()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        // Windows は先頭に -X utf8 が付く（段階 6 W2）。残りは Unix と同じ
+        // Windows は先頭に -X utf8（段階 6 W2）と -u（段階 6 W7）が付く。残りは Unix と同じ
         #[cfg(windows)]
         let args = {
-            assert_eq!(args[..2], ["-X", "utf8"], "{args:?}");
-            args[2..].to_vec()
+            assert_eq!(args[..3], ["-X", "utf8", "-u"], "{args:?}");
+            args[3..].to_vec()
         };
         assert_eq!(
             args[..6],
@@ -3030,6 +3053,17 @@ main()
         eprintln!("debugpy で試した処理系：{tried}");
     }
 
+    // 1 つの output の知らせが、標準出力で、text に word を含むか（段階 6 T4。A5 の W7 の確かめ用。
+    // wait の条件の中で呼ぶので、events のロックは取らない）
+    #[cfg(windows)]
+    fn stdout_contains(event: &Value, word: &str) -> bool {
+        event["kind"] == "output"
+            && event["category"] == "stdout"
+            && event["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(word))
+    }
+
     // A5（Windows 移植の段階 6 T3）：本物の debugpy（Windows）。Unix の debugs_python_with_real_debugpy と同じ 4 つの場面と、
     // 5. 入力のファイルがないとき（W1）・日本語の出力（W2）。止めたあとは、子孫（debugpy のアダプター）と Job の記録が残らない。
     // 処理系と、アプリの設定のフォルダの python\<処理系> の debugpy がなければ飛ぶ（CI では飛ぶ）。
@@ -3146,6 +3180,8 @@ main()
             let session = python_session(&pkg, &ws.0, Some("sample-1"), &[], interpreter, &tools);
             let (since, stopped) = session.wait_stopped(0);
             assert_eq!(stopped["reason"], "exception", "{label}");
+            // 止まっている間に、止まる前の出力（91）が届いている（W7。止まった知らせより前に届くので、0 から探す）
+            session.wait(0, |event| stdout_contains(event, "91"));
             let client = session.client();
             assert_eq!(client.stack().unwrap()[0].line, PY_LINE_KEY_ERROR as u64);
             client.step(StepAction::Continue).unwrap();
@@ -3177,6 +3213,8 @@ main()
                 }
                 thread::sleep(Duration::from_millis(20));
             };
+            // 止める前に、回り始める前の出力（385）が届いている（W7）
+            session.wait(0, |event| stdout_contains(event, "385"));
             thread::sleep(Duration::from_millis(500));
             session.cancel.store(true, Ordering::SeqCst);
             assert!(matches!(
