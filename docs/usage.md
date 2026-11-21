@@ -311,6 +311,7 @@ S = [input() for _ in range(N)]
 - 捕まえていない例外（`KeyError`・`IndexError` など）が起きると、その行で止まります。`exit()`・`sys.exit()` では止まりません。
 - debugpy の上で動かすため、通常の実行よりかなり遅くなります。
 - デバッグコンソールでは Python の式を入力できます（LLDB のコマンドは使えません）。
+- **Windows**：Windows でデバッグできるのは、今は Python（CPython）だけです。C++・Rust のデバッグはまだ使えず、PyPy でのデバッグは試していません。debugpy は、初めて「デバッグ」を押したときに実行ログに出る PowerShell 向けのコマンド（`&` で始まります）を、そのまま PowerShell で実行して入れてください（アプリのフォルダ〔%APPDATA% の下〕の `python\cpython` に入ります）。
 
 ## エディタと言語サーバー
 
