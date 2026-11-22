@@ -224,6 +224,8 @@ pub enum DebugEvent {
 
 // テストで差し替えられる、外の環境
 pub struct Environment {
+    // （Windows では読まない。段階 6 の C++ W8）
+    #[cfg_attr(windows, allow(dead_code))]
     pub xcrun: PathBuf,
     // アダプターに渡す HOME（テストで ~/.lldbinit を読まないことを確かめるときだけ使う）
     pub home: Option<PathBuf>,
@@ -366,6 +368,8 @@ fn is_system_exit(body: &Value) -> bool {
 }
 
 // `xcrun --find lldb-dap` で lldb-dap の場所を見つける（シェルは使わない。D-146 2.1）
+// （Windows では使わない。段階 6 の C++ W8）
+#[cfg_attr(windows, allow(dead_code))]
 pub fn find_adapter(xcrun: &Path) -> Result<PathBuf, String> {
     let mut command = Command::new(xcrun);
     command.args(["--find", "lldb-dap"]).stdin(Stdio::null());
@@ -467,6 +471,178 @@ fn launch_arguments(program: &Path, dir: &Path, input: &Path, rustc: Option<&Rus
             "settings set target.inherit-tcc true".to_string(),
         ],
     })
+}
+
+// ---- gdb（Windows。段階 6 の C++。W8〜W10。docs/windows-port-plan.md の「段階 6 の C++（gdb）の計画」） ----
+// 利用者の手元の MinGW-w64 の gdb（16.3 で確かめた）を DAP（--interpreter=dap）で使う。IDE には同梱せず、取得もしない
+
+// gdb の引数（9.1 の追加 50）：利用者のフォルダの初期化ファイルを読まない（システムの gdbinit は読む。libstdc++ の表示の登録）、
+// 始めの案内を出さない、DAP で話す、作業フォルダの .gdbinit とプログラム・DLL の隣のスクリプトを自動で読まない
+#[cfg(windows)]
+const GDB_ARGS: &[&str] = &[
+    "-nh",
+    "-q",
+    "--interpreter=dap",
+    "-iex",
+    "set auto-load off",
+];
+
+// gdb の最初のスレッド（main）の番号（gdb のスレッドの番号は 1 から数え、1 つの gdb で 1 つのプロセスだけを動かす）。
+// pause の threadId（W13。gdb の pause は threadId を見ずに `interrupt -a` で全部のスレッドを止める。DAP では要る項目）と、
+// 一時停止のあとに扱うスレッド（W14）に使う
+#[cfg(windows)]
+const GDB_PAUSE_THREAD: i64 = 1;
+
+#[cfg(windows)]
+const GDB_MISSING: &str = "C++ のデバッグには gdb（MinGW-w64 の gdb.exe）が要ります。g++.exe と同じフォルダにも PATH にも gdb.exe が見つかりません。MinGW-Builds の GCC（bin に gdb.exe が入っています）を使うか、gdb.exe のあるフォルダを PATH に足してください";
+
+#[cfg(windows)]
+const RUST_DEBUG_UNSUPPORTED: &str =
+    "Windows では、Rust のデバッグはまだ使えません（今は Python と C++ だけです）";
+
+// 起動する gdb と、gdb の子に付ける環境（W8）
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq)]
+struct GdbLaunch {
+    // 起動する exe（MinGW-Builds の形なら gdborig.exe、そうでなければ gdb.exe）
+    program: PathBuf,
+    // 子の PATH の先頭に、この順に足すフォルダ
+    path_prefix: Vec<PathBuf>,
+    // PYTHONHOME（MinGW-Builds の形のときだけ <mingw64>\opt）
+    python_home: Option<PathBuf>,
+}
+
+// 設定の C++ のコンパイラ（なければ見つけた g++）と同じフォルダ → PATH の順に gdb.exe を探す（W8）
+#[cfg(windows)]
+fn find_gdb(cpp: &crate::cpp::CppSettings) -> Result<GdbLaunch, String> {
+    let compiler_dir = crate::cpp::find_compiler(cpp)
+        .ok()
+        .and_then(|compiler| compiler.parent().map(Path::to_path_buf));
+    find_gdb_in(compiler_dir.as_deref(), std::env::var_os("PATH").as_deref())
+}
+
+// テストのために、コンパイラのフォルダと PATH を受け取る形（相対パスの PATH の項目は見ない。cpp.rs の find_compiler_on_windows と同じ）
+#[cfg(windows)]
+fn find_gdb_in(
+    compiler_dir: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<GdbLaunch, String> {
+    let in_path: Vec<PathBuf> = path_var
+        .map(|paths| {
+            std::env::split_paths(paths)
+                .filter(|dir| dir.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    let gdb = compiler_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(in_path)
+        .map(|dir| dir.join("gdb.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| GDB_MISSING.to_string())?;
+    let gdb_dir = gdb.parent().map(Path::to_path_buf).unwrap_or_default();
+    // デバッグ対象の DLL は、ふだんの実行と同じくコンパイラの bin から（なければ gdb のフォルダ）
+    let dll_dir = compiler_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| gdb_dir.clone());
+    // MinGW-Builds の形：gdb.exe は包みで、本体は隣の gdborig.exe、Python は ..\opt（包みの中身は文字列から見た推測。9.1 の追加 50）。
+    // 包みを通すと、空白のある引数が分かれ、デバッグ対象が opt\bin の libgcc_s_seh-1.dll で動く（P2 で確かめた）ので、本体を直接起動する
+    let orig = gdb_dir.join("gdborig.exe");
+    match gdb_dir.parent().map(|mingw| mingw.join("opt")) {
+        Some(opt) if orig.is_file() && opt.is_dir() => Ok(GdbLaunch {
+            program: orig,
+            path_prefix: vec![dll_dir, opt.join("bin")],
+            python_home: Some(opt),
+        }),
+        _ => Ok(GdbLaunch {
+            program: gdb,
+            path_prefix: vec![dll_dir],
+            python_home: None,
+        }),
+    }
+}
+
+// gdb の子の環境（W9）：PATH の先頭、PYTHONHOME、PYTHONUTF8=1（付けないと、デバッグ対象の出力が 1 文字も届かない。P2 の 1 回目）
+#[cfg(windows)]
+fn apply_gdb_env(command: &mut Command, launch: &GdbLaunch) {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let paths = launch
+        .path_prefix
+        .iter()
+        .cloned()
+        .chain(std::env::split_paths(&inherited));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
+    if let Some(home) = &launch.python_home {
+        command.env("PYTHONHOME", home);
+    }
+    command.env("PYTHONUTF8", "1");
+}
+
+// gdb を DAP で起動する命令（W9。作業フォルダ・process_group・標準入出力・D-104 の変数は Client::spawn_gdb で付ける）
+#[cfg(windows)]
+fn gdb_command(launch: &GdbLaunch) -> Command {
+    let mut command = Command::new(&launch.program);
+    command.args(GDB_ARGS);
+    apply_gdb_env(&mut command, launch);
+    command
+}
+
+// `gdb --version` の 1 行目（例：GNU gdb (GDB) 16.3）。gdborig.exe は libpython のため同じ環境で動かす。窓を出さない
+#[cfg(windows)]
+fn gdb_version(launch: &GdbLaunch) -> Option<String> {
+    let mut command = crate::process::command(&launch.program);
+    command.arg("--version").stdin(Stdio::null());
+    apply_gdb_env(&mut command, launch);
+    let output = command.output().ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+}
+
+// gdb の initialize（W10）：lldb-dap の拡張（$__lldb_sourceInitFile）を送らない
+#[cfg(windows)]
+fn gdb_initialize_arguments() -> Value {
+    json!({
+        "clientID": "atcoder-studio",
+        "clientName": "AtCoder Studio",
+        "adapterID": "gdb",
+        "locale": "ja",
+        "linesStartAt1": true,
+        "columnsStartAt1": true,
+        "pathFormat": "path",
+        "supportsVariableType": true,
+    })
+}
+
+// gdb の launch（W10）：program・cwd は `\\?\` を外す。標準入力は args に引用符つきの 1 つの文字列（配列で送ると gdb が `<` を引用して
+// 入らない。P2）。入力のファイルがないとき（choose_input の NUL）も同じ形。Windows のファイル名に `"` は使えないので逃がさない。
+// preRunCommands（target.input-path・inherit-tcc）は macOS の LLDB だけなので送らない
+#[cfg(windows)]
+fn gdb_launch_arguments(program: &Path, dir: &Path, input: &Path) -> Value {
+    json!({
+        "program": crate::trust::without_verbatim(program),
+        "cwd": crate::trust::without_verbatim(dir),
+        "args": format!("< \"{}\"", crate::trust::without_verbatim(input).display()),
+        "stopOnEntry": false,
+    })
+}
+
+// gdb の一時停止（interrupt）は、割り込みのためのスレッドで、理由のない停止（reason "stopped"）として届く（W14。A9 の記録：
+// threadId 5、スタックは ntdll!DbgBreakPoint）。利用者のコードが見えるように、main のスレッド（GDB_PAUSE_THREAD）の pause として扱う。
+// デバッグコンソールで利用者が gdb の命令（interrupt など）を打って止まったときも、同じく pause として扱う
+#[cfg(windows)]
+fn gdb_pause_stop(adapter: &str, message: &Value) -> Option<Value> {
+    if adapter != "gdb" || message["event"] != "stopped" || message["body"]["reason"] != "stopped" {
+        return None;
+    }
+    let mut message = message.clone();
+    message["body"]["reason"] = json!("pause");
+    message["body"]["threadId"] = json!(GDB_PAUSE_THREAD);
+    Some(message)
 }
 
 // ---- 標準入力（D-146 2.4） ----
@@ -637,6 +813,12 @@ impl Shared {
         if category == "console" && !state.launched {
             return;
         }
+        // Windows（段階 6 の C++ W11）：gdb は自分の文（No symbol table is loaded. など）を、デバッグ対象の出力と同じ stdout の知らせで送る。
+        // デバッグ対象が出力するのは process の知らせ（debuggee_pid が入る）より後なので、それより前の出力は gdb の文として捨てる
+        #[cfg(windows)]
+        if self.adapter == "gdb" && state.debuggee_pid.is_none() {
+            return;
+        }
         let room = OUTPUT_LIMIT.saturating_sub(state.output_sent);
         if text.len() <= room {
             state.output_sent += text.len();
@@ -666,6 +848,11 @@ impl Shared {
     }
 
     fn event(&self, message: &Value, notices: &Sender<Notice>) {
+        // Windows（段階 6 の C++ W14）：gdb の一時停止を、main のスレッドの pause として扱う（gdb_pause_stop）
+        #[cfg(windows)]
+        let rewritten = gdb_pause_stop(self.adapter, message);
+        #[cfg(windows)]
+        let message = rewritten.as_ref().unwrap_or(message);
         let body = &message["body"];
         match message["event"].as_str().unwrap_or_default() {
             "initialized" => {
@@ -928,6 +1115,36 @@ impl Client {
         Ok((client, child, notices))
     }
 
+    // Windows（段階 6 の C++。W9）：gdb を DAP で起動する。流れは spawn と同じ（Unix の spawn の行を変えないことを優先して分けた。
+    // Python の W5 と同じ理由）。gdb の子の環境（PATH・PYTHONHOME・PYTHONUTF8）は gdb_command で付ける
+    #[cfg(windows)]
+    fn spawn_gdb(
+        launch: &GdbLaunch,
+        dir: &Path,
+        root: &Path,
+        channel: &Channel<RunEvent>,
+    ) -> Result<(Arc<Client>, Child, Receiver<Notice>), String> {
+        let mut command = gdb_command(launch);
+        command
+            .current_dir(dir)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // デバッグ対象は gdb の環境を引き継ぐので、今の実行と同じく D-104 の変数を外す
+        toolchain::clear_ide_env(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("gdb を起動できません：{error}"))?;
+        crate::win::start_in_job(&child)
+            .map_err(|error| format!("gdb を起動できません：{error}"))?;
+        let stdin = child.stdin.take().expect("piped");
+        let stdout = child.stdout.take().expect("piped");
+        spawn_stderr_reader(child.stderr.take().expect("piped"), "gdb", channel.clone());
+        let (client, notices) = Client::connect("gdb", stdin, stdout, root, channel);
+        Ok((client, child, notices))
+    }
+
     // 書き込み先と読み取り元から、クライアントを作る
     fn connect(
         adapter: &'static str,
@@ -1080,6 +1297,17 @@ impl Client {
 
     // 続行・一時停止・ステップ（D-146 2.5）
     pub fn step(&self, action: StepAction) -> Result<(), String> {
+        // Windows（段階 6 の C++ W13）：gdb は動いている間の threads を断る（notStopped）ので、threads を送らずに pause を送る
+        #[cfg(windows)]
+        if action == StepAction::Pause && self.shared.adapter == "gdb" {
+            return self
+                .request(
+                    "pause",
+                    json!({ "threadId": GDB_PAUSE_THREAD }),
+                    REQUEST_WAIT,
+                )
+                .map(|_| ());
+        }
         let thread_id = match action {
             // 動いている間も止められるように、スレッドの一覧の最初（main）を使う
             StepAction::Pause => {
@@ -1414,6 +1642,15 @@ pub fn debug_target(
                 dir.display()
             ),
         ),
+        #[cfg(windows)]
+        Adapter::Gdb(launch) => info(
+            channel,
+            format!(
+                "デバッグアダプター：{}（{}）\n",
+                launch.program.display(),
+                gdb_version(launch).unwrap_or_else(|| "版は分かりません".to_string())
+            ),
+        ),
     }
 
     let (
@@ -1499,6 +1736,8 @@ pub fn debug_target(
             cancel,
             channel,
         ),
+        #[cfg(windows)]
+        Adapter::Gdb(launch) => Client::spawn_gdb(launch, dir, root, channel),
     };
     let (client, mut child, notices) = match spawned {
         Ok(spawned) => spawned,
@@ -1524,6 +1763,15 @@ pub fn debug_target(
             start_arguments: debugpy_attach_arguments(),
             stop_functions: &[],
             uncaught_exceptions: true,
+        },
+        // Windows（段階 6 の C++ W10）：止める関数は lldb-dap と同じ（__cxa_throw・abort。gdb でも止まることを P2 で確かめた）
+        #[cfg(windows)]
+        Adapter::Gdb(_) => SessionPlan {
+            initialize: gdb_initialize_arguments(),
+            start: "launch",
+            start_arguments: gdb_launch_arguments(&executable.path, dir, &input),
+            stop_functions: stop_functions(target.language),
+            uncaught_exceptions: false,
         },
     };
     let started = start_session(&client, &notices, plan, breakpoints, cancel);
@@ -1585,9 +1833,14 @@ pub fn debug_target(
 // 使うアダプター
 enum Adapter {
     // lldb-dap の場所
+    // （Windows では作らない。Rust は「まだ使えません」、C++ は gdb。段階 6 の C++ W8）
+    #[cfg_attr(windows, allow(dead_code))]
     Lldb(PathBuf),
     // debugpy を入れた場所（D-226）
     Debugpy(PathBuf),
+    // Windows（段階 6 の C++ W8）：起動する gdb と、gdb の子の環境
+    #[cfg(windows)]
+    Gdb(GdbLaunch),
 }
 
 // 言語に合うアダプターを見つける。Python は設定の処理系と、その処理系の debugpy
@@ -1597,7 +1850,13 @@ fn find_session_adapter(
     environment: &Environment,
 ) -> Result<Adapter, String> {
     match language {
+        #[cfg(not(windows))]
         Language::Rust | Language::Cpp => find_adapter(&environment.xcrun).map(Adapter::Lldb),
+        // Windows（段階 6 の C++ W8）：Rust はまだ使えない（次の PR）。C++ は gdb
+        #[cfg(windows)]
+        Language::Rust => Err(RUST_DEBUG_UNSUPPORTED.to_string()),
+        #[cfg(windows)]
+        Language::Cpp => find_gdb(&langs.cpp).map(Adapter::Gdb),
         Language::Python => {
             let interpreter = python::find_interpreter(&langs.python)?;
             find_debugpy(
@@ -3248,5 +3507,791 @@ main()
             session.finish();
         }
         eprintln!("debugpy で試した処理系：{tried}");
+    }
+
+    // Windows（段階 6 C++ T2）：比べて違えば、ユーザーのフォルダの名前を伏せて落ちる（失敗の文に一時フォルダのパスが出るため）
+    #[cfg(windows)]
+    fn assert_same<T: PartialEq + std::fmt::Debug>(left: T, right: T) {
+        assert!(
+            left == right,
+            "{}",
+            hide_names(&format!("left: {left:?}\nright: {right:?}"))
+        );
+    }
+
+    // 命令の環境の値（なければ None。名前は大文字・小文字を区別しない）
+    #[cfg(windows)]
+    fn command_env(command: &Command, name: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    // A7（段階 6 C++ T2。W8）：gdb の見つけ方と起動の形。偽のフォルダとファイルで試す（本物の gdb は使わない）
+    #[cfg(windows)]
+    #[test]
+    fn finds_gdb_next_to_the_compiler_on_windows() {
+        let ws = workspace("find-gdb");
+        let mingw = ws.0.join("mingw64");
+        let bin = mingw.join("bin");
+        let opt = mingw.join("opt");
+        let other = ws.0.join("other").join("bin");
+        write(&bin.join("g++.exe"), "");
+        let settings = crate::cpp::CppSettings {
+            compiler: bin.join("g++.exe").to_string_lossy().into_owned(),
+            ..crate::cpp::CppSettings::default()
+        };
+
+        // 1. MinGW-Builds の形（gdb.exe・gdborig.exe・..\opt）：gdborig.exe を直接。PATH はコンパイラの bin → opt\bin、PYTHONHOME は opt
+        write(&bin.join("gdb.exe"), "");
+        write(&bin.join("gdborig.exe"), "");
+        fs::create_dir_all(opt.join("bin")).unwrap();
+        let orig = GdbLaunch {
+            program: bin.join("gdborig.exe"),
+            path_prefix: vec![bin.clone(), opt.join("bin")],
+            python_home: Some(opt.clone()),
+        };
+        assert_same(find_gdb(&settings), Ok(orig));
+
+        // 2. gdborig.exe はあるが ..\opt がない：gdb.exe をそのまま。PATH の先頭はコンパイラの bin だけ、PYTHONHOME なし
+        fs::remove_dir_all(&opt).unwrap();
+        let plain = GdbLaunch {
+            program: bin.join("gdb.exe"),
+            path_prefix: vec![bin.clone()],
+            python_home: None,
+        };
+        assert_same(find_gdb_in(Some(&bin), None), Ok(plain.clone()));
+
+        // 3. gdborig.exe がない（gdb.exe が本体の配布）：gdb.exe をそのまま
+        fs::remove_file(bin.join("gdborig.exe")).unwrap();
+        assert_same(find_gdb_in(Some(&bin), None), Ok(plain));
+
+        // 4. コンパイラの隣になく、PATH にある：PATH の gdb.exe（相対パスの項目は見ない）。デバッグ対象の DLL のため、PATH の先頭はコンパイラの bin
+        fs::remove_file(bin.join("gdb.exe")).unwrap();
+        write(&other.join("gdb.exe"), "");
+        let path_var = std::env::join_paths([PathBuf::from("relative"), other.clone()]).unwrap();
+        assert_same(
+            find_gdb_in(Some(&bin), Some(&path_var)),
+            Ok(GdbLaunch {
+                program: other.join("gdb.exe"),
+                path_prefix: vec![bin.clone()],
+                python_home: None,
+            }),
+        );
+
+        // 5. gdb.exe がどこにもない：Windows 向けの案内の文
+        fs::remove_file(other.join("gdb.exe")).unwrap();
+        assert_same(
+            find_gdb_in(Some(&bin), Some(&path_var)),
+            Err(GDB_MISSING.to_string()),
+        );
+        assert_same(find_gdb_in(None, None), Err(GDB_MISSING.to_string()));
+    }
+
+    // A7b（段階 6 C++ T2。W9）：gdb を起動する命令の引数と環境
+    #[cfg(windows)]
+    #[test]
+    fn builds_gdb_command_on_windows() {
+        let orig = GdbLaunch {
+            program: PathBuf::from(r"C:\m\bin\gdborig.exe"),
+            path_prefix: vec![PathBuf::from(r"C:\m\bin"), PathBuf::from(r"C:\m\opt\bin")],
+            python_home: Some(PathBuf::from(r"C:\m\opt")),
+        };
+        let command = gdb_command(&orig);
+        assert_same(
+            command.get_program(),
+            std::ffi::OsStr::new(r"C:\m\bin\gdborig.exe"),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_same(
+            args,
+            [
+                "-nh",
+                "-q",
+                "--interpreter=dap",
+                "-iex",
+                "set auto-load off",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+        assert_same(
+            command_env(&command, "PYTHONHOME"),
+            Some(r"C:\m\opt".to_string()),
+        );
+        assert_same(command_env(&command, "PYTHONUTF8"), Some("1".to_string()));
+        let path = command_env(&command, "PATH").unwrap_or_default();
+        let head: Vec<PathBuf> = std::env::split_paths(&path).take(2).collect();
+        assert_same(head, orig.path_prefix.clone());
+
+        // gdb.exe が本体の配布：PYTHONHOME は付けない。PYTHONUTF8 は付ける
+        let plain = GdbLaunch {
+            program: PathBuf::from(r"C:\g\bin\gdb.exe"),
+            path_prefix: vec![PathBuf::from(r"C:\g\bin")],
+            python_home: None,
+        };
+        let command = gdb_command(&plain);
+        assert_same(command_env(&command, "PYTHONHOME"), None);
+        assert_same(command_env(&command, "PYTHONUTF8"), Some("1".to_string()));
+        let path = command_env(&command, "PATH").unwrap_or_default();
+        assert_same(
+            std::env::split_paths(&path).next(),
+            Some(PathBuf::from(r"C:\g\bin")),
+        );
+    }
+
+    // A7c（段階 6 C++ T2。W8）：Windows の Rust のデバッグは、Xcode の案内ではなく「まだ使えません」の文で止まる
+    #[cfg(windows)]
+    #[test]
+    fn reports_rust_debug_unsupported_on_windows() {
+        let result = find_session_adapter(
+            Language::Rust,
+            &LangSettings::default(),
+            &Environment::real(None),
+        );
+        assert_same(result.err(), Some(RUST_DEBUG_UNSUPPORTED.to_string()));
+    }
+
+    // A8（段階 6 C++ T2。W10）：gdb の initialize と launch。lldb-dap の項目がなく、`\\?\` を外し、標準入力は引用符つきの 1 つの文字列
+    #[cfg(windows)]
+    #[test]
+    fn builds_gdb_launch_configuration_on_windows() {
+        let init = gdb_initialize_arguments();
+        assert_eq!(init["adapterID"], "gdb");
+        assert_eq!(init["linesStartAt1"], true);
+        assert_eq!(init["pathFormat"], "path");
+        assert!(init.get("$__lldb_sourceInitFile").is_none(), "{init}");
+
+        let launch = gdb_launch_arguments(
+            Path::new(r"\\?\C:\w\pkg\target\main-debug.exe"),
+            Path::new(r"\\?\C:\w\pkg"),
+            Path::new(r"\\?\C:\w\pkg\test\input.txt"),
+        );
+        assert_eq!(launch["program"], r"C:\w\pkg\target\main-debug.exe");
+        assert_eq!(launch["cwd"], r"C:\w\pkg");
+        assert_eq!(launch["args"], r#"< "C:\w\pkg\test\input.txt""#);
+        assert_eq!(launch["stopOnEntry"], false);
+        for key in ["initCommands", "preRunCommands", "stdio", "env"] {
+            assert!(launch.get(key).is_none(), "{key}：{launch}");
+        }
+
+        // 入力のファイルがないとき（choose_input の NUL）も同じ形
+        let launch = gdb_launch_arguments(
+            Path::new(r"C:\w\a.exe"),
+            Path::new(r"C:\w"),
+            Path::new("NUL"),
+        );
+        assert_eq!(launch["args"], r#"< "NUL""#);
+    }
+
+    // ---- 本物の gdb を使うテスト（Windows 移植の段階 6 の C++ T3）。MinGW-w64 の g++ と gdb が要る ----
+
+    // 試しの C++ のプログラム。行の番号：11 日本語の出力、13・15 標準入力、16 string、17 vector を足す、18 出力（ブレークポイント）、
+    // 19 total が 7 なら throw、20 total が 8 なら範囲外の読み書き（デバッグ用のビルドでは abort。D-214）、21–24 total が 9 なら回り続ける
+    #[cfg(windows)]
+    const CPP_GDB_SOLUTION: &str = r#"#include <bits/stdc++.h>
+using namespace std;
+
+long long sum(const vector<long long>& v) {
+    long long s = 0;
+    for (auto x : v) s += x;
+    return s;
+}
+
+int main() {
+    cout << "あいう" << endl;
+    int n = 0;
+    cin >> n;
+    vector<long long> a(n);
+    for (auto& x : a) cin >> x;
+    string name = "atcoder";
+    long long total = sum(a);
+    cout << total << " " << name << endl;
+    if (total == 7) throw runtime_error("boom");
+    if (total == 8) cout << a[n] << endl;
+    if (total == 9) {
+        volatile long long i = 0;
+        while (true) i = i + 1;
+    }
+}
+"#;
+    #[cfg(windows)]
+    const CPP_GDB_LINE_PRINT: u32 = 18;
+
+    // このテストのプロセスの子孫に、gdb（gdb.exe・gdborig.exe）とデバッグ対象（main-debug.exe）が残っていないか
+    #[cfg(windows)]
+    fn gdb_left() -> Vec<(u32, String)> {
+        crate::win::descendants(std::process::id())
+            .into_iter()
+            .filter(|(_, name)| {
+                let name = name.to_ascii_lowercase();
+                name.starts_with("gdb") || name == "main-debug.exe"
+            })
+            .collect()
+    }
+
+    // 場面のあとに、gdb とデバッグ対象が残っていないかを確かめる。3 秒まで 20 ms ごとに見直し、まだ動いている（alive）ものだけを数える
+    // （assert_gone と同じ考え方。もう終わっているプロセスは利用者に害がない。利用者が決めた）。一覧にあるが alive でないものは、数えずに記録する。
+    // 残ったものの数は、落ちなくても記録する。落ちるときは、その場面のデバッグ対象の pid と、残ったもの 1 つずつの pid・名前・alive を出す
+    // （T3 の 5 つの確かめで、全体の cargo test のとき A9 が場面 2 のあとに 1 回落ちたため。「止めた直後に一覧に残っていた」という見立ては未確認）
+    #[cfg(windows)]
+    fn assert_no_gdb_left(scene: &str, debuggee: Option<i32>) {
+        let until = Instant::now() + Duration::from_secs(3);
+        let (running, ended) = loop {
+            let (running, ended): (Vec<_>, Vec<_>) = gdb_left()
+                .into_iter()
+                .partition(|(pid, _)| crate::win::is_alive(*pid));
+            if running.is_empty() || Instant::now() >= until {
+                break (running, ended);
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        eprintln!(
+            "gdb：{scene}のあと残ったもの（動いている）の数 {}",
+            running.len()
+        );
+        if !ended.is_empty() {
+            eprintln!(
+                "{}",
+                hide_names(&format!(
+                    "gdb：{scene}のあと一覧にあるが終わっているもの（数えない。pid・名前）{ended:?}"
+                ))
+            );
+        }
+        let detail: Vec<(u32, String, bool)> = running
+            .iter()
+            .map(|(pid, name)| (*pid, name.clone(), crate::win::is_alive(*pid)))
+            .collect();
+        assert!(
+            running.is_empty(),
+            "{}",
+            hide_names(&format!(
+                "{scene}：デバッグ対象の pid {debuggee:?}、残ったもの（pid・名前・alive）{detail:?}"
+            ))
+        );
+    }
+
+    // 実行ログに「強制的に止めました」が出たか（止めるときに forced になったかの記録。finish の前に session.events を写しておく）
+    #[cfg(windows)]
+    fn forced_in(events: &Arc<Mutex<Vec<Value>>>) -> bool {
+        events.lock().unwrap().iter().any(|event| {
+            event["type"] == "log"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("強制的に止めました"))
+        })
+    }
+
+    // A9（段階 6 C++ T3）：本物の gdb（Windows）。debugs_cpp_with_real_lldb_dap と同じ場面に、日本語の出力・gdb 自身の文が出ないこと（W11）・
+    // 一時停止（W13）・input.txt がないとき（< "NUL"）・止めたあとに gdb とデバッグ対象が残らないことを足す。
+    // CI では飛ぶ（GitHub Actions は環境変数 CI を付ける）：runner の gdb の有無と版を手元で調べられず、落ちたときに切り分けられないため
+    // （lldb-dap の本物のテストも CI では --skip。9.1 の追加 50）。gdb が見つからなくても飛ぶ。失敗の文はユーザーのフォルダの名前を伏せる
+    #[cfg(windows)]
+    #[test]
+    fn debugs_cpp_with_real_gdb_on_windows() {
+        if std::env::var_os("CI").is_some() {
+            eprintln!("CI では本物の gdb のテストを飛ばします");
+            return;
+        }
+        if find_gdb(&crate::cpp::CppSettings::default()).is_err() {
+            eprintln!("gdb がないので飛ばします");
+            return;
+        }
+        let ws = workspace("gdb");
+        let pkg = ws.0.join("pkg");
+        write(&pkg.join("main.cpp"), CPP_GDB_SOLUTION);
+        write(&pkg.join("test/input.txt"), "3\n1 2 3\n");
+        write(&pkg.join("test/sample-1.in"), "2\n3 4\n");
+        write(&pkg.join("test/sample-2.in"), "2\n3 5\n");
+        write(&pkg.join("test/sample-3.in"), "2\n4 5\n");
+
+        // 1. ブレークポイント → スタック → 変数（vector・string）→ 式 → デバッグコンソール → ステップ → 続行して終わる
+        let started = Instant::now();
+        let session = cpp_session(&pkg, &ws.0, None, &[CPP_GDB_LINE_PRINT]);
+        let (since, stopped) = session.wait_stopped(0);
+        eprintln!("gdb：始めてから止まるまで {:?}", started.elapsed());
+        assert_eq!(stopped["reason"], "breakpoint");
+        let log = session.log();
+        assert!(log.contains("デバッグアダプター："), "{}", hide_names(&log));
+        assert!(log.contains("（GNU gdb"), "{}", hide_names(&log));
+        assert!(log.contains(CPP_DEBUG_BUILD_NOTE), "{}", hide_names(&log));
+        assert!(
+            log.contains("標準入力：test/input.txt"),
+            "{}",
+            hide_names(&log)
+        );
+        // 件 2（追加 49）：始めたあとに continued が来ないことの記録（assert はしない）
+        let continued = session
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "debug" && event["event"]["kind"] == "continued")
+            .count();
+        eprintln!("gdb：最初に止まるまでの continued の数 {continued}");
+        let client = session.client();
+        let stack = client.stack().unwrap();
+        let shown = hide_names(&format!("{stack:?}"));
+        assert_eq!(stack[0].name, "main", "{shown}");
+        assert_eq!(
+            stack[0].workspace_path.as_deref(),
+            Some("pkg/main.cpp"),
+            "{shown}"
+        );
+        assert_eq!(stack[0].line, CPP_GDB_LINE_PRINT as u64, "{shown}");
+        let scopes = client.scopes(stack[0].id).unwrap();
+        let locals = client.variables(scopes[0].variables_reference).unwrap();
+        let find = |name: &str| {
+            locals
+                .iter()
+                .find(|v| v.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} がない：{}", hide_names(&format!("{locals:?}"))))
+        };
+        assert_eq!(find("n").value, "3");
+        assert_eq!(find("total").value, "6");
+        let name = find("name");
+        assert!(name.value.contains("atcoder"), "{name:?}");
+        // 変数の欄での vector の中身（P2 では見ていなかった。10 章の未確認）
+        let a = find("a");
+        assert!(a.value.contains("length 3"), "{a:?}");
+        let elements = client.variables(a.variables_reference).unwrap();
+        let values: Vec<&str> = elements.iter().map(|v| v.value.as_str()).collect();
+        assert_eq!(values, ["1", "2", "3"], "{elements:?}");
+        let watch = client
+            .evaluate("total + 1", Some(stack[0].id), EvaluateContext::Watch)
+            .unwrap();
+        assert_eq!(watch.result, "7");
+        // デバッグコンソールは gdb の命令。-nh で読んだシステムの gdbinit の libstdc++ の表示が登録されている
+        let printers = client
+            .evaluate(
+                "info pretty-printer",
+                Some(stack[0].id),
+                EvaluateContext::Repl,
+            )
+            .unwrap();
+        assert!(printers.result.contains("libstdc++-v6"), "{printers:?}");
+        client.step(StepAction::Next).unwrap();
+        let (since, stopped) = session.wait_stopped(since);
+        assert_eq!(stopped["reason"], "step");
+        assert_eq!(
+            client.stack().unwrap()[0].line,
+            (CPP_GDB_LINE_PRINT + 1) as u64
+        );
+        client.set_breakpoints("pkg/main.cpp", &[]).unwrap();
+        client.step(StepAction::Continue).unwrap();
+        let (_, exited) = session.wait(since, |event| event["kind"] == "exited");
+        assert_eq!(exited["code"], 0);
+        // W11：プログラムの最初の行が消えず、gdb 自身の文が出ない
+        let output = session.output();
+        assert!(output.starts_with("あいう"), "{}", hide_names(&output));
+        assert!(output.contains("6 atcoder"), "{}", hide_names(&output));
+        for noise in ["No symbol table", "pending", "No source file"] {
+            assert!(!output.contains(noise), "{noise}：{}", hide_names(&output));
+        }
+        drop(client);
+        let debuggee = session.debuggee_pid();
+        let events = session.events.clone();
+        let finish = session.finish();
+        eprintln!("gdb：場面 1 の forced {}", forced_in(&events));
+        assert!(
+            matches!(
+                finish,
+                Finish::Debugged {
+                    exit_code: Some(0),
+                    stopped: false
+                }
+            ),
+            "{finish:?}"
+        );
+        assert_no_gdb_left("場面 1", debuggee);
+
+        // 2. 例外を投げると止まり、呼んだ行が main.cpp に見える。止まったまま止める
+        let session = cpp_session(&pkg, &ws.0, Some("sample-1"), &[]);
+        let (_, stopped) = session.wait_stopped(0);
+        assert_eq!(stopped["reason"], "throw", "{stopped}");
+        let pid = session.debuggee_pid().unwrap();
+        let stack = session.client().stack().unwrap();
+        assert!(
+            stack
+                .iter()
+                .any(|frame| frame.workspace_path.as_deref() == Some("pkg/main.cpp")),
+            "{}",
+            hide_names(&format!("{stack:?}"))
+        );
+        session.cancel.store(true, Ordering::SeqCst);
+        let events = session.events.clone();
+        let finish = session.finish();
+        eprintln!("gdb：場面 2 の forced {}", forced_in(&events));
+        assert!(
+            matches!(finish, Finish::Debugged { stopped: true, .. }),
+            "{finish:?}"
+        );
+        assert_gone(pid);
+        assert_no_gdb_left("場面 2", Some(pid));
+
+        // 3. 範囲外の読み書きは、デバッグ用のビルドでは abort になって止まる（D-214）。続行したあとの動き（W12）は記録だけ
+        let session = cpp_session(&pkg, &ws.0, Some("sample-2"), &[]);
+        let (since, stopped) = session.wait_stopped(0);
+        assert_eq!(stopped["reason"], "abort", "{stopped}");
+        let client = session.client();
+        let stack = client.stack().unwrap();
+        assert!(
+            stack
+                .iter()
+                .any(|frame| frame.workspace_path.as_deref() == Some("pkg/main.cpp")),
+            "{}",
+            hide_names(&format!("{stack:?}"))
+        );
+        client.step(StepAction::Continue).unwrap();
+        let (since, next) = session.wait(since, |event| {
+            event["kind"] == "stopped" || event["kind"] == "exited"
+        });
+        eprintln!(
+            "gdb：abort のあと続行して {}",
+            hide_names(&next.to_string())
+        );
+        if next["kind"] == "stopped" {
+            client.step(StepAction::Continue).unwrap();
+            let (_, exited) = session.wait(since, |event| event["kind"] == "exited");
+            eprintln!("gdb：もう一度続行して {}", hide_names(&exited.to_string()));
+        }
+        let output = session.output();
+        assert!(
+            output.contains("__n < this->size()"),
+            "{}",
+            hide_names(&output)
+        );
+        drop(client);
+        let debuggee = session.debuggee_pid();
+        let events = session.events.clone();
+        let finish = session.finish();
+        eprintln!("gdb：場面 3 の forced {}", forced_in(&events));
+        assert!(
+            matches!(finish, Finish::Debugged { stopped: false, .. }),
+            "{finish:?}"
+        );
+        assert_no_gdb_left("場面 3", debuggee);
+
+        // 4. 回り続けているところで一時停止する（W13）。止まった理由とスタックは記録だけ。そのあと止める
+        let session = cpp_session(&pkg, &ws.0, Some("sample-3"), &[]);
+        session.wait(0, |event| {
+            event["kind"] == "output"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("9 atcoder"))
+        });
+        let pid = session.debuggee_pid().unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let since = session.events.lock().unwrap().len();
+        let client = session.client();
+        client.step(StepAction::Pause).unwrap();
+        let (_, stopped) = session.wait_stopped(since);
+        // W14：一時停止は main のスレッドの pause として扱い、スタックに利用者のコード（main.cpp）が見える
+        assert_eq!(stopped["reason"], "pause", "{stopped}");
+        assert_eq!(stopped["threadId"], GDB_PAUSE_THREAD, "{stopped}");
+        let stack = client.stack().unwrap();
+        assert!(
+            stack
+                .iter()
+                .any(|frame| frame.workspace_path.as_deref() == Some("pkg/main.cpp")),
+            "{}",
+            hide_names(&format!("{stack:?}"))
+        );
+        eprintln!(
+            "gdb：一時停止 {}、スタック {}",
+            hide_names(&stopped.to_string()),
+            hide_names(&format!(
+                "{:?}",
+                client
+                    .stack()
+                    .map(|stack| stack.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+            ))
+        );
+        drop(client);
+        let started = Instant::now();
+        session.cancel.store(true, Ordering::SeqCst);
+        let events = session.events.clone();
+        let finish = session.finish();
+        eprintln!(
+            "gdb：一時停止のあと止めるまで {:?}、場面 4 の forced {}",
+            started.elapsed(),
+            forced_in(&events)
+        );
+        assert!(
+            matches!(finish, Finish::Debugged { stopped: true, .. }),
+            "{finish:?}"
+        );
+        assert_gone(pid);
+        assert_no_gdb_left("場面 4", Some(pid));
+
+        // 5. input.txt がないとき（choose_input の NUL を < "NUL" で渡す。10 章の未確認）は、入力を待たずに終わる
+        fs::remove_file(pkg.join("test/input.txt")).unwrap();
+        let session = cpp_session(&pkg, &ws.0, None, &[]);
+        let (_, exited) = session.wait(0, |event| event["kind"] == "exited");
+        assert_eq!(exited["code"], 0);
+        assert!(
+            session.log().contains("入力ファイルなし"),
+            "{}",
+            hide_names(&session.log())
+        );
+        let output = session.output();
+        assert!(output.starts_with("あいう"), "{}", hide_names(&output));
+        assert!(output.contains("0 atcoder"), "{}", hide_names(&output));
+        let debuggee = session.debuggee_pid();
+        let events = session.events.clone();
+        session.finish();
+        eprintln!("gdb：場面 5 の forced {}", forced_in(&events));
+        assert_no_gdb_left("場面 5", debuggee);
+    }
+
+    // A10（段階 6 C++ T3。W11）：gdb のとき、process の知らせより前の出力（gdb 自身の文）は出さず、そのあとの出力（デバッグ対象）は出す。
+    // launch の答えのあと・process の前に届く gdb の文も捨てる（境は process の知らせ）。偽の知らせで試す（本物の gdb は使わない。CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn drops_gdb_messages_before_the_program_starts_on_windows() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let channel = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            Ok(())
+        });
+        let output = |seq: i64, text: &str| {
+            json!({
+                "seq": seq,
+                "type": "event",
+                "event": "output",
+                "body": { "category": "stdout", "output": text },
+            })
+        };
+        let messages = [
+            output(1, "No symbol table is loaded.  Use the \"file\" command.\n"),
+            json!({ "seq": 2, "type": "response", "request_seq": 2, "command": "launch", "success": true }),
+            output(3, "Breakpoint 2 (-function abort) pending.\n"),
+            json!({
+                "seq": 4,
+                "type": "event",
+                "event": "process",
+                "body": { "systemProcessId": 4321, "startMethod": "process" },
+            }),
+            output(5, "あいう\n"),
+        ];
+        let bytes: Vec<u8> = messages
+            .iter()
+            .flat_map(|message| encode(&message.to_string()))
+            .collect();
+        let (_client, notices) = Client::connect(
+            "gdb",
+            std::io::sink(),
+            std::io::Cursor::new(bytes),
+            Path::new("."),
+            &channel,
+        );
+        // 読み終えると、読み取りのスレッドが知らせの送り手を捨てる
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match notices.recv_timeout(Duration::from_millis(20)) {
+                Err(RecvTimeoutError::Disconnected) => break,
+                _ => assert!(Instant::now() < until, "読み終わりません"),
+            }
+        }
+        let texts: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "debug" && event["event"]["kind"] == "output")
+            .map(|event| {
+                event["event"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_same(texts, vec!["あいう\n".to_string()]);
+    }
+
+    // 偽のアダプター（段階 6 C++ T3。A11）：IDE が書いた要求を覚え、gdb と同じく threads は notStopped で断り、ほかは成功で答える
+    #[cfg(windows)]
+    struct FakeAdapterWriter {
+        decoder: Decoder,
+        requests: Arc<Mutex<Vec<Value>>>,
+        answers: Sender<Vec<u8>>,
+    }
+
+    #[cfg(windows)]
+    impl Write for FakeAdapterWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let texts = self.decoder.push(bytes).map_err(std::io::Error::other)?;
+            for text in texts {
+                let request: Value = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+                let command = request["command"].as_str().unwrap_or_default().to_string();
+                let refused = command == "threads";
+                let mut answer = json!({
+                    "seq": 0,
+                    "type": "response",
+                    "request_seq": request["seq"],
+                    "command": command,
+                    "success": !refused,
+                });
+                if refused {
+                    answer["message"] = json!("notStopped");
+                }
+                self.requests.lock().unwrap().push(request);
+                let _ = self.answers.send(encode(&answer.to_string()));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    struct FakeAdapterReader {
+        answers: Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+    }
+
+    #[cfg(windows)]
+    impl Read for FakeAdapterReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.is_empty() {
+                match self.answers.recv() {
+                    Ok(bytes) => self.pending = bytes,
+                    // 書き手（クライアントの書き込みのスレッド）が終わった
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = self.pending.len().min(buffer.len());
+            buffer[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+    }
+
+    // A11（段階 6 C++ T3。W13）：gdb のときの一時停止は、threads を送らずに pause だけを送る（gdb は動いている間の threads を断る）。
+    // 偽のアダプターで試す（本物の gdb は使わない。CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn pauses_gdb_without_asking_for_threads_on_windows() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (answers, incoming) = mpsc::channel();
+        let writer = FakeAdapterWriter {
+            decoder: Decoder::default(),
+            requests: requests.clone(),
+            answers,
+        };
+        let reader = FakeAdapterReader {
+            answers: incoming,
+            pending: Vec::new(),
+        };
+        let channel = Channel::new(|_| Ok(()));
+        let (client, _notices) = Client::connect("gdb", writer, reader, Path::new("."), &channel);
+        assert_same(client.step(StepAction::Pause), Ok(()));
+        let commands: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request["command"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_same(commands, vec!["pause".to_string()]);
+    }
+
+    // A12（段階 6 C++ T3。W14）：gdb の理由のない停止（一時停止）は、main のスレッド（1）の pause として扱う。
+    // ほかの理由の停止と、gdb でないアダプターの停止は、そのまま。偽の知らせで試す（本物の gdb は使わない。CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn treats_gdb_interrupt_as_pause_of_main_thread_on_windows() {
+        let stopped = |seq: i64, reason: &str, thread: i64| {
+            json!({
+                "seq": seq,
+                "type": "event",
+                "event": "stopped",
+                "body": { "reason": reason, "threadId": thread, "allThreadsStopped": true },
+            })
+        };
+        // 知らせを流し、読み終わるまで待って、画面への Stopped の知らせ（理由・スレッド）と、最後の止まったスレッドを返す
+        let run = |adapter: &'static str, messages: Vec<Value>| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let channel = Channel::new(move |body| {
+                if let InvokeResponseBody::Json(text) = body {
+                    sink.lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<Value>(&text).unwrap());
+                }
+                Ok(())
+            });
+            let bytes: Vec<u8> = messages
+                .iter()
+                .flat_map(|message| encode(&message.to_string()))
+                .collect();
+            let (client, notices) = Client::connect(
+                adapter,
+                std::io::sink(),
+                std::io::Cursor::new(bytes),
+                Path::new("."),
+                &channel,
+            );
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                match notices.recv_timeout(Duration::from_millis(20)) {
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    _ => assert!(Instant::now() < until, "読み終わりません"),
+                }
+            }
+            let stops: Vec<(String, Option<i64>)> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event["type"] == "debug" && event["event"]["kind"] == "stopped")
+                .map(|event| {
+                    (
+                        event["event"]["reason"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        event["event"]["threadId"].as_i64(),
+                    )
+                })
+                .collect();
+            let last = client.shared.lock_state().stopped_thread;
+            (stops, last)
+        };
+
+        // gdb：理由のない停止（threadId 5）は main（1）の pause。ブレークポイントの停止はそのまま
+        assert_same(
+            run(
+                "gdb",
+                vec![stopped(1, "breakpoint", 1), stopped(2, "stopped", 5)],
+            ),
+            (
+                vec![
+                    ("breakpoint".to_string(), Some(1)),
+                    ("pause".to_string(), Some(1)),
+                ],
+                Some(1),
+            ),
+        );
+        // gdb の signal の停止（abort のあとの __fastfail。W12）はそのまま
+        assert_same(
+            run("gdb", vec![stopped(1, "signal", 1)]),
+            (vec![("signal".to_string(), Some(1))], Some(1)),
+        );
+        // gdb でないアダプターは、理由が "stopped" でもそのまま
+        assert_same(
+            run("lldb-dap", vec![stopped(1, "stopped", 5)]),
+            (vec![("stopped".to_string(), Some(5))], Some(5)),
+        );
     }
 }
