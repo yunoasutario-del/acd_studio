@@ -298,6 +298,7 @@ S = [input() for _ in range(N)]
 - panic の代わりに、例外が投げられたとき（`throw`）と `abort` で止まります。`-D_GLIBCXX_ASSERTIONS` により、`vector` の範囲外アクセスなども `abort` として検出されます（実行・サンプルテスト・提出用のビルドには付けません）。
 - 止まったときは、作業領域内のソースのうち、いちばん上のフレームが選ばれます。
 - デバッグコンソールに LLDB の「`DW_TAG_member '_M_local_buf' refers to type …`」という警告が出ることがあります。GCC のデバッグ情報を LLDB が読むときのもので、変数の表示には影響しません。
+- **Windows**：MinGW-w64 の gdb を使います。g++.exe と同じフォルダ（MinGW-Builds の GCC なら bin）の gdb.exe を使い、なければ PATH から探します。IDE が入れることはありません。見つからないときは、実行ログに案内が出ます。デバッグ用のビルドは `target\main-debug.exe` です。デバッグコンソールでは、式と gdb のコマンドを入力できます（LLDB のコマンドは使えません）。`abort`（範囲外の読み書きを含む）で止まったあと続行すると、もう一度止まり（コールスタックは同じで、行は強調されません）、さらに続行すると終了コード -1073740791（0xC0000409）で終わります。動き始めてから最初に止まるまでは「一時停止」のボタンが出ません。Rust のデバッグはまだ使えません。
 
 ### Python のデバッグ
 
@@ -311,7 +312,7 @@ S = [input() for _ in range(N)]
 - 捕まえていない例外（`KeyError`・`IndexError` など）が起きると、その行で止まります。`exit()`・`sys.exit()` では止まりません。
 - debugpy の上で動かすため、通常の実行よりかなり遅くなります。
 - デバッグコンソールでは Python の式を入力できます（LLDB のコマンドは使えません）。
-- **Windows**：Windows でデバッグできるのは、今は Python（CPython）だけです。C++・Rust のデバッグはまだ使えず、PyPy でのデバッグは試していません。debugpy は、初めて「デバッグ」を押したときに実行ログに出る PowerShell 向けのコマンド（`&` で始まります）を、そのまま PowerShell で実行して入れてください（アプリのフォルダ〔%APPDATA% の下〕の `python\cpython` に入ります）。
+- **Windows**：Windows でデバッグできるのは、今は Python（CPython）と C++ です（C++ は [C++ のデバッグ](#c-のデバッグ) の「Windows」）。Rust のデバッグはまだ使えず、PyPy でのデバッグは試していません。debugpy は、初めて「デバッグ」を押したときに実行ログに出る PowerShell 向けのコマンド（`&` で始まります）を、そのまま PowerShell で実行して入れてください（アプリのフォルダ〔%APPDATA% の下〕の `python\cpython` に入ります）。
 
 ## エディタと言語サーバー
 

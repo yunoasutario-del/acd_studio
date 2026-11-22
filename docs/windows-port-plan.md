@@ -2850,6 +2850,105 @@ macOS への影響
 - 件 2（「一時停止」が最初に止まるまで出ない）：C++（gdb）でも continued が一度も来ないことを P2 で確かめた。gdb は launch の `run` で continued を出さない印を立てる（launch.py・events.py）。
   追加 49 のとおり、この PR では記録だけにし、別の小さな PR で直す
 
+### 段階 6 の C++（gdb）の結果（T2〜T4。2026-11-22。windows-stage6-cpp）
+
+| T | コミット | 中身 |
+| --- | --- | --- |
+| T1 | 22c3dd7 | 上の計画の節、9.1 の追加 50、10 章、段階 6 の Python の push と merge の記録 |
+| T2 | 96b2f18 | W8〜W10 とテスト A7・A7b・A7c・A8 |
+| T3 | 17d5de0 | W11・W13・W14 と、本物の gdb のテスト A9・偽の知らせのテスト A10〜A12 |
+| T4 | （この変更） | 結果の記録と docs/usage.md の C++ の項目 |
+
+T2
+- W8〜W10 の形は計画の表のとおり。spawn_gdb は Client::spawn と同じ流れを別に書いた（Unix の spawn の行を変えないため。Python の W5 と同じ理由。利用者が決めた）
+- macOS と共通の行には cfg・cfg_attr を付けただけ（find_session_adapter の Rust・C++ の腕に #[cfg(not(windows))]、Windows で使われなくなる find_adapter・Environment の xcrun・
+  Adapter::Lldb に #[cfg_attr(windows, allow(dead_code))]）
+- 直す前の失敗（テストと、空の答えを返す形だけの関数を先に書いた。4 つとも中身の違いで落ちた）：A8 は adapterID が Null、A7b は引数が []、
+  A7c は Xcode の案内の文（今の Windows では Rust と C++ のデバッグはこの文で止まっていた）、A7 は場面 1 で Err("")
+- 外す確かめ（4 か所を一度に外した。控えから戻したあと、ハッシュが控えと同じことを確かめた）：R1 MinGW-Builds の腕を消す → A7、R2 PYTHONUTF8 を消す → A7b、
+  R3 args を配列にする → A8、R4 Windows の Rust の腕を戻す → A7c が、それぞれ落ちた。相対パスの PATH の項目を見ないこと・gdb_version・spawn_gdb は、外しても落ちない
+  （spawn_gdb と gdb_version は A9 で確かめた）
+- 確かめ：cargo test lib 409 通過・0 失敗・9 無視
+
+T3
+- W11（gdb 自身の文）：gdb は No symbol table is loaded.・Breakpoint 1 (-function __cxa_throw) pending.・No source file named … などを、デバッグ対象の出力と同じ stdout の知らせで送る。
+  gdb のときは、process の知らせ（debuggee_pid が入る）より前の出力を捨てる。境を launch の答えでなく process にしたのは、gdb の文が launch の答えのあとにも届くことがあり、
+  デバッグ対象は process の知らせより後でしか出力しない見込みのため（gdb の events.py を読んだ。利用者が決めた）
+- W12（abort のあとの続行）：abort で止まったあと続行すると、もう一度 reason signal で止まり、もう一度続行すると終了コード -1073740791（0xC0000409。段階 2 S5b の __fastfail と同じ）で終わる。
+  隠すと本物の落ち方も隠れるおそれがあるので、コードは変えない（利用者が決めた）。usage.md に書いた
+- W13（一時停止）：gdb は動いている間の threads を断る（notStopped）ので、gdb の一時停止は threads を送らずに pause を送る
+  （gdb の pause.py は threadId を見ずに interrupt -a を動かす。threadId には 1 を入れる。利用者が決めた）
+- W14（一時停止のスレッド）：gdb の一時停止は、割り込みのためのスレッドで、理由のない停止（reason "stopped"）として届く
+  （直す前：threadId 5、スタックは ntdll!DbgBreakPoint → ntdll!DbgUiRemoteBreakin → KERNEL32!BaseThreadInitThunk → ntdll!RtlUserThreadStart → ???。main が出ない）。
+  gdb の reason "stopped" の停止を、main のスレッド（1）の pause として扱う。main のスレッドは番号 1 に決めた（threads を送る形は、知らせを読むスレッドで答えを待つと止まるため。利用者が決めた）。
+  デバッグコンソールで gdb の命令（interrupt など）を打って止まったときも、同じく pause として扱われる
+- テスト：A9（本物の gdb。5 つの場面）は CI では飛ぶ（環境変数 CI があるとき。runner の gdb の有無と版を手元で調べられず、落ちたときに切り分けられないため。
+  lldb-dap の本物のテストも CI では --skip。利用者が決めた）。gdb がなくても飛ぶ。A10〜A12（偽の知らせ・偽のアダプター）は CI でも動く
+- 直す前の失敗（テストを先に書いた。W11 → W13 の順に足し、W14 はテストを足してから足した）
+  - テストだけの段：A9 は場面 1 の「出力の頭が『あいう』」で落ちた（頭に gdb の文が 6 行）。A10 は gdb の文 2 行と「あいう」の 3 つが届いた。
+    A11 は Err("gdb が threads を断りました：notStopped")
+  - W11 だけの段：A10 が通り、A9 は場面 4 の一時停止が同じ notStopped で落ちた
+  - W14 のテストを足した段：A12 は ("stopped", Some(5))（期待は ("pause", Some(1))）。A9 は場面 4 の reason が "stopped"
+- 外す確かめ（W11・W13・W14 を一度に外した。控えから戻したあと、ハッシュが控えと同じことを確かめた）：R5 W11 → A10 と A9（場面 1）、R6 W13 → A11、R7 W14 → A12 が落ちた。
+  A9 は場面 1 で先に落ちるので、R6・R7 は A9 では見えない（R6 は W11 だけの段で、R7 は W14 の直す前の段で、A9 が捕まえることを見た）
+- 全体の cargo test で 1 回落ちた件：5 つの確かめの全体の cargo test で、1 回、A9 が落ちた（412 通過・1 失敗）。場面 2（例外で止まったまま止める）のあと、テストのプロセスの子孫に
+  main-debug.exe が 1 つ残って見えた（直前の、場面 2 のデバッグ対象が alive でなくなる確かめは通った。このときは始めるまで 4.01 秒かかった）。
+  A9 だけで動かしたときは、それまでの 5 回とも通っていた。落ちたときに pid・名前・alive を出すようにして、全体を 2 回動かすと、2 回とも通った（413 通過）。
+  「止めた直後に一覧に残っていた」という見立ては未確認のまま、A9 の確かめを、3 秒まで 20 ms ごとに見直し、alive のものだけを数える形にした
+  （もう終わっているプロセスは利用者に害がないため。一覧にあるが alive でないものは数えずに記録する。利用者が決めた）
+- clippy の type_complexity の警告（partition の結果の型）が出たので、型を (Vec<_>, Vec<_>) にした
+- 確かめ：cargo test lib 413 通過・0 失敗・9 無視
+
+A9 で記録したこと（assert していない所を含む）
+- 変数の欄で vector の中身（1・2・3）が見えた
+- 始めてから止まるまで約 2.0〜2.6 秒（A9 だけのとき）
+- 件 2：C++ でも、最初に止まるまでの continued は 0
+- 止めるのは、どの場面も forced false（Python の件 4 とは違う）。一時停止のあと止めるまで 24〜33 ms
+- abort のあと続行 2 回で、終了コード -1073740791（0xC0000409）
+- input.txt がないとき（`< "NUL"`）、入力を待たずに終わった
+
+画面の確かめ（2026-11-22。17d5de0 から作った release の exe 685672F5…025B〔10,162,176 バイト〕。利用者が操作した。ログインも提出もしていない。
+作業領域は、作業する側が作った %USERPROFILE%\Documents\debug_test_cpp〔a\main.cpp は 25 行の試しのプログラム、a\test\input.txt〕。場面の順は B → C → D → E → A）
+- 場面 B（input.txt は「3」「1 2 3」。初めて信頼したフォルダで最初のデバッグ）
+  - 実行ログに「デバッグアダプター：C:\Program Files (x86)\mingw64\bin\gdborig.exe（GNU gdb (GDB) 16.3）」、デバッグ用のビルドの文、「標準入力：test/input.txt」「デバッグを始めました。」
+  - 18 行目で止まり、強調された。変数は n 3・a std::vector of length 3, capacity 3・name "atcoder"・total 6。a を開くと [0] 1・[1] 2・[2] 3。ウォッチ式 total + 1 は 7
+  - デバッグコンソールの「あいう」は化けず、gdb の文（No symbol table・pending・No source file）は出なかった。info pretty-printer に builtin と libstdc++-v6
+  - ステップオーバーで 19 行目。続行で「6 atcoder」「プログラムが終わりました（終了コード 0）」、実行ログ「デバッグが終わりました（終了コード 0）」。強制なし
+  - 始めてから止まるまで「一時停止」は出ず、続行・ステップ・停止のボタンになった（件 2）
+- 場面 C（例外。input.txt は「2」「3 4」）：「例外でで止まっています」「例外でで止まりました。」（件 1）、あいう・7 atcoder。
+  コールスタックは libstdc++-6!.cxa_throw と main で、main が選ばれ、19 行目が強調された。停止で「デバッグを止めました。…」、強制なし
+- 場面 D（abort。input.txt は「2」「3 5」）：「abort でで止まっています」「abort でで止まりました。」（件 1）、8 atcoder と stl_vector.h:1263 の Assertion '__n < this->size()' failed. の文。
+  コールスタックは ucrtbase!abort → libstdc++-6!_ZSt21__glibcxx_assert_fail… → stl_vector.h:1263 → main で、20 行目が強調された。
+  続行で「止まっています」、コールスタックは同じで、どの行も強調されない（W12）。もう一度続行で、デバッグコンソール「プログラムが終わりました（終了コード -1073740791）」、
+  実行ログ「デバッグが終わりました（終了コード -1073740791）」（件 6）
+- 場面 E（一時停止。input.txt は「2」「4 5」）：18 行目で止めてから続行すると、ボタンが「一時停止」になり、あいう・9 atcoder。一時停止で「止まっています」、
+  コールスタックは main だけで強調され、変数の一番上に i（volatile long long）。停止はすぐで、実行ログ「デバッグを止めました。…」。
+  デバッグコンソールに「プログラムが終わりました（終了コード 0）」が出た（止めたのに 0。件 7）
+- 場面 A（input.txt なし。ファイル一覧から消した）：デバッグコンソールに「あいう」「0 atcoder」「プログラムが終わりました（終了コード 0）」。
+  1 回目は利用者が実行ログの頭を見落としたので、見直した。見直しでは、デバッグ用のビルドの文のすぐあとに「入力ファイルなし（空の標準入力で実行）。入力が必要なら test/input.txt を作ってください」が出て、
+  そのあと「デバッグを始めています…」「デバッグを始めました。」「デバッグが終わりました。」「デバッグが終わりました（終了コード 0）」
+- コンソールの黒い窓は一度も出なかった。× で閉じても何も出なかった
+- 前と後（読むだけの命令。後は、見直しのあと、アプリを閉じてから）
+  - atcoder-studio・gdb・gdborig・main-debug は 0 → 0
+  - settings.json と acd_studio の git status（windows-stage6-cpp・17d5de0・0 行）は変わらなかった
+  - trusted.json は debug_test_cpp を信頼した分だけ変わった（567 → 625 バイト。denied 0 件・folders 11 件で、debug_test_cpp の項目が 1 つ。前の件数は数えていない）
+  - debug_test_cpp は、a\test\input.txt がなくなり（場面 A で消した分）、a\target\main-debug.exe（309,495 バイト）が増えた。main.cpp のハッシュは同じ
+- アプリを開いたままの gdb・main-debug の数は数えていない（利用者が操作している間は命令を動かさないため）。止めたあとに gdb とデバッグ対象が残らないことは、A9 で確かめた
+- 試しの作業領域 %USERPROFILE%\Documents\debug_test（Python）と %USERPROFILE%\Documents\debug_test_cpp（C++）は、消さずに残している。消すかは利用者が決める
+
+受け入れ条件の結果（元の版の AC16-12・AC18-09・10 を Windows 向けに読み替えたもの）
+- AC16-12：満たした（ブレークポイント・ステップ・変数〔vector・string〕・ウォッチ式・デバッグコンソール・例外で止まる・範囲外の読み書きで abort として止まる・input.txt の入力・
+  日本語の出力・input.txt がないとき入力を待たずに終わる）。ただし「一時停止」は最初に止まるまで出ない（件 2）。コールスタックの場所はフルパスで出る（件 5）
+- AC18-09：満たした（初めて信頼したフォルダの、最初のデバッグで止まった・終わった）
+- AC18-10：満たした（アプリを閉じたあと、gdb・gdborig・main-debug は 0。コンソールの窓は出ない）。アプリを開いたままの数は画面の確かめでは数えておらず、A9 で確かめた
+
+画面の確かめで見つかった 3 つの件（扱いは 9.1 の追加 51。番号は「段階 6 の Python の結果」の件 1〜4 の続き）
+| # | 見たこと | 原因 | 扱い |
+| --- | --- | --- | --- |
+| 5 | コールスタックの場所の欄が、ファイル名でなくフルパス（%USERPROFILE%\Documents\debug_test_cpp\a\main.cpp:18 や、stl_vector.h の場所） | src/panels/DebugPanel.tsx:83-85 の fileName が "/" だけで区切り、Windows の "\" で区切らない（読んで確かめた）。同じ fileName を、ブレークポイントの一覧（216 行）でも使う。Python でも同じ見込み（推測）。共通の TS | 件 1 と一緒に、デバッグの画面の文を直すあとの小さな PR で直す |
+| 6 | abort のあとの終了コードが 10 進（-1073740791）のままで、0xC0000409 と名前が付かない | 実行の結果は run.rs の exit_code_text で 16 進と名前にするが、デバッグの文（App.tsx:654 と src/panels/runLog.ts:91）は値をそのまま出す（読んで確かめた） | 件 5 と同じ PR |
+| 7 | 一時停止のあと「停止」すると、デバッグコンソールに「プログラムが終わりました（終了コード 0）」と出る | 未確認（gdb がデバッグ対象を止めたときの exited の知らせの値と見られる。推測） | 件 2・件 4 と同じ PR で調べる |
+
 ---
 
 ## 8. 新しい依存の候補
@@ -2958,6 +3057,7 @@ macOS への影響
 | 追加 48（2026-11-20） | 段階 6（デバッグ）を始める（12 は書き換えない）。言語の順は Python → C++ → Rust で、言語ごとにブランチと PR を分ける。Windows で使えるデバッグは、まず Python（CPython）だけ。C++・Rust はまだで、PyPy の debugpy はあとで決める。範囲は「段階 6 の Python（debugpy）の計画」の節に書き、docs/usage.md には T4 で 1 段落足す。debugpy は CPython の分だけ利用者の手元に入れる（版・命令の全文・入れる場所を見せ、利用者がアプリを閉じたあと、許可を得てから。版は 1.8.22）。Windows の入れ方の案内文は PowerShell 向け（先頭に &）で、Unix の文はそのまま。spawn_debugpy のつなげなかったときの 2 行（kill_group → wait）は、テストのために小さな関数に移す（「場所を移す」。Unix の動きは同じ）。`\\?\` のパス（W6）は、本物の debugpy のテストの結果を見てから決める。デバッグコンソールの文が Python でも「LLDB」なのは、macOS と共通の画面の文なので直さない。段階 6 の計画と決めたことは、この計画書に書く。ブランチは origin/main（12c2400）から作った windows-stage6-python | 段階 6 |
 | 追加 49（2026-11-21） | 段階 6 の Python の画面の確かめ（AC20-04・05）で見つかった 4 つの件の扱い。標準出力が届かない件は、この PR で W7 として直す（cfg(windows) で `-u`。Unix の経路は変えない。macOS でも同じことが起きる見込みは、10 章に未確認として書く）。「例外でで」（failureStop と、それを呼ぶ 2 か所）と「一時停止にならない」は、Python の PR のあとの別の小さな PR で直す（共通の TS などを変えるので、macOS も変わる。後者は C++ の段階で lldb-dap の動きを見てから決める）。「強制的に止めた」は記録だけにして一時的なテストはせず、調べは後者の PR で行う。W6 は source.path にだけ without_verbatim を通す（cwd は変えない）。find_debugpy は OS ごとの 2 つの関数に分ける | 段階 6 |
 | 追加 50（2026-11-22） | 段階 6 の C++ を、origin/main（73d20c8）から作った windows-stage6-cpp で行う。アダプターは利用者の手元の MinGW-Builds の gdb 16.3 の DAP（A）。LLVM の lldb-dap（B）と attach の形は、今は使わない。gdb.exe の隣に gdborig.exe と ..\opt があるときだけ gdborig.exe を直接起動し、gdb の子にだけ PYTHONHOME=<mingw64>\opt と PATH（コンパイラの bin → opt\bin → もとの PATH）を付ける。ないときは gdb.exe をそのまま使う。どちらも PYTHONUTF8=1 を gdb の子にだけ付ける。引数は -nh -q --interpreter=dap -iex "set auto-load off"。標準入力は launch の args に引用符つきの 1 つの文字列（"< \"パス\""）。P2 で見つけた 3 つの件（gdb 自身の文が stdout で届く・abort のあと signal で止まる・一時停止が送れない）は、先にテストを書いてから直す。Windows の Rust のデバッグの文は、Xcode の案内から「まだ使えません」の文に変わる（cfg(windows) の中だけ）。件 1・件 2（追加 49）は、この PR でも記録だけ。計画は「段階 6 の C++（gdb）の計画」の節 | 段階 6 |
+| 追加 51（2026-11-22） | 段階 6 の C++ の T2・T3 と画面の確かめで決めたこと。spawn_gdb は Client::spawn と別に書く（Unix の spawn の行を変えないため。利用者が決めた）。A9（本物の gdb）は CI では飛ばす（環境変数 CI があるとき。利用者が決めた）。W11 の境は、launch の答えでなく process の知らせ（利用者が決めた）。W12（abort のあと signal で止まり、0xC0000409 で終わる）はコードを変えない（利用者が決めた）。W13 は threads を送らずに pause を送り、W14 は gdb の reason "stopped" の停止を main のスレッド（1）の pause として扱う。デバッグコンソールで interrupt を打ったときも pause になる（利用者が決めた）。全体の cargo test で A9 が 1 回落ちた件は、見立てを確かめないまま、3 秒まで見直して alive のものだけを数える形にした（利用者が決めた）。画面の確かめで見つかった件 5〜7 は、この PR では記録だけ：件 5（コールスタックのフルパス）と件 6（終了コードが 10 進）は、件 1 と一緒に、デバッグの画面の文を直すあとの小さな PR で直し、件 7（一時停止のあと止めると終了コード 0）は件 2・件 4 と同じ PR で調べる（利用者が決めた）。結果は「段階 6 の C++（gdb）の結果」の節 | 段階 6 |
 
 ---
 
@@ -3008,17 +3108,23 @@ macOS への影響
   - W7 の場面 4 の確かめが、直す前に落ちるか
   - traceback に debugpy と runpy のフレームが並ぶ理由（runpy で動かすため。推測）
   - IDE が渡した cwd の `\\?\` が、Python の中で外れていた理由（Windows か Rust の標準ライブラリか）
-- 段階 6 の C++（「段階 6 の C++（gdb）の計画」）
+- 段階 6 の C++（「段階 6 の C++（gdb）の計画」と「段階 6 の C++（gdb）の結果」）
   - 6 章の gdb の Python と DAP は確認済み（P1・P2）。「6 章：すべてのデバッグの方式」のうち、LLVM の lldb-dap の有無と CodeLLDB のライセンスは未確認のまま
-  - 「一時停止」の件の lldb-dap の動き：この機械に lldb-dap がないので未確認のまま（gdb は continued を一度も送らないことを確かめた）
-  - 空白・日本語の入ったパスでの標準入力（`"< \"パス\""`）と、gdborig.exe の起動
+  - 「一時停止」の件の lldb-dap の動き：この機械に lldb-dap がないので未確認のまま（gdb は continued を一度も送らないことを、P2・A9・画面の場面 B で確かめた）
+  - 空白・日本語の入ったパスでの標準入力（`"< \"パス\""`）と、gdborig.exe の起動（`< "NUL"` で空の入力になることは、A9 の場面 5 と画面の場面 A で確認済み）
+  - 利用者が PYTHONHOME・PYTHONPATH を付けているときの gdb.exe（gdborig.exe のない配布で gdb.exe をそのまま使うとき。gdborig.exe のときの PYTHONPATH も）
   - MinGW-Builds の包み（gdb.exe）の中身（文字列から見た推測）
   - gdb が PDB を読めないこと（推測。Rust の PR で見る）
   - Microsoft の cpptools を VS Code の外で使えないこと（使用条件の文は読んでいない。推測）
-  - A9 が CI の windows-latest で動くか（runner の MinGW の gdb の有無）
-  - 変数の欄（variables）での vector の中身の表示（P2 では、入力が入らなかった 1 回目の length 0 だけを見た。中身は 2 回目の repl の info locals でだけ見た）
+  - A9 が CI の windows-latest で動くか（runner の MinGW の gdb の有無）（→ CI では飛ばすことにした〔追加 51〕。runner の gdb の有無は未確認のまま）
+  - 変数の欄（variables）での vector の中身の表示（→ A9 と画面の場面 B で確認済み：[0] 1・[1] 2・[2] 3）
+  - gdb の一時停止（→ W13・W14 のあと、A9 の場面 4 と画面の場面 E で確認済み：main のスレッドで止まり、main が強調される）
   - P2 の 1 回目で出力が届かなかった理由（gdb の Python が cp932 として読めなかったと見られる。推測）と、abort のあと signal で止まる理由（SIGABRT と見られる。推測）
-- docs/usage.md で Windows に触れているのは、末尾の「Windows：対応を確認していません。」と、段階 6 で足した Python のデバッグの 1 項目だけ。
+    （続行すると 0xC0000409 で終わることは、A9 と画面の場面 D で確認済み）
+  - 全体の cargo test で A9 が 1 回落ちた理由（止めた直後に一覧に残っていたという見立ては未確認）
+  - 画面の確かめで見つかった件 5〜7（直すのは別の PR）：件 5 の fileName がブレークポイントの一覧と Python でも同じに出るか（推測）、件 7 の終了コード 0 の理由
+- 計画書の前の段階の記録の中に、ユーザーのフォルダの名前が入ったパス（6 行）と、アプリの識別子（10 行）がそのまま残っている。利用者が「最後にまとめて直す」と決めた（2026-11-22）
+- docs/usage.md で Windows に触れているのは、末尾の「Windows：対応を確認していません。」と、段階 6 で足した Python と C++ のデバッグの項目だけ。
   usage.md の Windows の書き方（brew・macOS のキーなど）をまとめて直すのは、あとの PR の候補
 - 段階 3 で確かめること：残りなし（ShellExecuteW を COM の初期化なしで呼んで URL とフォルダを開けることは T8 で確認済み。提出の処理を始めずに提出のページを開ける経路がないことは T8 でコードで確認済み。InPrivate と on_navigation の制限のもとでログインが通ること〔Turnstile が出たかは記録していない〕と、cookies() が WebView2 で REVEL_SESSION を返すこと〔HttpOnly かは見ていない〕は T9 で、CI の Windows で資格情報を書けることは run 42378818906 で確認済み。アプリが記録をファイルに書かないことは T9 の前にコードで確認済み）。あとの段階へ残したものは「段階 3 の結果」の「残る未確認」にある
 - curl の .curlrc：Windows の curl.exe は --disable で読まない（段階 3 T10。テストで確認済み）。macOS の curl には付けていない（.curlrc が Cookie の入った要求に効くかは推測のまま）。
