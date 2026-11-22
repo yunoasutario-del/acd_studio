@@ -224,6 +224,8 @@ pub enum DebugEvent {
 
 // テストで差し替えられる、外の環境
 pub struct Environment {
+    // （Windows では読まない。段階 6 の C++ W8）
+    #[cfg_attr(windows, allow(dead_code))]
     pub xcrun: PathBuf,
     // アダプターに渡す HOME（テストで ~/.lldbinit を読まないことを確かめるときだけ使う）
     pub home: Option<PathBuf>,
@@ -366,6 +368,8 @@ fn is_system_exit(body: &Value) -> bool {
 }
 
 // `xcrun --find lldb-dap` で lldb-dap の場所を見つける（シェルは使わない。D-146 2.1）
+// （Windows では使わない。段階 6 の C++ W8）
+#[cfg_attr(windows, allow(dead_code))]
 pub fn find_adapter(xcrun: &Path) -> Result<PathBuf, String> {
     let mut command = Command::new(xcrun);
     command.args(["--find", "lldb-dap"]).stdin(Stdio::null());
@@ -466,6 +470,158 @@ fn launch_arguments(program: &Path, dir: &Path, input: &Path, rustc: Option<&Rus
             // 責任を持つプロセスになり、問題（実行ファイル）が変わるたびに macOS が確認を出す（Phase 18 作業 3。D-217）
             "settings set target.inherit-tcc true".to_string(),
         ],
+    })
+}
+
+// ---- gdb（Windows。段階 6 の C++。W8〜W10。docs/windows-port-plan.md の「段階 6 の C++（gdb）の計画」） ----
+// 利用者の手元の MinGW-w64 の gdb（16.3 で確かめた）を DAP（--interpreter=dap）で使う。IDE には同梱せず、取得もしない
+
+// gdb の引数（9.1 の追加 50）：利用者のフォルダの初期化ファイルを読まない（システムの gdbinit は読む。libstdc++ の表示の登録）、
+// 始めの案内を出さない、DAP で話す、作業フォルダの .gdbinit とプログラム・DLL の隣のスクリプトを自動で読まない
+#[cfg(windows)]
+const GDB_ARGS: &[&str] = &[
+    "-nh",
+    "-q",
+    "--interpreter=dap",
+    "-iex",
+    "set auto-load off",
+];
+
+#[cfg(windows)]
+const GDB_MISSING: &str = "C++ のデバッグには gdb（MinGW-w64 の gdb.exe）が要ります。g++.exe と同じフォルダにも PATH にも gdb.exe が見つかりません。MinGW-Builds の GCC（bin に gdb.exe が入っています）を使うか、gdb.exe のあるフォルダを PATH に足してください";
+
+#[cfg(windows)]
+const RUST_DEBUG_UNSUPPORTED: &str =
+    "Windows では、Rust のデバッグはまだ使えません（今は Python と C++ だけです）";
+
+// 起動する gdb と、gdb の子に付ける環境（W8）
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq)]
+struct GdbLaunch {
+    // 起動する exe（MinGW-Builds の形なら gdborig.exe、そうでなければ gdb.exe）
+    program: PathBuf,
+    // 子の PATH の先頭に、この順に足すフォルダ
+    path_prefix: Vec<PathBuf>,
+    // PYTHONHOME（MinGW-Builds の形のときだけ <mingw64>\opt）
+    python_home: Option<PathBuf>,
+}
+
+// 設定の C++ のコンパイラ（なければ見つけた g++）と同じフォルダ → PATH の順に gdb.exe を探す（W8）
+#[cfg(windows)]
+fn find_gdb(cpp: &crate::cpp::CppSettings) -> Result<GdbLaunch, String> {
+    let compiler_dir = crate::cpp::find_compiler(cpp)
+        .ok()
+        .and_then(|compiler| compiler.parent().map(Path::to_path_buf));
+    find_gdb_in(compiler_dir.as_deref(), std::env::var_os("PATH").as_deref())
+}
+
+// テストのために、コンパイラのフォルダと PATH を受け取る形（相対パスの PATH の項目は見ない。cpp.rs の find_compiler_on_windows と同じ）
+#[cfg(windows)]
+fn find_gdb_in(
+    compiler_dir: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Result<GdbLaunch, String> {
+    let in_path: Vec<PathBuf> = path_var
+        .map(|paths| {
+            std::env::split_paths(paths)
+                .filter(|dir| dir.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    let gdb = compiler_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(in_path)
+        .map(|dir| dir.join("gdb.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| GDB_MISSING.to_string())?;
+    let gdb_dir = gdb.parent().map(Path::to_path_buf).unwrap_or_default();
+    // デバッグ対象の DLL は、ふだんの実行と同じくコンパイラの bin から（なければ gdb のフォルダ）
+    let dll_dir = compiler_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| gdb_dir.clone());
+    // MinGW-Builds の形：gdb.exe は包みで、本体は隣の gdborig.exe、Python は ..\opt（包みの中身は文字列から見た推測。9.1 の追加 50）。
+    // 包みを通すと、空白のある引数が分かれ、デバッグ対象が opt\bin の libgcc_s_seh-1.dll で動く（P2 で確かめた）ので、本体を直接起動する
+    let orig = gdb_dir.join("gdborig.exe");
+    match gdb_dir.parent().map(|mingw| mingw.join("opt")) {
+        Some(opt) if orig.is_file() && opt.is_dir() => Ok(GdbLaunch {
+            program: orig,
+            path_prefix: vec![dll_dir, opt.join("bin")],
+            python_home: Some(opt),
+        }),
+        _ => Ok(GdbLaunch {
+            program: gdb,
+            path_prefix: vec![dll_dir],
+            python_home: None,
+        }),
+    }
+}
+
+// gdb の子の環境（W9）：PATH の先頭、PYTHONHOME、PYTHONUTF8=1（付けないと、デバッグ対象の出力が 1 文字も届かない。P2 の 1 回目）
+#[cfg(windows)]
+fn apply_gdb_env(command: &mut Command, launch: &GdbLaunch) {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let paths = launch
+        .path_prefix
+        .iter()
+        .cloned()
+        .chain(std::env::split_paths(&inherited));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
+    if let Some(home) = &launch.python_home {
+        command.env("PYTHONHOME", home);
+    }
+    command.env("PYTHONUTF8", "1");
+}
+
+// gdb を DAP で起動する命令（W9。作業フォルダ・process_group・標準入出力・D-104 の変数は Client::spawn_gdb で付ける）
+#[cfg(windows)]
+fn gdb_command(launch: &GdbLaunch) -> Command {
+    let mut command = Command::new(&launch.program);
+    command.args(GDB_ARGS);
+    apply_gdb_env(&mut command, launch);
+    command
+}
+
+// `gdb --version` の 1 行目（例：GNU gdb (GDB) 16.3）。gdborig.exe は libpython のため同じ環境で動かす。窓を出さない
+#[cfg(windows)]
+fn gdb_version(launch: &GdbLaunch) -> Option<String> {
+    let mut command = crate::process::command(&launch.program);
+    command.arg("--version").stdin(Stdio::null());
+    apply_gdb_env(&mut command, launch);
+    let output = command.output().ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+}
+
+// gdb の initialize（W10）：lldb-dap の拡張（$__lldb_sourceInitFile）を送らない
+#[cfg(windows)]
+fn gdb_initialize_arguments() -> Value {
+    json!({
+        "clientID": "atcoder-studio",
+        "clientName": "AtCoder Studio",
+        "adapterID": "gdb",
+        "locale": "ja",
+        "linesStartAt1": true,
+        "columnsStartAt1": true,
+        "pathFormat": "path",
+        "supportsVariableType": true,
+    })
+}
+
+// gdb の launch（W10）：program・cwd は `\\?\` を外す。標準入力は args に引用符つきの 1 つの文字列（配列で送ると gdb が `<` を引用して
+// 入らない。P2）。入力のファイルがないとき（choose_input の NUL）も同じ形。Windows のファイル名に `"` は使えないので逃がさない。
+// preRunCommands（target.input-path・inherit-tcc）は macOS の LLDB だけなので送らない
+#[cfg(windows)]
+fn gdb_launch_arguments(program: &Path, dir: &Path, input: &Path) -> Value {
+    json!({
+        "program": crate::trust::without_verbatim(program),
+        "cwd": crate::trust::without_verbatim(dir),
+        "args": format!("< \"{}\"", crate::trust::without_verbatim(input).display()),
+        "stopOnEntry": false,
     })
 }
 
@@ -925,6 +1081,36 @@ impl Client {
             channel.clone(),
         );
         let (client, notices) = Client::connect("lldb-dap", stdin, stdout, root, channel);
+        Ok((client, child, notices))
+    }
+
+    // Windows（段階 6 の C++。W9）：gdb を DAP で起動する。流れは spawn と同じ（Unix の spawn の行を変えないことを優先して分けた。
+    // Python の W5 と同じ理由）。gdb の子の環境（PATH・PYTHONHOME・PYTHONUTF8）は gdb_command で付ける
+    #[cfg(windows)]
+    fn spawn_gdb(
+        launch: &GdbLaunch,
+        dir: &Path,
+        root: &Path,
+        channel: &Channel<RunEvent>,
+    ) -> Result<(Arc<Client>, Child, Receiver<Notice>), String> {
+        let mut command = gdb_command(launch);
+        command
+            .current_dir(dir)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // デバッグ対象は gdb の環境を引き継ぐので、今の実行と同じく D-104 の変数を外す
+        toolchain::clear_ide_env(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("gdb を起動できません：{error}"))?;
+        crate::win::start_in_job(&child)
+            .map_err(|error| format!("gdb を起動できません：{error}"))?;
+        let stdin = child.stdin.take().expect("piped");
+        let stdout = child.stdout.take().expect("piped");
+        spawn_stderr_reader(child.stderr.take().expect("piped"), "gdb", channel.clone());
+        let (client, notices) = Client::connect("gdb", stdin, stdout, root, channel);
         Ok((client, child, notices))
     }
 
@@ -1414,6 +1600,15 @@ pub fn debug_target(
                 dir.display()
             ),
         ),
+        #[cfg(windows)]
+        Adapter::Gdb(launch) => info(
+            channel,
+            format!(
+                "デバッグアダプター：{}（{}）\n",
+                launch.program.display(),
+                gdb_version(launch).unwrap_or_else(|| "版は分かりません".to_string())
+            ),
+        ),
     }
 
     let (
@@ -1499,6 +1694,8 @@ pub fn debug_target(
             cancel,
             channel,
         ),
+        #[cfg(windows)]
+        Adapter::Gdb(launch) => Client::spawn_gdb(launch, dir, root, channel),
     };
     let (client, mut child, notices) = match spawned {
         Ok(spawned) => spawned,
@@ -1524,6 +1721,15 @@ pub fn debug_target(
             start_arguments: debugpy_attach_arguments(),
             stop_functions: &[],
             uncaught_exceptions: true,
+        },
+        // Windows（段階 6 の C++ W10）：止める関数は lldb-dap と同じ（__cxa_throw・abort。gdb でも止まることを P2 で確かめた）
+        #[cfg(windows)]
+        Adapter::Gdb(_) => SessionPlan {
+            initialize: gdb_initialize_arguments(),
+            start: "launch",
+            start_arguments: gdb_launch_arguments(&executable.path, dir, &input),
+            stop_functions: stop_functions(target.language),
+            uncaught_exceptions: false,
         },
     };
     let started = start_session(&client, &notices, plan, breakpoints, cancel);
@@ -1585,9 +1791,14 @@ pub fn debug_target(
 // 使うアダプター
 enum Adapter {
     // lldb-dap の場所
+    // （Windows では作らない。Rust は「まだ使えません」、C++ は gdb。段階 6 の C++ W8）
+    #[cfg_attr(windows, allow(dead_code))]
     Lldb(PathBuf),
     // debugpy を入れた場所（D-226）
     Debugpy(PathBuf),
+    // Windows（段階 6 の C++ W8）：起動する gdb と、gdb の子の環境
+    #[cfg(windows)]
+    Gdb(GdbLaunch),
 }
 
 // 言語に合うアダプターを見つける。Python は設定の処理系と、その処理系の debugpy
@@ -1597,7 +1808,13 @@ fn find_session_adapter(
     environment: &Environment,
 ) -> Result<Adapter, String> {
     match language {
+        #[cfg(not(windows))]
         Language::Rust | Language::Cpp => find_adapter(&environment.xcrun).map(Adapter::Lldb),
+        // Windows（段階 6 の C++ W8）：Rust はまだ使えない（次の PR）。C++ は gdb
+        #[cfg(windows)]
+        Language::Rust => Err(RUST_DEBUG_UNSUPPORTED.to_string()),
+        #[cfg(windows)]
+        Language::Cpp => find_gdb(&langs.cpp).map(Adapter::Gdb),
         Language::Python => {
             let interpreter = python::find_interpreter(&langs.python)?;
             find_debugpy(
@@ -3248,5 +3465,185 @@ main()
             session.finish();
         }
         eprintln!("debugpy で試した処理系：{tried}");
+    }
+
+    // Windows（段階 6 C++ T2）：比べて違えば、ユーザーのフォルダの名前を伏せて落ちる（失敗の文に一時フォルダのパスが出るため）
+    #[cfg(windows)]
+    fn assert_same<T: PartialEq + std::fmt::Debug>(left: T, right: T) {
+        assert!(
+            left == right,
+            "{}",
+            hide_names(&format!("left: {left:?}\nright: {right:?}"))
+        );
+    }
+
+    // 命令の環境の値（なければ None。名前は大文字・小文字を区別しない）
+    #[cfg(windows)]
+    fn command_env(command: &Command, name: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    // A7（段階 6 C++ T2。W8）：gdb の見つけ方と起動の形。偽のフォルダとファイルで試す（本物の gdb は使わない）
+    #[cfg(windows)]
+    #[test]
+    fn finds_gdb_next_to_the_compiler_on_windows() {
+        let ws = workspace("find-gdb");
+        let mingw = ws.0.join("mingw64");
+        let bin = mingw.join("bin");
+        let opt = mingw.join("opt");
+        let other = ws.0.join("other").join("bin");
+        write(&bin.join("g++.exe"), "");
+        let settings = crate::cpp::CppSettings {
+            compiler: bin.join("g++.exe").to_string_lossy().into_owned(),
+            ..crate::cpp::CppSettings::default()
+        };
+
+        // 1. MinGW-Builds の形（gdb.exe・gdborig.exe・..\opt）：gdborig.exe を直接。PATH はコンパイラの bin → opt\bin、PYTHONHOME は opt
+        write(&bin.join("gdb.exe"), "");
+        write(&bin.join("gdborig.exe"), "");
+        fs::create_dir_all(opt.join("bin")).unwrap();
+        let orig = GdbLaunch {
+            program: bin.join("gdborig.exe"),
+            path_prefix: vec![bin.clone(), opt.join("bin")],
+            python_home: Some(opt.clone()),
+        };
+        assert_same(find_gdb(&settings), Ok(orig));
+
+        // 2. gdborig.exe はあるが ..\opt がない：gdb.exe をそのまま。PATH の先頭はコンパイラの bin だけ、PYTHONHOME なし
+        fs::remove_dir_all(&opt).unwrap();
+        let plain = GdbLaunch {
+            program: bin.join("gdb.exe"),
+            path_prefix: vec![bin.clone()],
+            python_home: None,
+        };
+        assert_same(find_gdb_in(Some(&bin), None), Ok(plain.clone()));
+
+        // 3. gdborig.exe がない（gdb.exe が本体の配布）：gdb.exe をそのまま
+        fs::remove_file(bin.join("gdborig.exe")).unwrap();
+        assert_same(find_gdb_in(Some(&bin), None), Ok(plain));
+
+        // 4. コンパイラの隣になく、PATH にある：PATH の gdb.exe（相対パスの項目は見ない）。デバッグ対象の DLL のため、PATH の先頭はコンパイラの bin
+        fs::remove_file(bin.join("gdb.exe")).unwrap();
+        write(&other.join("gdb.exe"), "");
+        let path_var = std::env::join_paths([PathBuf::from("relative"), other.clone()]).unwrap();
+        assert_same(
+            find_gdb_in(Some(&bin), Some(&path_var)),
+            Ok(GdbLaunch {
+                program: other.join("gdb.exe"),
+                path_prefix: vec![bin.clone()],
+                python_home: None,
+            }),
+        );
+
+        // 5. gdb.exe がどこにもない：Windows 向けの案内の文
+        fs::remove_file(other.join("gdb.exe")).unwrap();
+        assert_same(
+            find_gdb_in(Some(&bin), Some(&path_var)),
+            Err(GDB_MISSING.to_string()),
+        );
+        assert_same(find_gdb_in(None, None), Err(GDB_MISSING.to_string()));
+    }
+
+    // A7b（段階 6 C++ T2。W9）：gdb を起動する命令の引数と環境
+    #[cfg(windows)]
+    #[test]
+    fn builds_gdb_command_on_windows() {
+        let orig = GdbLaunch {
+            program: PathBuf::from(r"C:\m\bin\gdborig.exe"),
+            path_prefix: vec![PathBuf::from(r"C:\m\bin"), PathBuf::from(r"C:\m\opt\bin")],
+            python_home: Some(PathBuf::from(r"C:\m\opt")),
+        };
+        let command = gdb_command(&orig);
+        assert_same(
+            command.get_program(),
+            std::ffi::OsStr::new(r"C:\m\bin\gdborig.exe"),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_same(
+            args,
+            [
+                "-nh",
+                "-q",
+                "--interpreter=dap",
+                "-iex",
+                "set auto-load off",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+        assert_same(
+            command_env(&command, "PYTHONHOME"),
+            Some(r"C:\m\opt".to_string()),
+        );
+        assert_same(command_env(&command, "PYTHONUTF8"), Some("1".to_string()));
+        let path = command_env(&command, "PATH").unwrap_or_default();
+        let head: Vec<PathBuf> = std::env::split_paths(&path).take(2).collect();
+        assert_same(head, orig.path_prefix.clone());
+
+        // gdb.exe が本体の配布：PYTHONHOME は付けない。PYTHONUTF8 は付ける
+        let plain = GdbLaunch {
+            program: PathBuf::from(r"C:\g\bin\gdb.exe"),
+            path_prefix: vec![PathBuf::from(r"C:\g\bin")],
+            python_home: None,
+        };
+        let command = gdb_command(&plain);
+        assert_same(command_env(&command, "PYTHONHOME"), None);
+        assert_same(command_env(&command, "PYTHONUTF8"), Some("1".to_string()));
+        let path = command_env(&command, "PATH").unwrap_or_default();
+        assert_same(
+            std::env::split_paths(&path).next(),
+            Some(PathBuf::from(r"C:\g\bin")),
+        );
+    }
+
+    // A7c（段階 6 C++ T2。W8）：Windows の Rust のデバッグは、Xcode の案内ではなく「まだ使えません」の文で止まる
+    #[cfg(windows)]
+    #[test]
+    fn reports_rust_debug_unsupported_on_windows() {
+        let result = find_session_adapter(
+            Language::Rust,
+            &LangSettings::default(),
+            &Environment::real(None),
+        );
+        assert_same(result.err(), Some(RUST_DEBUG_UNSUPPORTED.to_string()));
+    }
+
+    // A8（段階 6 C++ T2。W10）：gdb の initialize と launch。lldb-dap の項目がなく、`\\?\` を外し、標準入力は引用符つきの 1 つの文字列
+    #[cfg(windows)]
+    #[test]
+    fn builds_gdb_launch_configuration_on_windows() {
+        let init = gdb_initialize_arguments();
+        assert_eq!(init["adapterID"], "gdb");
+        assert_eq!(init["linesStartAt1"], true);
+        assert_eq!(init["pathFormat"], "path");
+        assert!(init.get("$__lldb_sourceInitFile").is_none(), "{init}");
+
+        let launch = gdb_launch_arguments(
+            Path::new(r"\\?\C:\w\pkg\target\main-debug.exe"),
+            Path::new(r"\\?\C:\w\pkg"),
+            Path::new(r"\\?\C:\w\pkg\test\input.txt"),
+        );
+        assert_eq!(launch["program"], r"C:\w\pkg\target\main-debug.exe");
+        assert_eq!(launch["cwd"], r"C:\w\pkg");
+        assert_eq!(launch["args"], r#"< "C:\w\pkg\test\input.txt""#);
+        assert_eq!(launch["stopOnEntry"], false);
+        for key in ["initCommands", "preRunCommands", "stdio", "env"] {
+            assert!(launch.get(key).is_none(), "{key}：{launch}");
+        }
+
+        // 入力のファイルがないとき（choose_input の NUL）も同じ形
+        let launch = gdb_launch_arguments(
+            Path::new(r"C:\w\a.exe"),
+            Path::new(r"C:\w"),
+            Path::new("NUL"),
+        );
+        assert_eq!(launch["args"], r#"< "NUL""#);
     }
 }
