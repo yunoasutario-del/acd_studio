@@ -2513,6 +2513,7 @@ exe の作り直し
 
 **今回の移植には含めない（9 章 12。2026-10-29 に決めた）。** 段階 1 では、デバッグのコードは Windows でコンパイルが通るようにするだけで、動かさない。以下は後で行うときのための記録。
 → 2026-11-20 に段階 6 を始めた（9.1 の追加 48。12 は書き換えていない）。Python（debugpy）の計画は、下の「段階 6 の Python（debugpy）の計画」。
+→ 2026-11-22 に C++ を始めた（9.1 の追加 50）。アダプターは MinGW-Builds の gdb 16.3 の DAP。計画は下の「段階 6 の C++（gdb）の計画」。
 
 何を変えるか
 - 6 章で選んだ方式のアダプターの探索と起動、DAP の違いの吸収
@@ -2713,6 +2714,142 @@ W7 のあとのやり直し（2026-11-22。5127049 から作った exe 975615C2�
 - 起動の時間：A5 で、始めてから止まるまで約 1.2 秒。CONNECT_WAIT・LAUNCH_WAIT は変えていない
 - 出力の改行：テストでは CRLF（30\r\n）。デバッグコンソールで `\r` は見えない（画面）
 
+### 段階 6 の Python の push と merge（2026-11-22。windows-stage6-cpp の T1 で書いた）
+
+- windows-stage6-python を origin へ push した（-u なし。送ったのは c49ff9d・16aeb4f・82e99d5・5127049・d9fd6b8 の 5 つ）。push の前に、利用者が自分の窓で秘密の値の照らし合わせをした
+- push の run #57 は success（利用者がブラウザで見た）
+
+| OS | lib | npm test |
+| --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out | 26 通過 |
+| Windows | 405 通過・0 失敗・8 無視・1 filtered out | 26 通過 |
+
+- run #57 の Annotations は、Node.js 20 の非推奨（macOS と Windows の両方）と、macOS の runner の混雑の notice だけ
+- PR #12（base は利用者のリポジトリの main。5 commits・Files changed 4）：All checks have passed・No conflicts
+- merge は 73d20c8（Create a merge commit。ブランチは消していない）。親は 12c2400 と d9fd6b8、tree は d9fd6b8 と同じ（4c4ab1e244aacd671b2dd599527b1d42795e2d67。T1 の前に読むだけの命令で確かめ直した）。
+  手元の main は、git fetch origin のあと、親と tree を確かめ、git switch main と git merge --ff-only origin/main で 73d20c8 に合わせた
+- merge のあとの main の push の run #59 は、macOS・Windows とも success（利用者がブラウザで見た）
+
+| OS | lib | 時間 | npm test |
+| --- | --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out | 40.76 秒 | 26 通過・0 失敗 |
+| Windows | 405 通過・0 失敗・8 無視・1 filtered out | 60.45 秒 | 26 通過・0 失敗 |
+
+- run #59 の Annotations は、Node.js 20 の非推奨（macOS と Windows の両方。actions/checkout@v4・actions/setup-node@v4）と、macOS の runner の混雑の notice だけ
+- デスクトップの exe（%USERPROFILE%\Desktop\atcoder-studio.exe）は、5127049 から作った release の exe（10,148,864 バイト・975615C2…FDD6D）に入れ替えた
+  （前は 0058571 から作った B99BBA6A…0226。73d20c8 とはコードが同じで、違うのは計画書と usage.md だけなので、作り直さなかった）
+
+### 段階 6 の C++（gdb）の計画（2026-11-22。windows-stage6-cpp）
+
+範囲（9.1 の追加 50）
+- Windows で使えるデバッグに C++ を足す。Rust はまだ（次の PR）。言語ごとにブランチと PR を分ける（追加 48）
+- アダプターは、利用者の手元の MinGW-Builds の gdb 16.3 の DAP（`--interpreter=dap`）。IDE には同梱せず、取得もしない（元の版の D-145 の 1 と同じ考え方）
+- 利用者向けの docs/usage.md の Windows のデバッグの項目に、最後のコミットで C++ を足す
+
+元の版との対応
+| 項目 | 元の版 |
+| --- | --- |
+| 段階・作業 | Phase 17 作業 6（C++ のデバッグ） |
+| D-番号 | D-211（C++ のデバッグ）・D-214（デバッグ用のビルドに -D_GLIBCXX_ASSERTIONS）・D-217（target.inherit-tcc。macOS の LLDB だけで、Windows の gdb では使わない） |
+| 画面の確かめの基準 | AC16-12（ブレークポイント・ステップ・変数〔vector・string〕・例外で止まる）・AC18-09・10（初めての問題でも止まる・今までどおり） |
+| コミット | このリポジトリでは、元の版の全体を最初に取り込んだ 309895d に入っている。機能ごとの元の版のコミットのハッシュは、公開の履歴にないので未確認 |
+| 元の版の Windows | デバッグは対象外（P-07-8）。総合開発仕様書 8.2 は、Windows では MSVC/PDB と GNU/DWARF の違いを調べ、対応範囲を明示することを求めている → 下の「道具の調べ」と、上の「範囲」 |
+
+道具の調べ（2026-11-22。読むだけの命令と、上限つきの命令で確かめた）
+- この IDE の C++ は MinGW の g++（9.1 の 10）なので、デバッグ情報は DWARF。PDB は MSVC・clang-cl のときだけで、C++ では使わない（5.1）。
+  PDB が問題になるのは Rust（x86_64-pc-windows-msvc）。gdb は PDB を読めない見込み（推測）なので、Rust は次の PR で別に決める
+- この機械：gdb 16.3（C:\Program Files (x86)\mingw64\bin。Python 3.12 の込み〔`--configuration` に --with-python〕。mingw64\opt に libpython3.12.dll と標準ライブラリ）。
+  share\gdb\python\gdb\dap に DAP の .py が 23 個。libstdc++ の表示（share\gcc-15.2.0\python）を mingw64\etc\gdbinit が登録する。
+  lldb・lldb-dap・codelldb はない。VS Code に Microsoft の cpptools 1.35.6 がある（VS Code の外での使用は使用条件で許されていない見込み。推測。使わない）
+- 候補：A 今の gdb の DAP（選んだ）／B LLVM の lldb-dap（決まった版の Python の DLL が要る見込み、入れ物が大きい）／C MSYS2 の lldb／D 別の gdb／E CodeLLDB。
+  A を選んだ理由：入れるものがない、g++ と同じ配布、DWARF をそのまま読む、DAP の中身（.py）を手元で読める
+- gdb.exe は 57,427 バイトの包みで、本体は隣の gdborig.exe（11,509,760 バイト）。包みは PYTHONHOME を ..\opt にして gdborig.exe を CreateProcessA で起動するものと見られる
+  （中の文字列 PYTHONHOME・..\opt・gdborig・SetEnvironmentVariableA・CreateProcessA から見た推測）
+
+確かめ（P1・P2。どれもコミットしていない）
+- P1（Start-Process・30 秒の上限・空の標準入力）：`-batch -ex "python print(1)"` は、引数が `-ex python` と `print(1)` に分かれて渡り、python が続きの行を待つ印 `>` を出した。
+  `-batch -x <命令のファイル>` では、`-nx`・`-nh` とも 0.1 秒以内に `1`。`-nh` では info pretty-printer に libstdc++-v6 があり、`-nx` では何も出なかった。
+  → gdb の Python は動く（確認済み）。6 章の「120 秒たっても終わらない」は、引数が分かれ、python が端末の入力を待ったためと見られる（推測）
+- P2（一時的なテストで、IDE の DAP のクライアントから本物の gdb を動かした。2 回。debug.rs の控えを取り、足して動かし、控えから戻して、ハッシュが同じことと status 0 行を確かめた）
+  - 1 回目（gdb.exe・`-iex "set auto-load off"`）：空白のある引数が包みで分かれ、auto-load を切れなかった。PYTHONUTF8 がないと、デバッグ対象の出力が 1 文字も届かなかった
+    （gdb の Python が出力のパイプを cp932 として読めなかったと見られる。推測）。`["<", パス]` では標準入力が入らなかった
+  - 2 回目（どれも PYTHONUTF8=1）：gdb.exe（`-ix` にファイル）と gdborig.exe（PYTHONHOME を付けて `-iex`）の両方で、libstdc++ の表示が登録され、auto-load が切れた
+
+| 標準入力の渡し方（launch の args） | 結果 |
+| --- | --- |
+| `["<", パス]`・`["<パス"]`・repl の `set args`（configurationDone の前。launch が args を入れ直すので消える） | 入らない |
+| `"< パス"`・`"< \"パス\""`（1 つの文字列） | 入る（包み・本体とも） |
+
+| DLL | gdb.exe（包み） | gdborig.exe（本体） |
+| --- | --- | --- |
+| libgcc_s_seh-1.dll | opt\bin | bin（ふだんの実行と同じ） |
+| libstdc++-6.dll | bin | bin |
+
+  - 止まる・変数・式：18 行目のブレークポイントで止まり、ウォッチ式も動いた。ステップオーバーで次の行へ。
+    変数の欄（variables）では、vector が libstdc++ の表示で出た（1 回目。入力が入らなかったので length 0）。
+    2 回目は、repl の info locals で a = std::vector of length 3, capacity 3 = {1, 2, 3}・name・total が見えた。
+    変数の欄に入力のあとの vector の中身が出るかは、A9 か画面で見る
+  - 例外：`__cxa_throw` の関数のブレークポイントで止まり（IDE は throw として扱った）、スタックに main（main.cpp）が出た
+  - 範囲外の読み書き：`abort` の関数のブレークポイントで止まり（ucrtbase!abort → __glibcxx_assert_fail → vector::operator[] → main）、assert の文も出力に届いた
+  - 止める：終わったあと・止まっている間・動いている間のどれも、disconnect で 20〜41 ms に終わり、forced にならなかった。gdb もデバッグ対象も残らず、gdb の子孫は空、Job の記録もない
+  - process の知らせ（systemProcessId）は来た。**continued は一度も来なかった**（始めたあと・ステップ・続行のどれでも）
+  - 始める時間：1 回目の最初だけ 4.4 秒、ほかは約 0.07〜0.23 秒
+
+決めたこと（9.1 の追加 50）
+- 起動：gdb.exe の隣に gdborig.exe と ..\opt があるとき（MinGW-Builds の形）だけ gdborig.exe を直接起動し、gdb の子にだけ PYTHONHOME=<mingw64>\opt と、
+  PATH（コンパイラの bin → opt\bin → もとの PATH）を付ける。gdborig.exe がないとき（gdb.exe が本体の配布）は gdb.exe をそのまま使う。どちらも PYTHONUTF8=1 を gdb の子にだけ付ける。
+  理由：デバッグ対象の DLL がふだんの実行と同じになる、空白のある引数が分かれない、包みの CreateProcessA（ANSI。日本語の入ったパスが心配。推測）を避ける。包みの中身は上のとおり推測
+- 引数：`-nh -q --interpreter=dap -iex "set auto-load off"`。-nh は、利用者のフォルダの初期化ファイルを読まず、システムの gdbinit（libstdc++ の表示の登録）は読むため。
+  `set auto-load off` は、作業フォルダの .gdbinit と、プログラムや DLL の隣の自動で読み込むスクリプトを読まないため（元の版の D-146 2.3 の「利用者の初期化ファイルを読まない」に合わせる）
+- 標準入力：launch の args に、引用符つきの 1 つの文字列 `"< \"パス\""`（パスは `\\?\` を外した形）。空白・日本語の入ったパスは未確認で、A9 か画面の確かめで見る
+
+変えること（どれも Windows だけ。番号は Python の W1〜W7 の続き）
+| # | 所 | 変えること |
+| --- | --- | --- |
+| W8 | find_session_adapter | Windows の C++ は gdb を探す（設定の C++ のコンパイラ〔または見つけた g++〕と同じフォルダの gdb.exe → PATH の gdb.exe）。見つからなければ Windows 向けの案内の文。**Windows の Rust のデバッグの文は、今の Xcode の案内から「まだ使えません」の文に変わる**（cfg(windows) の中だけ。macOS の文は変えない） |
+| W9 | gdb の起動 | 上の「起動」「引数」。D-104 の変数は今と同じく外す。process_group(0) と start_in_job は今の Client::spawn と同じ |
+| W10 | initialize・launch の中身 | gdb のときは `$__lldb_sourceInitFile`・preRunCommands（target.input-path・target.inherit-tcc は macOS の LLDB だけ）を送らない。program・cwd は `\\?\` を外す。標準入力は上の形 |
+| W11 | gdb 自身の文（P2 の件 3） | 「No symbol table is loaded.」「Breakpoint 1 (-function __cxa_throw) pending.」などが、デバッグ対象の出力と同じ stdout の知らせで届く。扱いは T3 で決める（例：launch の答えより前の stdout を出さない） |
+| W12 | abort のあとの続行（P2 の件 4） | abort で止まったあと続行すると、もう一度 reason signal で止まる（SIGABRT と見られる。推測）。扱いは T3 で決める |
+| W13 | 一時停止（P2 の件 5） | step(Pause) が先に threads を送り、gdb は動いている間の threads を断る（notStopped）。gdb の pause の .py を読んでから、threads を送らない形を決める |
+
+- 変えないこと：止める関数（`__cxa_throw`・`abort`。gdb でも止まることを P2 で確かめた）、stack・scopes・variables・evaluate の要求の形、shutdown（W4 の release_job を含む）、
+  ブレークポイントのパス（W6 の without_verbatim がそのまま効く）
+- W11〜W13 は、先にテストを書き、直す前に落ちることを確かめてから直す
+
+macOS への影響
+- W8〜W13 は cfg(windows)。Adapter に足す gdb の場合も Windows だけ。Unix の行は変えない
+- 共通のテストで Windows でも動くもの（builds_launch_configuration・reports_missing_adapter など）が落ちたら、Windows の期待値を cfg で足す（Unix の期待値は変えない）
+- 画面の TypeScript は変えない。確かめは CI の macos-latest（ビルド・clippy・テスト）。macOS の画面は未確認
+
+先に書くテスト（どれも cfg(windows)）
+| # | テスト（名前は案） | 中身 |
+| --- | --- | --- |
+| A7 | finds_gdb_next_to_the_compiler_on_windows | 偽のコンパイラのフォルダの gdb.exe（と gdborig.exe・opt）の見つけ方と、起動の形の分け方。ないときの案内の文 |
+| A8 | builds_gdb_launch_configuration_on_windows | gdb のときの launch に lldb の項目がなく、program・cwd に `\\?\` がなく、args が `"< \"パス\""` |
+| A9 | debugs_cpp_with_real_gdb_on_windows | debugs_cpp_with_real_lldb_dap と同じ場面に、日本語の出力・input.txt がないとき・止めたあとに子孫と Job の記録が残らないこと・W11〜W13 を足す。gdb がなければ飛ぶ |
+- A9 が CI の windows-latest で動くか（runner に MinGW の gdb があるか）は未確認。T3 の前に .github/workflows/ci.yml を読み、CI で動かすか飛ばすかを利用者に相談する
+- W11〜W13 のテストの形（偽の DAP のメッセージで試せるか）は、T2 のあとに案を見せる
+
+順番（コミット）
+- T1：この節、9.1 の追加 50、10 章、段階 6 の Python の push と merge の記録
+- T2：テスト A7・A8 と W8〜W10
+- T3：テスト A9 と W11〜W13
+- T3 のあと：release の exe を作り、画面で確かめる（下の基準。手順は別に作り、コードと照らしてから見せる）
+- T4：画面の確かめの結果と、usage.md の Windows のデバッグの項目に C++ を足す
+
+画面の確かめの基準（元の版の AC16-12・AC18-09・10 を Windows 向けに読み替えたもの）
+| # | 元の版の期待結果 | Windows での確かめ方 |
+| --- | --- | --- |
+| AC16-12 | ブレークポイント・ステップ・変数（vector・string）・例外で止まる | 同じ。範囲外の読み書きで abort として止まること、input.txt の入力、日本語の出力、input.txt がないとき入力を待たずに終わることも見る |
+| AC18-09 | 初めての問題でもアクセスの確認が出ず、止まる・終わる | macOS の TCC の話なので、Windows では「初めての問題（作業領域のフォルダ）でも止まる・終わる」だけを見る |
+| AC18-10 | 今までどおり | 止めたあと、gdb とデバッグ対象（main-debug.exe）が残らない（読むだけの命令で数える）。コンソールの窓が出ない |
+
+件 1・件 2（「段階 6 の Python の結果」の「見つかった 4 つの件」。扱いは 9.1 の追加 49）
+- 件 1（「例外でで」）：C++ でも throw と abort で同じく出る見込み（推測）。この PR では記録だけ
+- 件 2（「一時停止」が最初に止まるまで出ない）：C++（gdb）でも continued が一度も来ないことを P2 で確かめた。gdb は launch の `run` で continued を出さない印を立てる（launch.py・events.py）。
+  追加 49 のとおり、この PR では記録だけにし、別の小さな PR で直す
+
 ---
 
 ## 8. 新しい依存の候補
@@ -2820,6 +2957,7 @@ W7 のあとのやり直し（2026-11-22。5127049 から作った exe 975615C2�
 | 追加 47（2026-11-19） | スニペットの補完が出ない不具合は、origin/main（12e756b）から作った windows-fix-snippet-completion と PR で直す。変えるのは、共通の TypeScript（src/editor/snippets.ts）と新しいテスト（tests/snippets.test.ts）だけで、Rust は変えない。共通のコードなので、macOS でもスニペットが補完に出るように変わる見込み。macOS の確かめは CI の macos-latest の npm test だけで、macOS の画面は未確認。原因は、テストで確かめたもの（出どころの関数が読まれるたびに作り直され、@codemirror/autocomplete が結果を捨てていた）と、元の開発者の見当（はじめは clangd の更新、のちに gcc の更新で、新しい方も見るようにしたら直った。その直しの中身は未確認）の両方を書く。画面の確かめは C++ だけにし、Rust・Python はテスト 1 で確かめた。作業領域は試し用の %USERPROFILE%\Documents\snippet_test。決めたことは、windows-features-plan.md がまだないので、この計画書に書く（windows-features-plan.md は新しい機能を始めるときに作る）。この PR では、run #51・#52 の数字と、awc0204 での C++ の提出の結果も書く | 段階 5 のあとの直し |
 | 追加 48（2026-11-20） | 段階 6（デバッグ）を始める（12 は書き換えない）。言語の順は Python → C++ → Rust で、言語ごとにブランチと PR を分ける。Windows で使えるデバッグは、まず Python（CPython）だけ。C++・Rust はまだで、PyPy の debugpy はあとで決める。範囲は「段階 6 の Python（debugpy）の計画」の節に書き、docs/usage.md には T4 で 1 段落足す。debugpy は CPython の分だけ利用者の手元に入れる（版・命令の全文・入れる場所を見せ、利用者がアプリを閉じたあと、許可を得てから。版は 1.8.22）。Windows の入れ方の案内文は PowerShell 向け（先頭に &）で、Unix の文はそのまま。spawn_debugpy のつなげなかったときの 2 行（kill_group → wait）は、テストのために小さな関数に移す（「場所を移す」。Unix の動きは同じ）。`\\?\` のパス（W6）は、本物の debugpy のテストの結果を見てから決める。デバッグコンソールの文が Python でも「LLDB」なのは、macOS と共通の画面の文なので直さない。段階 6 の計画と決めたことは、この計画書に書く。ブランチは origin/main（12c2400）から作った windows-stage6-python | 段階 6 |
 | 追加 49（2026-11-21） | 段階 6 の Python の画面の確かめ（AC20-04・05）で見つかった 4 つの件の扱い。標準出力が届かない件は、この PR で W7 として直す（cfg(windows) で `-u`。Unix の経路は変えない。macOS でも同じことが起きる見込みは、10 章に未確認として書く）。「例外でで」（failureStop と、それを呼ぶ 2 か所）と「一時停止にならない」は、Python の PR のあとの別の小さな PR で直す（共通の TS などを変えるので、macOS も変わる。後者は C++ の段階で lldb-dap の動きを見てから決める）。「強制的に止めた」は記録だけにして一時的なテストはせず、調べは後者の PR で行う。W6 は source.path にだけ without_verbatim を通す（cwd は変えない）。find_debugpy は OS ごとの 2 つの関数に分ける | 段階 6 |
+| 追加 50（2026-11-22） | 段階 6 の C++ を、origin/main（73d20c8）から作った windows-stage6-cpp で行う。アダプターは利用者の手元の MinGW-Builds の gdb 16.3 の DAP（A）。LLVM の lldb-dap（B）と attach の形は、今は使わない。gdb.exe の隣に gdborig.exe と ..\opt があるときだけ gdborig.exe を直接起動し、gdb の子にだけ PYTHONHOME=<mingw64>\opt と PATH（コンパイラの bin → opt\bin → もとの PATH）を付ける。ないときは gdb.exe をそのまま使う。どちらも PYTHONUTF8=1 を gdb の子にだけ付ける。引数は -nh -q --interpreter=dap -iex "set auto-load off"。標準入力は launch の args に引用符つきの 1 つの文字列（"< \"パス\""）。P2 で見つけた 3 つの件（gdb 自身の文が stdout で届く・abort のあと signal で止まる・一時停止が送れない）は、先にテストを書いてから直す。Windows の Rust のデバッグの文は、Xcode の案内から「まだ使えません」の文に変わる（cfg(windows) の中だけ）。件 1・件 2（追加 49）は、この PR でも記録だけ。計画は「段階 6 の C++（gdb）の計画」の節 | 段階 6 |
 
 ---
 
@@ -2870,6 +3008,16 @@ W7 のあとのやり直し（2026-11-22。5127049 から作った exe 975615C2�
   - W7 の場面 4 の確かめが、直す前に落ちるか
   - traceback に debugpy と runpy のフレームが並ぶ理由（runpy で動かすため。推測）
   - IDE が渡した cwd の `\\?\` が、Python の中で外れていた理由（Windows か Rust の標準ライブラリか）
+- 段階 6 の C++（「段階 6 の C++（gdb）の計画」）
+  - 6 章の gdb の Python と DAP は確認済み（P1・P2）。「6 章：すべてのデバッグの方式」のうち、LLVM の lldb-dap の有無と CodeLLDB のライセンスは未確認のまま
+  - 「一時停止」の件の lldb-dap の動き：この機械に lldb-dap がないので未確認のまま（gdb は continued を一度も送らないことを確かめた）
+  - 空白・日本語の入ったパスでの標準入力（`"< \"パス\""`）と、gdborig.exe の起動
+  - MinGW-Builds の包み（gdb.exe）の中身（文字列から見た推測）
+  - gdb が PDB を読めないこと（推測。Rust の PR で見る）
+  - Microsoft の cpptools を VS Code の外で使えないこと（使用条件の文は読んでいない。推測）
+  - A9 が CI の windows-latest で動くか（runner の MinGW の gdb の有無）
+  - 変数の欄（variables）での vector の中身の表示（P2 では、入力が入らなかった 1 回目の length 0 だけを見た。中身は 2 回目の repl の info locals でだけ見た）
+  - P2 の 1 回目で出力が届かなかった理由（gdb の Python が cp932 として読めなかったと見られる。推測）と、abort のあと signal で止まる理由（SIGABRT と見られる。推測）
 - docs/usage.md で Windows に触れているのは、末尾の「Windows：対応を確認していません。」と、段階 6 で足した Python のデバッグの 1 項目だけ。
   usage.md の Windows の書き方（brew・macOS のキーなど）をまとめて直すのは、あとの PR の候補
 - 段階 3 で確かめること：残りなし（ShellExecuteW を COM の初期化なしで呼んで URL とフォルダを開けることは T8 で確認済み。提出の処理を始めずに提出のページを開ける経路がないことは T8 でコードで確認済み。InPrivate と on_navigation の制限のもとでログインが通ること〔Turnstile が出たかは記録していない〕と、cookies() が WebView2 で REVEL_SESSION を返すこと〔HttpOnly かは見ていない〕は T9 で、CI の Windows で資格情報を書けることは run 42378818906 で確認済み。アプリが記録をファイルに書かないことは T9 の前にコードで確認済み）。あとの段階へ残したものは「段階 3 の結果」の「残る未確認」にある
