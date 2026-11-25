@@ -793,6 +793,60 @@ fn lldb_dap_init_commands_windows(rustc: &RustcPaths) -> Vec<String> {
     commands
 }
 
+// Windows（段階 6 の Rust W21）：lldb の設定 target.skip-prologue を、evaluate の repl（バッククォートで命令として）で変える。
+// 断られたら実行ログに 1 行出して続ける（パスは入れない）
+#[cfg(windows)]
+fn set_skip_prologue(client: &Client, value: bool, channel: &Channel<RunEvent>) {
+    let expression = format!("`settings set target.skip-prologue {value}");
+    if client
+        .request(
+            "evaluate",
+            json!({ "expression": expression, "context": "repl" }),
+            REQUEST_WAIT,
+        )
+        .is_err()
+    {
+        info(
+            channel,
+            "panic で止める位置の設定（skip-prologue）ができませんでした。panic で止まらないことがあります\n",
+        );
+    }
+}
+
+// Windows（段階 6 の Rust W22・W23）：lldb-dap の console の知らせを、行ごとに分ける。lldb-server の文は捨て、Process … exited は console、
+// ほかは stdout。続けて同じ扱いの行は 1 つにまとめる。行の途中で知らせが分かれたときは、形が合わないので stdout になる（計画の気がかり）
+#[cfg(windows)]
+fn lldb_dap_console_parts(text: &str) -> Vec<(&'static str, String)> {
+    static LAUNCHED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^Launched '.*' as process \d+\.\.\.$").unwrap()
+    });
+    static EXITED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^Process \d+ exited with status = -?\d+ \(0x[0-9A-Fa-f]+\)( .*)?$")
+            .unwrap()
+    });
+    let mut parts: Vec<(&'static str, String)> = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        if matches!(
+            body,
+            "lldb-server exiting..." | "Connection established." | "lldb-server-local_build"
+        ) || LAUNCHED.is_match(body)
+        {
+            continue;
+        }
+        let kind = if EXITED.is_match(body) {
+            "console"
+        } else {
+            "stdout"
+        };
+        match parts.last_mut() {
+            Some((last, joined)) if *last == kind => joined.push_str(line),
+            _ => parts.push((kind, line.to_string())),
+        }
+    }
+    parts
+}
+
 // Windows の Rust の launch（W18）：program・cwd・input-path は `\\?\` を外す。preRunCommands は標準入力だけ
 // （target.inherit-tcc は macOS の LLDB だけ）。Unix の launch_arguments の行は変えない
 #[cfg(windows)]
@@ -953,6 +1007,11 @@ struct State {
     output_omitted: bool,
     // panic・例外・abort で止める関数のブレークポイントの id と、止まった理由（"panic"・"throw"・"abort"）
     stop_breakpoints: Vec<(i64, &'static str)>,
+    // Windows（段階 6 の Rust W19）：lldb-dap に一時停止を送ったスレッド（threads の最初）と、止まったあと最初の stack() でスレッドを選び直す印
+    #[cfg(windows)]
+    pause_thread: Option<i64>,
+    #[cfg(windows)]
+    pick_thread: bool,
 }
 
 struct Shared {
@@ -994,6 +1053,20 @@ impl Shared {
         if self.adapter == "gdb" && state.debuggee_pid.is_none() {
             return;
         }
+        // Windows（段階 6 の Rust W22・W23）：lldb-dap では、利用者のプログラムの出力も console で届く（P4-C）。行ごとに見て、lldb-server の文は捨て、
+        // 「Process <番号> exited with status = …」は console のまま、ほかは stdout にする（launch の答えの前の console は上で捨てた）。
+        // 分けたものは 1 つずつ output に渡し直す。console のまま 1 つにまとまったもの（Process … exited だけ）は、渡し直さずに下へ進む
+        #[cfg(windows)]
+        if self.adapter == "lldb-dap" && category == "console" {
+            let parts = lldb_dap_console_parts(text);
+            if !(parts.len() == 1 && parts[0].0 == "console") {
+                drop(state);
+                for (kind, part) in parts {
+                    self.output(kind, &part);
+                }
+                return;
+            }
+        }
         let room = OUTPUT_LIMIT.saturating_sub(state.output_sent);
         if text.len() <= room {
             state.output_sent += text.len();
@@ -1022,10 +1095,32 @@ impl Shared {
         }
     }
 
+    // Windows（段階 6 の Rust W19）：lldb-dap の一時停止は、Windows が一時停止のために作ったスレッドで、reason exception・description interrupt として届く
+    // （P4-C）。pause を送ったスレッドの pause として扱い、最初の stack() でスレッドを選び直す印を立てる。本当の例外（description が interrupt でない）はそのまま
+    #[cfg(windows)]
+    fn lldb_dap_pause_stop(&self, message: &Value) -> Option<Value> {
+        if self.adapter != "lldb-dap"
+            || message["event"] != "stopped"
+            || message["body"]["reason"] != "exception"
+            || message["body"]["description"] != "interrupt"
+        {
+            return None;
+        }
+        let mut state = self.lock_state();
+        let mut message = message.clone();
+        message["body"]["reason"] = json!("pause");
+        if let Some(thread) = state.pause_thread.take() {
+            message["body"]["threadId"] = json!(thread);
+        }
+        state.pick_thread = true;
+        Some(message)
+    }
+
     fn event(&self, message: &Value, notices: &Sender<Notice>) {
-        // Windows（段階 6 の C++ W14）：gdb の一時停止を、main のスレッドの pause として扱う（gdb_pause_stop）
+        // Windows（段階 6 の C++ W14・Rust W19）：gdb と lldb-dap の一時停止を、pause として扱う（gdb_pause_stop・lldb_dap_pause_stop）
         #[cfg(windows)]
-        let rewritten = gdb_pause_stop(self.adapter, message);
+        let rewritten =
+            gdb_pause_stop(self.adapter, message).or_else(|| self.lldb_dap_pause_stop(message));
         #[cfg(windows)]
         let message = rewritten.as_ref().unwrap_or(message);
         let body = &message["body"];
@@ -1527,6 +1622,11 @@ impl Client {
             }
             _ => self.stopped_thread()?,
         };
+        // Windows（段階 6 の Rust W19）：lldb-dap の一時停止の知らせを、このスレッドの pause として扱うために覚える
+        #[cfg(windows)]
+        if action == StepAction::Pause && self.shared.adapter == "lldb-dap" {
+            self.shared.lock_state().pause_thread = Some(thread_id);
+        }
         // 止まっている印は、要求を送る前に消す。答えを待つ間に次の「止まった」の知らせが届くことがあり、
         // 答えのあとに消すと、その知らせまで消してしまう（Phase 10 作業 6。D-169）
         if action != StepAction::Pause {
@@ -1583,7 +1683,55 @@ impl Client {
             .unwrap_or_default())
     }
 
+    // Windows（段階 6 の Rust W19）：一時停止のあと最初の stack() で、作業領域のフレームがあるスレッドを、なければ名前が main のスレッドを選び、
+    // 止まったスレッドにする（続行・ステップもそのスレッドに送る）。読み取りのスレッドの中では要求の答えを待てないので、ここで行う
+    #[cfg(windows)]
+    fn pick_paused_thread(&self) {
+        if !std::mem::take(&mut self.shared.lock_state().pick_thread) {
+            return;
+        }
+        let Ok(body) = self.request("threads", json!({}), REQUEST_WAIT) else {
+            return;
+        };
+        let threads = body["threads"].as_array().cloned().unwrap_or_default();
+        let has_own_frame = |id: i64| {
+            self.request(
+                "stackTrace",
+                json!({ "threadId": id, "startFrame": 0, "levels": 100 }),
+                REQUEST_WAIT,
+            )
+            .ok()
+            .and_then(|body| body["stackFrames"].as_array().cloned())
+            .is_some_and(|frames| {
+                frames.iter().any(|frame| {
+                    frame["source"]["path"]
+                        .as_str()
+                        .and_then(|path| in_workspace(&self.shared.root, path))
+                        .is_some()
+                })
+            })
+        };
+        let chosen = threads
+            .iter()
+            .filter_map(|thread| thread["id"].as_i64())
+            .find(|id| has_own_frame(*id))
+            .or_else(|| {
+                threads
+                    .iter()
+                    .find(|thread| thread["name"] == "main")
+                    .and_then(|thread| thread["id"].as_i64())
+            });
+        if let Some(id) = chosen {
+            let mut state = self.shared.lock_state();
+            if state.stopped_thread.is_some() {
+                state.stopped_thread = Some(id);
+            }
+        }
+    }
+
     pub fn stack(&self) -> Result<Vec<FrameView>, String> {
+        #[cfg(windows)]
+        self.pick_paused_thread();
         let thread_id = self.stopped_thread()?;
         let body = self.request(
             "stackTrace",
@@ -2193,6 +2341,12 @@ fn start_session(
         .iter()
         .map(|(name, _)| json!({ "name": name }))
         .collect();
+    // Windows（段階 6 の Rust W21）：lldb-dap では rust_panic を関数の頭に置く（既定の skip-prologue では関数の途中に置かれて止まらない。P3・P4）。
+    // 値はブレークポイントを作るときに決まるので、setFunctionBreakpoints の前後だけ false にする（行のブレークポイントは、その前に既定のまま作った）
+    #[cfg(windows)]
+    if adapter == "lldb-dap" {
+        set_skip_prologue(client, false, channel);
+    }
     match client.request(
         "setFunctionBreakpoints",
         json!({ "breakpoints": names }),
@@ -2213,6 +2367,10 @@ fn start_session(
             channel,
             format!("panic・例外で止める設定ができません：{error}\n"),
         ),
+    }
+    #[cfg(windows)]
+    if adapter == "lldb-dap" {
+        set_skip_prologue(client, true, channel);
     }
     client.request("configurationDone", json!({}), REQUEST_WAIT)?;
     client.finish_request(launch, plan.start, LAUNCH_WAIT)?;
@@ -4683,6 +4841,1086 @@ int main() {
         assert_same(
             run("lldb-dap", vec![stopped(1, "stopped", 5)]),
             (vec![("stopped".to_string(), Some(5))], Some(5)),
+        );
+    }
+
+    // ---- Windows の Rust（lldb-dap）の一時停止・panic・出力のテスト（段階 6 の Rust T3。A17〜A21） ----
+
+    // 偽のアダプター（段階 6 Rust T3。A17・A18）：IDE が書いた要求を覚え、要求ごとに answer で決めた知らせ（答え・イベント）を返す。
+    // 読む側は A11 の FakeAdapterReader を使う
+    // 偽のアダプターの答えの決め方（要求を受け取り、返す知らせを決める）
+    #[cfg(windows)]
+    type FakeAnswer = Box<dyn Fn(&Value) -> Vec<Value> + Send>;
+
+    #[cfg(windows)]
+    struct ScriptedAdapterWriter {
+        decoder: Decoder,
+        requests: Arc<Mutex<Vec<Value>>>,
+        answers: Sender<Vec<u8>>,
+        answer: FakeAnswer,
+    }
+
+    #[cfg(windows)]
+    impl Write for ScriptedAdapterWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let texts = self.decoder.push(bytes).map_err(std::io::Error::other)?;
+            for text in texts {
+                let request: Value = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+                let messages = (self.answer)(&request);
+                self.requests.lock().unwrap().push(request);
+                for message in messages {
+                    let _ = self.answers.send(encode(&message.to_string()));
+                }
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // 要求への成功の答え
+    #[cfg(windows)]
+    fn fake_answer(request: &Value, body: Value) -> Value {
+        json!({
+            "seq": 0,
+            "type": "response",
+            "request_seq": request["seq"],
+            "command": request["command"],
+            "success": true,
+            "body": body,
+        })
+    }
+
+    // 偽のアダプターにつないだクライアント・知らせ・IDE が送った要求・画面への知らせ
+    #[cfg(windows)]
+    type ScriptedClient = (
+        Arc<Client>,
+        Receiver<Notice>,
+        Arc<Mutex<Vec<Value>>>,
+        Arc<Mutex<Vec<Value>>>,
+    );
+
+    // 偽のアダプターにつないだクライアント。答えの決め方（answer）を受け取り、クライアント・知らせ・IDE が送った要求・画面への知らせを返す
+    #[cfg(windows)]
+    fn scripted_client(
+        adapter: &'static str,
+        root: &Path,
+        answer: impl Fn(&Value) -> Vec<Value> + Send + 'static,
+    ) -> ScriptedClient {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (answers, incoming) = mpsc::channel();
+        let writer = ScriptedAdapterWriter {
+            decoder: Decoder::default(),
+            requests: requests.clone(),
+            answers,
+            answer: Box::new(answer),
+        };
+        let reader = FakeAdapterReader {
+            answers: incoming,
+            pending: Vec::new(),
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let channel = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            Ok(())
+        });
+        let (client, notices) = Client::connect(adapter, writer, reader, root, &channel);
+        (client, notices, requests, events)
+    }
+
+    // 画面への Debug の知らせのうち、条件に合う最初のもの（10 秒まで待つ）
+    #[cfg(windows)]
+    fn wait_for_debug_event(
+        events: &Arc<Mutex<Vec<Value>>>,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(event) = events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|event| event["type"] == "debug" && wanted(&event["event"]))
+            {
+                return event["event"].clone();
+            }
+            assert!(Instant::now() < until, "待っている知らせが来ません");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // A17（段階 6 Rust T3。W19）：lldb-dap の一時停止は、Windows が一時停止のために作ったスレッドで、reason exception・description interrupt として届く
+    // （P4-C で確かめた）。pause を送ったスレッド（threads の最初）の pause として扱い、最初にスタックを取るときに、作業領域のフレームがあるスレッド
+    // （なければ名前が main のスレッド）を選び直す。本当の例外はそのまま。偽のアダプターで試す（本物の lldb-dap は使わない。CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn treats_lldb_dap_interrupt_as_pause_on_windows() {
+        let ws = workspace("lldb-dap-pause");
+        let source = ws.0.join("pkg").join("src").join("main.rs");
+        write(&source, "fn main() {}\n");
+        let own = source.to_string_lossy().into_owned();
+        // スレッドは threads の順に 8（Thread 2）・7（main）・10（Thread 3）・9（Thread 5。一時停止のためのスレッド）。
+        // own_thread に作業領域のフレームを持たせる。結果は（画面への stopped の理由とスレッド、stack() のいちばん上の関数、そのあとの止まったスレッド）
+        let run = |description: &'static str, own_thread: Option<i64>| {
+            let own = own.clone();
+            let answer = move |request: &Value| -> Vec<Value> {
+                match request["command"].as_str().unwrap_or_default() {
+                    "threads" => vec![fake_answer(
+                        request,
+                        json!({ "threads": [
+                            { "id": 8, "name": "Thread 2" },
+                            { "id": 7, "name": "main" },
+                            { "id": 10, "name": "Thread 3" },
+                            { "id": 9, "name": "Thread 5" },
+                        ] }),
+                    )],
+                    "pause" => vec![
+                        fake_answer(request, json!({})),
+                        json!({
+                            "seq": 0,
+                            "type": "event",
+                            "event": "stopped",
+                            "body": {
+                                "reason": "exception",
+                                "description": description,
+                                "threadId": 9,
+                                "allThreadsStopped": true,
+                            },
+                        }),
+                    ],
+                    "stackTrace" => {
+                        let thread = request["arguments"]["threadId"].as_i64();
+                        let frames = if thread == own_thread {
+                            json!([
+                                { "id": 1, "name": "core::hint::black_box", "line": 10, "column": 1 },
+                                { "id": 2, "name": "solution::main", "line": 3, "column": 1, "source": { "path": own.as_str() } },
+                            ])
+                        } else if thread == Some(9) {
+                            json!([{ "id": 3, "name": "DbgBreakPoint", "line": 0, "column": 0 }])
+                        } else {
+                            json!([{
+                                "id": 4,
+                                "name": format!("thread{}::wait", thread.unwrap_or_default()),
+                                "line": 0,
+                                "column": 0,
+                            }])
+                        };
+                        vec![fake_answer(request, json!({ "stackFrames": frames }))]
+                    }
+                    _ => vec![fake_answer(request, json!({}))],
+                }
+            };
+            let (client, _notices, _requests, events) = scripted_client("lldb-dap", &ws.0, answer);
+            assert_same(client.step(StepAction::Pause), Ok(()));
+            let stopped = wait_for_debug_event(&events, |event| event["kind"] == "stopped");
+            let shown = (
+                stopped["reason"].as_str().unwrap_or_default().to_string(),
+                stopped["threadId"].as_i64(),
+            );
+            let top = client
+                .stack()
+                .unwrap()
+                .first()
+                .map(|frame| frame.name.clone());
+            let thread = client.shared.lock_state().stopped_thread;
+            (shown, top, thread)
+        };
+
+        // 1. 一時停止：pause を送ったスレッド（threads の最初の 8）の pause。stack() で、作業領域のフレームがあるスレッド（10）を選び直す
+        assert_same(
+            run("interrupt", Some(10)),
+            (
+                ("pause".to_string(), Some(8)),
+                Some("core::hint::black_box".to_string()),
+                Some(10),
+            ),
+        );
+        // 2. 作業領域のフレームがどのスレッドにもない：名前が main のスレッド（7）
+        assert_same(
+            run("interrupt", None),
+            (
+                ("pause".to_string(), Some(8)),
+                Some("thread7::wait".to_string()),
+                Some(7),
+            ),
+        );
+        // 3. 本当の例外（description が interrupt でない）：そのまま（exception・9）。選び直さない
+        assert_same(
+            run("Exception 0xc0000005 encountered at address 0x0", Some(10)),
+            (
+                ("exception".to_string(), Some(9)),
+                Some("DbgBreakPoint".to_string()),
+                Some(9),
+            ),
+        );
+    }
+
+    // A18（段階 6 Rust T3。W21）：Windows の lldb-dap では、rust_panic を関数の頭に置くため、setFunctionBreakpoints の前後だけ skip-prologue を false にする
+    // （evaluate の repl。行のブレークポイントは、その前に既定のまま作る）。偽のアダプターで、送る要求の順を見る（CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn sets_rust_panic_at_the_function_start_on_windows() {
+        let ws = workspace("lldb-dap-skip-prologue");
+        write(
+            &ws.0.join("pkg").join("src").join("main.rs"),
+            "fn main() {}\n",
+        );
+        let answer = |request: &Value| -> Vec<Value> {
+            let command = request["command"].as_str().unwrap_or_default();
+            let body = match command {
+                "setBreakpoints" => {
+                    json!({ "breakpoints": [{ "id": 1, "verified": true, "line": 1 }] })
+                }
+                "setFunctionBreakpoints" => {
+                    json!({ "breakpoints": [{ "id": 2, "verified": true }] })
+                }
+                _ => json!({}),
+            };
+            let mut messages = vec![fake_answer(request, body)];
+            if command == "launch" {
+                messages.push(json!({ "seq": 0, "type": "event", "event": "initialized" }));
+            }
+            messages
+        };
+        let (client, notices, requests, _events) = scripted_client("lldb-dap", &ws.0, answer);
+        let plan = SessionPlan {
+            initialize: initialize_arguments(),
+            start: "launch",
+            start_arguments: lldb_dap_launch_arguments_windows(
+                Path::new(r"C:\w\a.exe"),
+                Path::new(r"C:\w"),
+                Path::new("NUL"),
+                None,
+            ),
+            stop_functions: stop_functions(Language::Rust),
+            uncaught_exceptions: false,
+        };
+        let breakpoints = vec![SourceBreakpoints {
+            path: "pkg/src/main.rs".to_string(),
+            lines: vec![1],
+        }];
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_same(
+            start_session(&client, &notices, plan, &breakpoints, &cancel),
+            Ok(()),
+        );
+        let sent: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(
+                |request| match request["command"].as_str().unwrap_or_default() {
+                    "evaluate" => format!(
+                        "evaluate {} {}",
+                        request["arguments"]["context"].as_str().unwrap_or_default(),
+                        request["arguments"]["expression"]
+                            .as_str()
+                            .unwrap_or_default()
+                    ),
+                    other => other.to_string(),
+                },
+            )
+            .collect();
+        assert_same(
+            sent,
+            [
+                "initialize",
+                "launch",
+                "setBreakpoints",
+                "evaluate repl `settings set target.skip-prologue false",
+                "setFunctionBreakpoints",
+                "evaluate repl `settings set target.skip-prologue true",
+                "configurationDone",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+    }
+
+    // 偽の知らせを Client::connect("lldb-dap") に流し、画面への出力の知らせ（category と中身）を返す（A19・A20）
+    #[cfg(windows)]
+    fn lldb_dap_outputs(messages: Vec<Value>) -> Vec<(String, String)> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let channel = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            Ok(())
+        });
+        let bytes: Vec<u8> = messages
+            .iter()
+            .flat_map(|message| encode(&message.to_string()))
+            .collect();
+        let (_client, notices) = Client::connect(
+            "lldb-dap",
+            std::io::sink(),
+            std::io::Cursor::new(bytes),
+            Path::new("."),
+            &channel,
+        );
+        // 読み終えると、読み取りのスレッドが知らせの送り手を捨てる
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match notices.recv_timeout(Duration::from_millis(20)) {
+                Err(RecvTimeoutError::Disconnected) => break,
+                _ => assert!(Instant::now() < until, "読み終わりません"),
+            }
+        }
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "debug" && event["event"]["kind"] == "output")
+            .map(|event| {
+                (
+                    event["event"]["category"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    event["event"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn lldb_dap_output_event(category: &str, text: &str) -> Value {
+        json!({
+            "seq": 0,
+            "type": "event",
+            "event": "output",
+            "body": { "category": category, "output": text },
+        })
+    }
+
+    #[cfg(windows)]
+    fn lldb_dap_launch_answer() -> Value {
+        json!({ "seq": 0, "type": "response", "request_seq": 2, "command": "launch", "success": true })
+    }
+
+    // A19（段階 6 Rust T3。W22）：Windows の lldb-dap では、lldb-server の文（lldb-server exiting...・Connection established.・lldb-server-local_build・
+    // Launched '<exe>' as process <番号>...）を画面に出さない。1 つの知らせに何行か入っていても、前後の行は残す。偽の知らせで試す（CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn hides_lldb_server_lines_on_windows() {
+        let console = |text: &str| lldb_dap_output_event("console", text);
+        let outputs = lldb_dap_outputs(vec![
+            console("Running initCommands:\n"),
+            lldb_dap_launch_answer(),
+            json!({ "seq": 0, "type": "event", "event": "process", "body": { "systemProcessId": 7732 } }),
+            console("あいう\n"),
+            // 利用者の出力で、形の合わないもの（行の途中の Launched など）は残す
+            console("Launched rocket\n"),
+            // 1 行ずつ届く形（P4 の場面 a）
+            console("lldb-server exiting...\n"),
+            console("Connection established.\n"),
+            console("lldb-server-local_build\n"),
+            console("Launched 'C:\\w\\pkg\\target\\debug\\a.exe' as process 7732...\n"),
+            // 4 つの文が 1 つの知らせにまとめて届く形
+            console(
+                "lldb-server exiting...\nConnection established.\nlldb-server-local_build\nLaunched 'C:\\w\\a.exe' as process 12...\n",
+            ),
+            // 利用者の出力と混ざって届く形
+            console("x\nlldb-server exiting...\ny\n"),
+        ]);
+        let text: String = outputs.iter().map(|(_, text)| text.as_str()).collect();
+        assert_same(text.as_str(), "あいう\nLaunched rocket\nx\ny\n");
+    }
+
+    // A20（段階 6 Rust T3。W23）：Windows の lldb-dap では、利用者のプログラムの出力も console で届く（P4-C）ので、launch の答えのあとの console のうち、
+    // lldb-server の文でも「Process <番号> exited with status = …」でもないものを stdout として画面に送る。important はそのまま。
+    // launch の答えの前の console（lldb-dap 自身の文）は今までどおり捨てる。偽の知らせで試す（CI でも動く）
+    #[cfg(windows)]
+    #[test]
+    fn shows_lldb_dap_console_output_as_program_output_on_windows() {
+        let console = |text: &str| lldb_dap_output_event("console", text);
+        let outputs = lldb_dap_outputs(vec![
+            console("Running initCommands:\n"),
+            lldb_dap_launch_answer(),
+            console("あいう\n"),
+            lldb_dap_output_event(
+                "important",
+                "warning: this version of LLDB has no plugin for the language \"rust\". Inspection of frame variables will be limited\n",
+            ),
+            console("6 atcoder\n"),
+            console("Process 12 exited with status = 0 (0x00000000) \n"),
+        ]);
+        assert_same(
+            outputs,
+            vec![
+                ("stdout".to_string(), "あいう\n".to_string()),
+                (
+                    "important".to_string(),
+                    "warning: this version of LLDB has no plugin for the language \"rust\". Inspection of frame variables will be limited\n"
+                        .to_string(),
+                ),
+                ("stdout".to_string(), "6 atcoder\n".to_string()),
+                (
+                    "console".to_string(),
+                    "Process 12 exited with status = 0 (0x00000000) \n".to_string(),
+                ),
+            ],
+        );
+    }
+
+    // ---- 本物の lldb-dap を使うテスト（Windows 移植の段階 6 の Rust T3。A21）。LLVM の lldb-dap と CPython（python3.dll）が要る ----
+
+    // 試しの Rust のプログラム（P4 と同じ）。行の番号：17 fn add、49 add を呼ぶ、51 2 つ目の println!、60 範囲外の添字（panic）
+    #[cfg(windows)]
+    const RUST_LLDB_SOLUTION: &str = r#"use std::collections::HashMap;
+use std::io::Read;
+
+#[derive(Debug)]
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+#[derive(Debug)]
+enum Shape {
+    Empty,
+    Circle(i64),
+    Rect { w: i64, h: i64 },
+}
+
+fn add(x: i64, y: i64) -> i64 {
+    let s = x * 10 + y;
+    s
+}
+
+fn main() {
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text).unwrap();
+    let mut words = text.split_whitespace();
+    let n: usize = words.next().map_or(0, |w| w.parse().unwrap());
+    let a: Vec<i64> = (0..n).map(|_| words.next().unwrap().parse().unwrap()).collect();
+    let q: Option<usize> = words.next().map(|w| w.parse().unwrap());
+    let name = String::from("atcoder");
+    let mut count: HashMap<i64, usize> = HashMap::new();
+    for &v in &a {
+        *count.entry(v).or_insert(0) += 1;
+    }
+    let first: Option<i64> = a.first().copied();
+    let point = Point { x: 1, y: 2 };
+    let shapes = vec![Shape::Empty, Shape::Circle(3), Shape::Rect { w: 4, h: 5 }];
+    let area: i64 = shapes
+        .iter()
+        .map(|s| match s {
+            Shape::Empty => 0,
+            Shape::Circle(r) => 3 * r * r,
+            Shape::Rect { w, h } => w * h,
+        })
+        .sum();
+    let mut total: i32 = 0;
+    for &v in &a {
+        total += v as i32;
+    }
+    let sum = add(point.x, point.y) + add(3, 4);
+    println!("あいう");
+    println!("{total} {name} {first:?} {point:?} {sum} {area}");
+    if n == 1 {
+        let mut spin: u64 = 0;
+        while spin < 3_000_000_000 {
+            spin = std::hint::black_box(spin + 1);
+        }
+        println!("spin {spin}");
+    }
+    if let Some(q) = q {
+        println!("{} {}", a[q], count.len());
+    }
+}
+"#;
+    // 起動してすぐ（入力を読む前に）1 行を出す bin（launch の答えより前に届いて捨てられないか。P4-D）
+    #[cfg(windows)]
+    const RUST_LLDB_EARLY: &str = r#"use std::io::Read;
+
+fn main() {
+    println!("early-line");
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text).unwrap();
+    println!("read {}", text.split_whitespace().count());
+}
+"#;
+    #[cfg(windows)]
+    const RUST_LLDB_LINE_FN: u32 = 17;
+    #[cfg(windows)]
+    const RUST_LLDB_LINE_PRINT: u32 = 51;
+    #[cfg(windows)]
+    const RUST_LLDB_LINE_PANIC: u32 = 60;
+    #[cfg(windows)]
+    const RUST_LLDB_PATH: &str = "pkg/src/solution.rs";
+
+    // A21 の lldb-dap：本番の find_lldb_dap（PATH → %ProgramFiles%\LLVM\bin）で見つからなければ、テストのときだけ読む環境変数 LLDB_DAP_FOR_TEST
+    // （lldb-dap.exe の場所）。本番の find_lldb_dap・find_lldb_launch は、この変数を読まない
+    #[cfg(windows)]
+    fn lldb_dap_for_test() -> Option<PathBuf> {
+        find_lldb_dap().ok().or_else(|| {
+            std::env::var_os("LLDB_DAP_FOR_TEST")
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+        })
+    }
+
+    // このテストのプロセスの子孫に残った lldb-dap・lldb-server・デバッグ対象。3 秒まで 20 ms ごとに見直し、まだ動いている（alive）ものだけを数える
+    // （assert_no_gdb_left と同じ考え方）
+    #[cfg(windows)]
+    fn lldb_dap_left() -> Vec<(u32, String)> {
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let running: Vec<(u32, String)> = crate::win::descendants(std::process::id())
+                .into_iter()
+                .filter(|(pid, name)| {
+                    let name = name.to_ascii_lowercase();
+                    matches!(
+                        name.as_str(),
+                        "lldb-dap.exe" | "lldb-server.exe" | "solution.exe" | "early.exe"
+                    ) && crate::win::is_alive(*pid)
+                })
+                .collect();
+            if running.is_empty() || Instant::now() >= until {
+                return running;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    fn rust_lldb_check(problems: &mut Vec<String>, label: &str, ok: bool) {
+        eprintln!("lldb-dap：{label} {}", if ok { "ok" } else { "NG" });
+        if !ok {
+            problems.push(label.to_string());
+        }
+    }
+
+    #[cfg(windows)]
+    struct RustLldbScene {
+        session: Session,
+        client: Arc<Client>,
+        child: Child,
+        notices: Receiver<Notice>,
+    }
+
+    // 本番の起動（Client::spawn_lldb_dap）と始め方（start_session・initialize_arguments・lldb_dap_launch_arguments_windows）で、1 つの場面を始める
+    #[cfg(windows)]
+    fn start_rust_lldb_scene(
+        launch: &LldbLaunch,
+        root: &Path,
+        pkg: &Path,
+        exe: &Path,
+        rustc: &RustcPaths,
+        input: &Path,
+        lines: &[u32],
+    ) -> RustLldbScene {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let channel: Channel<RunEvent> = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            Ok(())
+        });
+        let (client, child, notices) = Client::spawn_lldb_dap(launch, pkg, root, &channel)
+            .unwrap_or_else(|error| panic!("{}", hide_names(&error)));
+        let control = Arc::new(DebugControl::default());
+        control.set(Some(client.clone()));
+        let breakpoints = if lines.is_empty() {
+            Vec::new()
+        } else {
+            vec![SourceBreakpoints {
+                path: RUST_LLDB_PATH.to_string(),
+                lines: lines.to_vec(),
+            }]
+        };
+        let plan = SessionPlan {
+            initialize: initialize_arguments(),
+            start: "launch",
+            start_arguments: lldb_dap_launch_arguments_windows(exe, pkg, input, Some(rustc)),
+            stop_functions: stop_functions(Language::Rust),
+            uncaught_exceptions: false,
+        };
+        let session = Session {
+            events,
+            control,
+            cancel: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        if let Err(message) = start_session(&client, &notices, plan, &breakpoints, &session.cancel)
+        {
+            panic!(
+                "{}",
+                hide_names(&format!(
+                    "始められません：{message}：{:?}",
+                    session.events.lock().unwrap()
+                ))
+            );
+        }
+        RustLldbScene {
+            session,
+            client,
+            child,
+            notices,
+        }
+    }
+
+    // 止めて（IDE の shutdown）、画面への出力（category と中身）を返す。lldb-server の文・作業領域の .lldbinit の目印が出ないこと、
+    // lldb-dap・lldb-server・デバッグ対象が残らないことを確かめる
+    #[cfg(windows)]
+    fn finish_rust_lldb_scene(
+        scene: RustLldbScene,
+        label: &str,
+        problems: &mut Vec<String>,
+    ) -> Vec<(String, String)> {
+        let RustLldbScene {
+            session,
+            client,
+            mut child,
+            notices,
+        } = scene;
+        let pid = session.debuggee_pid();
+        let forced = client.shutdown(&mut child);
+        session.control.set(None);
+        drop(client);
+        drop(notices);
+        eprintln!("lldb-dap：{label} の forced {forced}");
+        let outputs: Vec<(String, String)> = session
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "debug" && event["event"]["kind"] == "output")
+            .map(|event| {
+                (
+                    event["event"]["category"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    event["event"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        for (category, text) in &outputs {
+            eprintln!(
+                "lldb-dap：{label} の出力 [{category}] {}",
+                hide_names(&format!("{text:?}"))
+            );
+        }
+        let shown: String = outputs
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<String>()
+            + &session.log();
+        for noise in [
+            "lldb-server",
+            "Connection established",
+            "Launched '",
+            "MARK-CWD",
+        ] {
+            rust_lldb_check(
+                problems,
+                &format!("{label}：{noise} が出ない"),
+                !shown.contains(noise),
+            );
+        }
+        let left = lldb_dap_left();
+        rust_lldb_check(
+            problems,
+            &hide_names(&format!("{label}：残りがない {left:?}")),
+            left.is_empty(),
+        );
+        if let Some(pid) = pid {
+            rust_lldb_check(
+                problems,
+                &format!("{label}：デバッグ対象が残らない"),
+                !alive(pid),
+            );
+        }
+        outputs
+    }
+
+    // 止まるか終わるまで待つ
+    #[cfg(windows)]
+    fn rust_lldb_next(session: &Session, since: usize) -> (usize, Value) {
+        session.wait(since, |event| {
+            event["kind"] == "stopped" || event["kind"] == "exited"
+        })
+    }
+
+    // 終わるまで続行する（止まった回数と終了コード）。止まりすぎたら落とす
+    #[cfg(windows)]
+    fn rust_lldb_continue_to_end(scene: &RustLldbScene, mut since: usize) -> (usize, Value) {
+        let mut stops = 0;
+        loop {
+            scene.client.step(StepAction::Continue).unwrap();
+            let (next_since, next) = rust_lldb_next(&scene.session, since);
+            since = next_since;
+            if next["kind"] == "exited" {
+                return (stops, next["code"].clone());
+            }
+            stops += 1;
+            assert!(stops <= 5, "止まりすぎ");
+        }
+    }
+
+    // A21（段階 6 Rust T3）：本物の lldb-dap（Windows）。P4 の場面 a・c・e・f・g を、本番の関数（Python のフォルダの確かめ・spawn_lldb_dap・
+    // start_session・Windows の launch・shutdown）で動かす。lldb-dap の見つけ方だけは lldb_dap_for_test。
+    // CI では飛ぶ（GitHub Actions は環境変数 CI を付ける。A9 と同じ）。lldb-dap か CPython（python3.dll）がなければ飛ぶ。失敗の文はユーザーのフォルダの名前を伏せる。
+    // 黒い窓が出ないこと（W20）は、手元で動かすときに利用者が画面で見る
+    #[cfg(windows)]
+    #[test]
+    fn debugs_rust_with_real_lldb_dap_on_windows() {
+        if std::env::var_os("CI").is_some() {
+            eprintln!("CI では本物の lldb-dap のテストを飛ばします");
+            return;
+        }
+        let Some(program) = lldb_dap_for_test() else {
+            eprintln!("lldb-dap がないので飛ばします");
+            return;
+        };
+        let cpython = python::PythonSettings {
+            interpreter: Interpreter::Cpython,
+            ..python::PythonSettings::default()
+        };
+        let Some(python_dir) = python::find_interpreter(&cpython)
+            .ok()
+            .and_then(|interpreter| lldb_python_dir(&interpreter).ok())
+        else {
+            eprintln!("CPython（python3.dll）がないので飛ばします");
+            return;
+        };
+        let launch = LldbLaunch {
+            program,
+            python_dir,
+        };
+        let ws = workspace("lldb-dap-rust");
+        let root = ws.0.clone();
+        let pkg = root.join("pkg");
+        write(
+            &pkg.join("Cargo.toml"),
+            "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"solution\"\npath = \"src/solution.rs\"\n\n[[bin]]\nname = \"early\"\npath = \"src/early.rs\"\n",
+        );
+        write(&pkg.join("src/solution.rs"), RUST_LLDB_SOLUTION);
+        write(&pkg.join("src/early.rs"), RUST_LLDB_EARLY);
+        write(&pkg.join("test/input.txt"), "3\n1 2 3\n");
+        write(&pkg.join("test/panic.in"), "3\n1 2 3\n7\n");
+        write(&pkg.join("test/spin.in"), "1\n5\n");
+        // AC5-12：作業領域（lldb-dap の cwd と、ルート）の .lldbinit は読まない
+        write(
+            &pkg.join(".lldbinit"),
+            "script print(\"MARK-CWD-LLDBINIT\")\n",
+        );
+        write(
+            &root.join(".lldbinit"),
+            "script print(\"MARK-CWD-LLDBINIT\")\n",
+        );
+
+        // IDE と同じビルド（run::prepare。dev・1 GiB のスタック）
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        let channel: Channel<RunEvent> = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+            }
+            Ok(())
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let build = |bin: &str| -> PathBuf {
+            let target = Target {
+                package: "pkg".to_string(),
+                bin: bin.to_string(),
+                language: Language::Rust,
+            };
+            match prepare(
+                &pkg,
+                &target,
+                false,
+                &LangSettings::default(),
+                &cancel,
+                &channel,
+                |_, _| Ok(((), Vec::new())),
+            ) {
+                Ok((prepared, ())) => prepared.executable.path,
+                Err(finish) => panic!(
+                    "{}",
+                    hide_names(&format!(
+                        "{bin} をビルドできません：{finish:?}：{:?}",
+                        events.lock().unwrap()
+                    ))
+                ),
+            }
+        };
+        let exe = build("solution");
+        let early = build("early");
+        let cargo = toolchain::find_cargo().expect("cargo がない");
+        let rustc = toolchain::rustc_paths(&cargo, &pkg)
+            .unwrap_or_else(|error| panic!("{}", hide_names(&error)));
+        let input = pkg.join("test/input.txt");
+        let mut problems = Vec::new();
+
+        // a：ブレークポイント（51 行目）→ スタック → 変数（AC5-04）→ 式 → 続行して終わる。出力は stdout（W23）
+        let scene = start_rust_lldb_scene(
+            &launch,
+            &root,
+            &pkg,
+            &exe,
+            &rustc,
+            &input,
+            &[RUST_LLDB_LINE_PRINT],
+        );
+        {
+            let (session, client) = (&scene.session, &scene.client);
+            let (since, stopped) = rust_lldb_next(session, 0);
+            rust_lldb_check(
+                &mut problems,
+                "a：breakpoint で止まる",
+                stopped["reason"] == "breakpoint",
+            );
+            if stopped["kind"] == "stopped" {
+                let stack = client.stack().unwrap();
+                rust_lldb_check(
+                    &mut problems,
+                    "a：51 行目",
+                    stack[0].workspace_path.as_deref() == Some(RUST_LLDB_PATH)
+                        && stack[0].line == RUST_LLDB_LINE_PRINT as u64,
+                );
+                let scopes = client.scopes(stack[0].id).unwrap();
+                let locals = client.variables(scopes[0].variables_reference).unwrap();
+                let value = |name: &str| {
+                    locals
+                        .iter()
+                        .find(|variable| variable.name == name)
+                        .map(|variable| variable.value.clone())
+                        .unwrap_or_default()
+                };
+                for (name, part) in [
+                    ("a", "size=3"),
+                    ("name", "atcoder"),
+                    ("count", "size=3"),
+                    ("first", "Some(1)"),
+                    ("point", "x:1"),
+                    ("shapes", "size=3"),
+                ] {
+                    rust_lldb_check(
+                        &mut problems,
+                        &format!("a：{name} に {part}"),
+                        value(name).contains(part),
+                    );
+                }
+                for (name, want) in [("total", "6"), ("sum", "46"), ("area", "47")] {
+                    rust_lldb_check(
+                        &mut problems,
+                        &format!("a：{name} は {want}"),
+                        value(name) == want,
+                    );
+                }
+                if let Some(a) = locals.iter().find(|variable| variable.name == "a") {
+                    let values: Vec<String> = client
+                        .variables(a.variables_reference)
+                        .unwrap()
+                        .into_iter()
+                        .map(|element| element.value)
+                        .collect();
+                    rust_lldb_check(
+                        &mut problems,
+                        "a：a の中身は 1・2・3",
+                        values == ["1", "2", "3"],
+                    );
+                }
+                let watch = client
+                    .evaluate("total + 1", Some(stack[0].id), EvaluateContext::Watch)
+                    .map(|view| view.result);
+                rust_lldb_check(
+                    &mut problems,
+                    "a：total + 1 は 7",
+                    watch.as_deref() == Ok("7"),
+                );
+                let (stops, code) = rust_lldb_continue_to_end(&scene, since);
+                // 同じ行で何回か止まる（K1。P4 では 3 回）のは記録だけ
+                eprintln!("lldb-dap：a の続行のあと止まった回数 {stops}");
+                rust_lldb_check(&mut problems, "a：終了コード 0", code == 0);
+            }
+        }
+        let outputs = finish_rust_lldb_scene(scene, "a", &mut problems);
+        let stdout: String = outputs
+            .iter()
+            .filter(|(category, _)| category == "stdout")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        rust_lldb_check(
+            &mut problems,
+            "a：あいうが stdout",
+            stdout.contains("あいう"),
+        );
+        rust_lldb_check(
+            &mut problems,
+            "a：2 行目が stdout",
+            stdout.contains("6 atcoder Some(1) Point { x: 1, y: 2 } 46 47"),
+        );
+
+        // c：範囲外の添字の panic で止まる（W21）。作業領域のフレームは 60 行目。続行すると 101（AC5-06）
+        let scene = start_rust_lldb_scene(
+            &launch,
+            &root,
+            &pkg,
+            &exe,
+            &rustc,
+            &pkg.join("test/panic.in"),
+            &[],
+        );
+        {
+            let (session, client) = (&scene.session, &scene.client);
+            let (since, stopped) = rust_lldb_next(session, 0);
+            rust_lldb_check(
+                &mut problems,
+                "c：panic で止まる",
+                stopped["reason"] == "panic",
+            );
+            if stopped["kind"] == "stopped" {
+                let stack = client.stack().unwrap();
+                let own = stack.iter().find(|frame| frame.workspace_path.is_some());
+                rust_lldb_check(
+                    &mut problems,
+                    "c：作業領域のフレームは 60 行目",
+                    own.is_some_and(|frame| {
+                        frame.workspace_path.as_deref() == Some(RUST_LLDB_PATH)
+                            && frame.line == RUST_LLDB_LINE_PANIC as u64
+                    }),
+                );
+                let (_, code) = rust_lldb_continue_to_end(&scene, since);
+                rust_lldb_check(&mut problems, "c：終了コード 101", code == 101);
+            }
+        }
+        finish_rust_lldb_scene(scene, "c", &mut problems);
+
+        // e：fn の行（17 行目）のブレークポイントで止まり、引数 x・y が読める（W21 で、行のブレークポイントは skip-prologue の既定のまま作られる）
+        let scene = start_rust_lldb_scene(
+            &launch,
+            &root,
+            &pkg,
+            &exe,
+            &rustc,
+            &input,
+            &[RUST_LLDB_LINE_FN],
+        );
+        {
+            let (session, client) = (&scene.session, &scene.client);
+            let (since, stopped) = rust_lldb_next(session, 0);
+            rust_lldb_check(
+                &mut problems,
+                "e：breakpoint で止まる",
+                stopped["reason"] == "breakpoint",
+            );
+            if stopped["kind"] == "stopped" {
+                let stack = client.stack().unwrap();
+                eprintln!(
+                    "lldb-dap：e で止まった所 {} {}",
+                    stack[0].name, stack[0].line
+                );
+                let scopes = client.scopes(stack[0].id).unwrap();
+                let locals = client.variables(scopes[0].variables_reference).unwrap();
+                let value = |name: &str| {
+                    locals
+                        .iter()
+                        .find(|variable| variable.name == name)
+                        .map(|variable| variable.value.clone())
+                        .unwrap_or_default()
+                };
+                rust_lldb_check(&mut problems, "e：x は 1", value("x") == "1");
+                rust_lldb_check(&mut problems, "e：y は 2", value("y") == "2");
+                client.set_breakpoints(RUST_LLDB_PATH, &[]).unwrap();
+                let (_, code) = rust_lldb_continue_to_end(&scene, since);
+                rust_lldb_check(&mut problems, "e：終了コード 0", code == 0);
+            }
+        }
+        finish_rust_lldb_scene(scene, "e", &mut problems);
+
+        // f：回り続けているところで一時停止する（W19）。理由は pause、スタックに作業領域のフレームがある。そのあと止める（AC5-08）
+        let scene = start_rust_lldb_scene(
+            &launch,
+            &root,
+            &pkg,
+            &exe,
+            &rustc,
+            &pkg.join("test/spin.in"),
+            &[],
+        );
+        {
+            let (session, client) = (&scene.session, &scene.client);
+            session.wait(0, |event| {
+                event["kind"] == "output"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("atcoder"))
+            });
+            thread::sleep(Duration::from_millis(500));
+            let since = session.events.lock().unwrap().len();
+            let paused = client.step(StepAction::Pause);
+            rust_lldb_check(&mut problems, "f：一時停止を送れる", paused.is_ok());
+            if paused.is_ok() {
+                let (_, stopped) = session.wait_stopped(since);
+                rust_lldb_check(
+                    &mut problems,
+                    "f：理由は pause",
+                    stopped["reason"] == "pause",
+                );
+                let stack = client.stack().unwrap();
+                rust_lldb_check(
+                    &mut problems,
+                    "f：作業領域のフレームがある",
+                    stack
+                        .iter()
+                        .any(|frame| frame.workspace_path.as_deref() == Some(RUST_LLDB_PATH)),
+                );
+            }
+        }
+        finish_rust_lldb_scene(scene, "f", &mut problems);
+
+        // g：起動してすぐ出した行（入力を読む前）が、launch の答えより前に届いて捨てられず、stdout で残る（P4-D・W23）
+        let scene = start_rust_lldb_scene(&launch, &root, &pkg, &early, &rustc, &input, &[]);
+        {
+            let (_, exited) = scene.session.wait(0, |event| event["kind"] == "exited");
+            rust_lldb_check(&mut problems, "g：終了コード 0", exited["code"] == 0);
+        }
+        let outputs = finish_rust_lldb_scene(scene, "g", &mut problems);
+        let stdout: String = outputs
+            .iter()
+            .filter(|(category, _)| category == "stdout")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        rust_lldb_check(
+            &mut problems,
+            "g：early-line が stdout",
+            stdout.contains("early-line"),
+        );
+        rust_lldb_check(
+            &mut problems,
+            "g：read 4 が stdout",
+            stdout.contains("read 4"),
+        );
+
+        assert!(
+            problems.is_empty(),
+            "{}",
+            hide_names(&format!("{problems:?}"))
         );
     }
 }
