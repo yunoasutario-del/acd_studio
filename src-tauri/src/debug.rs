@@ -496,10 +496,6 @@ const GDB_PAUSE_THREAD: i64 = 1;
 #[cfg(windows)]
 const GDB_MISSING: &str = "C++ のデバッグには gdb（MinGW-w64 の gdb.exe）が要ります。g++.exe と同じフォルダにも PATH にも gdb.exe が見つかりません。MinGW-Builds の GCC（bin に gdb.exe が入っています）を使うか、gdb.exe のあるフォルダを PATH に足してください";
 
-#[cfg(windows)]
-const RUST_DEBUG_UNSUPPORTED: &str =
-    "Windows では、Rust のデバッグはまだ使えません（今は Python と C++ だけです）";
-
 // 起動する gdb と、gdb の子に付ける環境（W8）
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq)]
@@ -643,6 +639,185 @@ fn gdb_pause_stop(adapter: &str, message: &Value) -> Option<Value> {
     message["body"]["reason"] = json!("pause");
     message["body"]["threadId"] = json!(GDB_PAUSE_THREAD);
     Some(message)
+}
+
+// ---- lldb-dap（Windows。段階 6 の Rust。W15〜W23。docs/windows-port-plan.md の「段階 6 の Rust（lldb-dap）の計画」） ----
+// LLVM の公式版の lldb-dap（23.1.6 で確かめた）を DAP で使う。IDE には同梱せず、取得もしない（D-145）
+
+#[cfg(windows)]
+const LLDB_DAP_MISSING: &str = "Rust のデバッグには LLVM の lldb-dap（lldb-dap.exe）が要ります。PATH にも %ProgramFiles%\\LLVM\\bin にも見つかりません。LLVM の公式版（23.1 以降。llvm-project の GitHub の Releases にある Windows 用のインストーラー）を入れるか、lldb-dap.exe のあるフォルダを PATH に足してください";
+
+#[cfg(windows)]
+const LLDB_PYTHON_MISSING: &str = "Rust のデバッグ（lldb-dap）には CPython の python3.dll が要ります。見つけた CPython のフォルダに python3.dll がありません。python.org の Windows 版の Python 3.13 を入れてください（例：`winget install --id Python.Python.3.13 --scope user`）。別の場所のものを使うときは、settings.json の python.cpython に python.exe のパスを書いてください";
+
+// 起動する lldb-dap と、子の PATH の先頭に足す Python のフォルダ（W15・W16）
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq)]
+struct LldbLaunch {
+    program: PathBuf,
+    python_dir: PathBuf,
+}
+
+// PATH → %ProgramFiles%\LLVM\bin の順に lldb-dap.exe を探す（W15。9.1 の追加 52。試しのために取り出した %LOCALAPPDATA%\Programs の下は探さない）
+#[cfg(windows)]
+fn find_lldb_dap() -> Result<PathBuf, String> {
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    find_lldb_dap_in(
+        std::env::var_os("PATH").as_deref(),
+        program_files.as_deref(),
+    )
+}
+
+// テストのために、PATH と %ProgramFiles% を受け取る形（相対パスの PATH の項目は見ない。find_gdb_in と同じ）
+#[cfg(windows)]
+fn find_lldb_dap_in(
+    path_var: Option<&std::ffi::OsStr>,
+    program_files: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let in_path: Vec<PathBuf> = path_var
+        .map(|paths| {
+            std::env::split_paths(paths)
+                .filter(|dir| dir.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    in_path
+        .into_iter()
+        .chain(program_files.map(|dir| dir.join("LLVM").join("bin")))
+        .map(|dir| dir.join("lldb-dap.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| LLDB_DAP_MISSING.to_string())
+}
+
+// CPython の exe のフォルダに python3.dll があれば、そのフォルダ（W16。lldb-dap の liblldb.dll が python3.dll を読む。
+// lldb-dap は自分では Python を探さない〔--check-python で確かめた〕）
+#[cfg(windows)]
+fn lldb_python_dir(interpreter: &Path) -> Result<PathBuf, String> {
+    interpreter
+        .parent()
+        .filter(|dir| dir.join("python3.dll").is_file())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| LLDB_PYTHON_MISSING.to_string())
+}
+
+// lldb-dap と、その子に足す Python のフォルダ（W15・W16）。Python は、設定の python.interpreter が pypy でも CPython を探す
+#[cfg(windows)]
+fn find_lldb_launch(settings: &python::PythonSettings) -> Result<LldbLaunch, String> {
+    let program = find_lldb_dap()?;
+    let cpython = python::PythonSettings {
+        interpreter: Interpreter::Cpython,
+        ..settings.clone()
+    };
+    let interpreter = python::find_interpreter(&cpython)
+        .map_err(|error| format!("Rust のデバッグ（lldb-dap）には CPython が要ります。{error}"))?;
+    let python_dir = lldb_python_dir(&interpreter)?;
+    Ok(LldbLaunch {
+        program,
+        python_dir,
+    })
+}
+
+// lldb-dap の子の環境（W16・W20）：PATH の先頭に Python のフォルダ。デバッグ対象の起動のたびに出るコンソールの窓を隠す
+// （LLDB の ProcessLauncherWindows が読む変数。LLDB の自前のテストの道具も付けている。9.1 の追加 52）
+#[cfg(windows)]
+fn apply_lldb_dap_env(command: &mut Command, launch: &LldbLaunch) {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(launch.python_dir.clone()).chain(std::env::split_paths(&inherited));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
+    command.env("LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE", "true");
+}
+
+// lldb-dap を DAP で起動する命令（W16・W20。--no-lldbinit：家とシステムの .lldbinit を読まない。initialize の $__lldb_sourceInitFile: false と両方）
+#[cfg(windows)]
+fn lldb_dap_command(launch: &LldbLaunch) -> Command {
+    let mut command = Command::new(&launch.program);
+    command.arg("--no-lldbinit");
+    apply_lldb_dap_env(&mut command, launch);
+    command
+}
+
+// `lldb-dap --version` の最初の行。Python を足した子の環境で、窓を出さず（CREATE_NO_WINDOW）、上限つきで動かす。答えがなければ None
+#[cfg(windows)]
+const LLDB_DAP_VERSION_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+fn lldb_dap_version(launch: &LldbLaunch) -> Option<String> {
+    let mut command = crate::process::command(&launch.program);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    apply_lldb_dap_env(&mut command, launch);
+    let mut child = command.spawn().ok()?;
+    let until = Instant::now() + LLDB_DAP_VERSION_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < until => thread::sleep(POLL_INTERVAL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+// Windows の Rust の initCommands（W17）：lldb_lookup.py の import と source-map だけ（Windows の rustc の etc に lldb_commands がない）。
+// パスは Windows の区切りでつなぐ（Unix の init_commands の行は変えない）
+#[cfg(windows)]
+fn lldb_dap_init_commands_windows(rustc: &RustcPaths) -> Vec<String> {
+    let rustlib = rustc.sysroot.join("lib").join("rustlib");
+    let mut commands = vec![format!(
+        "command script import {}",
+        lldb_quote(&rustlib.join("etc").join("lldb_lookup.py"))
+    )];
+    let source = rustlib.join("src").join("rust");
+    if let Some(hash) = &rustc.commit_hash
+        && source.is_dir()
+    {
+        commands.push(format!(
+            "settings set target.source-map /rustc/{hash} {}",
+            lldb_quote(&source)
+        ));
+    }
+    commands
+}
+
+// Windows の Rust の launch（W18）：program・cwd・input-path は `\\?\` を外す。preRunCommands は標準入力だけ
+// （target.inherit-tcc は macOS の LLDB だけ）。Unix の launch_arguments の行は変えない
+#[cfg(windows)]
+fn lldb_dap_launch_arguments_windows(
+    program: &Path,
+    dir: &Path,
+    input: &Path,
+    rustc: Option<&RustcPaths>,
+) -> Value {
+    json!({
+        "type": "lldb-dap",
+        "request": "launch",
+        "name": "AtCoder Studio",
+        "program": crate::trust::without_verbatim(program),
+        "args": [],
+        "cwd": crate::trust::without_verbatim(dir),
+        "stopOnEntry": false,
+        "initCommands": rustc.map(lldb_dap_init_commands_windows).unwrap_or_default(),
+        "preRunCommands": [
+            format!(
+                "settings set target.input-path {}",
+                lldb_quote(&crate::trust::without_verbatim(input))
+            ),
+        ],
+    })
 }
 
 // ---- 標準入力（D-146 2.4） ----
@@ -1142,6 +1317,40 @@ impl Client {
         let stdout = child.stdout.take().expect("piped");
         spawn_stderr_reader(child.stderr.take().expect("piped"), "gdb", channel.clone());
         let (client, notices) = Client::connect("gdb", stdin, stdout, root, channel);
+        Ok((client, child, notices))
+    }
+
+    // Windows（段階 6 の Rust。W16・W20）：lldb-dap を DAP で起動する。流れは spawn_gdb と同じ（Unix の spawn と C++ の spawn_gdb の行は変えない）。
+    // 引数と子の環境（--no-lldbinit・Python のフォルダ・窓を隠す変数）は lldb_dap_command で付ける
+    #[cfg(windows)]
+    fn spawn_lldb_dap(
+        launch: &LldbLaunch,
+        dir: &Path,
+        root: &Path,
+        channel: &Channel<RunEvent>,
+    ) -> Result<(Arc<Client>, Child, Receiver<Notice>), String> {
+        let mut command = lldb_dap_command(launch);
+        command
+            .current_dir(dir)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // デバッグ対象は lldb-dap の環境を引き継ぐので、今の実行と同じく D-104 の変数を外す
+        toolchain::clear_ide_env(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("lldb-dap を起動できません：{error}"))?;
+        crate::win::start_in_job(&child)
+            .map_err(|error| format!("lldb-dap を起動できません：{error}"))?;
+        let stdin = child.stdin.take().expect("piped");
+        let stdout = child.stdout.take().expect("piped");
+        spawn_stderr_reader(
+            child.stderr.take().expect("piped"),
+            "lldb-dap",
+            channel.clone(),
+        );
+        let (client, notices) = Client::connect("lldb-dap", stdin, stdout, root, channel);
         Ok((client, child, notices))
     }
 
@@ -1651,6 +1860,18 @@ pub fn debug_target(
                 gdb_version(launch).unwrap_or_else(|| "版は分かりません".to_string())
             ),
         ),
+        // Windows（段階 6 の Rust）：版が取れなかったときは、版の部分を出さずに場所だけ
+        #[cfg(windows)]
+        Adapter::LldbDap(launch) => info(
+            channel,
+            format!(
+                "デバッグアダプター：{}{}\n",
+                launch.program.display(),
+                lldb_dap_version(launch)
+                    .map(|version| format!("（{version}）"))
+                    .unwrap_or_default()
+            ),
+        ),
     }
 
     let (
@@ -1738,6 +1959,8 @@ pub fn debug_target(
         ),
         #[cfg(windows)]
         Adapter::Gdb(launch) => Client::spawn_gdb(launch, dir, root, channel),
+        #[cfg(windows)]
+        Adapter::LldbDap(launch) => Client::spawn_lldb_dap(launch, dir, root, channel),
     };
     let (client, mut child, notices) = match spawned {
         Ok(spawned) => spawned,
@@ -1770,6 +1993,20 @@ pub fn debug_target(
             initialize: gdb_initialize_arguments(),
             start: "launch",
             start_arguments: gdb_launch_arguments(&executable.path, dir, &input),
+            stop_functions: stop_functions(target.language),
+            uncaught_exceptions: false,
+        },
+        // Windows（段階 6 の Rust W17・W18）：initialize は lldb-dap と同じ。launch は Windows 用
+        #[cfg(windows)]
+        Adapter::LldbDap(_) => SessionPlan {
+            initialize: initialize_arguments(),
+            start: "launch",
+            start_arguments: lldb_dap_launch_arguments_windows(
+                &executable.path,
+                dir,
+                &input,
+                rustc.as_ref(),
+            ),
             stop_functions: stop_functions(target.language),
             uncaught_exceptions: false,
         },
@@ -1833,7 +2070,7 @@ pub fn debug_target(
 // 使うアダプター
 enum Adapter {
     // lldb-dap の場所
-    // （Windows では作らない。Rust は「まだ使えません」、C++ は gdb。段階 6 の C++ W8）
+    // （Windows では作らない。Rust は LldbDap、C++ は gdb。段階 6 の C++ W8・Rust W15）
     #[cfg_attr(windows, allow(dead_code))]
     Lldb(PathBuf),
     // debugpy を入れた場所（D-226）
@@ -1841,6 +2078,9 @@ enum Adapter {
     // Windows（段階 6 の C++ W8）：起動する gdb と、gdb の子の環境
     #[cfg(windows)]
     Gdb(GdbLaunch),
+    // Windows（段階 6 の Rust W15）：起動する lldb-dap と、その子の PATH に足す Python のフォルダ
+    #[cfg(windows)]
+    LldbDap(LldbLaunch),
 }
 
 // 言語に合うアダプターを見つける。Python は設定の処理系と、その処理系の debugpy
@@ -1852,9 +2092,9 @@ fn find_session_adapter(
     match language {
         #[cfg(not(windows))]
         Language::Rust | Language::Cpp => find_adapter(&environment.xcrun).map(Adapter::Lldb),
-        // Windows（段階 6 の C++ W8）：Rust はまだ使えない（次の PR）。C++ は gdb
+        // Windows：Rust は LLVM の lldb-dap（段階 6 の Rust W15）。C++ は gdb（段階 6 の C++ W8）
         #[cfg(windows)]
-        Language::Rust => Err(RUST_DEBUG_UNSUPPORTED.to_string()),
+        Language::Rust => find_lldb_launch(&langs.python).map(Adapter::LldbDap),
         #[cfg(windows)]
         Language::Cpp => find_gdb(&langs.cpp).map(Adapter::Gdb),
         Language::Python => {
@@ -3645,18 +3885,6 @@ main()
         );
     }
 
-    // A7c（段階 6 C++ T2。W8）：Windows の Rust のデバッグは、Xcode の案内ではなく「まだ使えません」の文で止まる
-    #[cfg(windows)]
-    #[test]
-    fn reports_rust_debug_unsupported_on_windows() {
-        let result = find_session_adapter(
-            Language::Rust,
-            &LangSettings::default(),
-            &Environment::real(None),
-        );
-        assert_same(result.err(), Some(RUST_DEBUG_UNSUPPORTED.to_string()));
-    }
-
     // A8（段階 6 C++ T2。W10）：gdb の initialize と launch。lldb-dap の項目がなく、`\\?\` を外し、標準入力は引用符つきの 1 つの文字列
     #[cfg(windows)]
     #[test]
@@ -3687,6 +3915,169 @@ main()
             Path::new("NUL"),
         );
         assert_eq!(launch["args"], r#"< "NUL""#);
+    }
+
+    // A13（段階 6 Rust T2。W15・W16）：lldb-dap の見つけ方（PATH → %ProgramFiles%\LLVM\bin）と、Python のフォルダ（python3.dll があること）。
+    // 偽のフォルダとファイルで試す（本物の lldb-dap は使わない）
+    #[cfg(windows)]
+    #[test]
+    fn finds_lldb_dap_on_windows() {
+        let ws = workspace("find-lldb-dap");
+        let path_dir = ws.0.join("path").join("bin");
+        let program_files = ws.0.join("pf");
+        let llvm_bin = program_files.join("LLVM").join("bin");
+        write(&path_dir.join("lldb-dap.exe"), "");
+        write(&llvm_bin.join("lldb-dap.exe"), "");
+        let path_var = std::env::join_paths([PathBuf::from("relative"), path_dir.clone()]).unwrap();
+
+        // 1. PATH にある：PATH のもの（%ProgramFiles% より先。相対パスの項目は見ない）
+        assert_same(
+            find_lldb_dap_in(Some(&path_var), Some(&program_files)),
+            Ok(path_dir.join("lldb-dap.exe")),
+        );
+
+        // 2. PATH になく、%ProgramFiles%\LLVM\bin にある：そこのもの
+        fs::remove_file(path_dir.join("lldb-dap.exe")).unwrap();
+        assert_same(
+            find_lldb_dap_in(Some(&path_var), Some(&program_files)),
+            Ok(llvm_bin.join("lldb-dap.exe")),
+        );
+
+        // 3. どこにもない：LLVM の公式版を入れる案内の文
+        fs::remove_file(llvm_bin.join("lldb-dap.exe")).unwrap();
+        assert_same(
+            find_lldb_dap_in(Some(&path_var), Some(&program_files)),
+            Err(LLDB_DAP_MISSING.to_string()),
+        );
+        assert_same(
+            find_lldb_dap_in(None, None),
+            Err(LLDB_DAP_MISSING.to_string()),
+        );
+
+        // 4. Python：CPython の exe の隣に python3.dll がなければ案内の文、あればそのフォルダ
+        let python = ws.0.join("Python313");
+        write(&python.join("python.exe"), "");
+        assert_same(
+            lldb_python_dir(&python.join("python.exe")),
+            Err(LLDB_PYTHON_MISSING.to_string()),
+        );
+        write(&python.join("python3.dll"), "");
+        assert_same(
+            lldb_python_dir(&python.join("python.exe")),
+            Ok(python.clone()),
+        );
+    }
+
+    // A14（段階 6 Rust T2。W16・W20）：lldb-dap を起動する命令の引数と環境
+    #[cfg(windows)]
+    #[test]
+    fn builds_lldb_dap_command_on_windows() {
+        let launch = LldbLaunch {
+            program: PathBuf::from(r"C:\l\bin\lldb-dap.exe"),
+            python_dir: PathBuf::from(r"C:\p\Python313"),
+        };
+        let command = lldb_dap_command(&launch);
+        assert_same(
+            command.get_program(),
+            std::ffi::OsStr::new(r"C:\l\bin\lldb-dap.exe"),
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // 家とシステムの .lldbinit を読まない（initialize の $__lldb_sourceInitFile: false と両方）
+        assert_same(args, vec!["--no-lldbinit".to_string()]);
+        // デバッグ対象の起動のたびに出るコンソールの窓を隠す（K4）
+        assert_same(
+            command_env(&command, "LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE"),
+            Some("true".to_string()),
+        );
+        // liblldb.dll が読む python3.dll のため、子の PATH の先頭に Python のフォルダ
+        let path = command_env(&command, "PATH").unwrap_or_default();
+        assert_same(
+            std::env::split_paths(&path).next(),
+            Some(PathBuf::from(r"C:\p\Python313")),
+        );
+    }
+
+    // A15（段階 6 Rust T2。W17）：Windows の initCommands。lldb_lookup.py の import と source-map だけで、lldb_commands を読まない
+    #[cfg(windows)]
+    #[test]
+    fn builds_rust_init_commands_on_windows() {
+        let ws = workspace("rust-init-windows");
+        let sysroot = crate::trust::without_verbatim(&ws.0).join("sysroot");
+        let rustc = RustcPaths {
+            sysroot: sysroot.clone(),
+            commit_hash: Some("0123abc".to_string()),
+        };
+        let import = format!(
+            "command script import {}",
+            lldb_quote(&sysroot.join(r"lib\rustlib\etc\lldb_lookup.py"))
+        );
+
+        // rust-src がない：import だけ
+        assert_same(lldb_dap_init_commands_windows(&rustc), vec![import.clone()]);
+
+        // rust-src がある：import と source-map
+        let source = sysroot.join(r"lib\rustlib\src\rust");
+        fs::create_dir_all(&source).unwrap();
+        assert_same(
+            lldb_dap_init_commands_windows(&rustc),
+            vec![
+                import,
+                format!(
+                    "settings set target.source-map /rustc/0123abc {}",
+                    lldb_quote(&source)
+                ),
+            ],
+        );
+    }
+
+    // A16（段階 6 Rust T2。W18）：Windows の Rust の launch。inherit-tcc を送らず、program・cwd・input-path の `\\?\` を外す
+    #[cfg(windows)]
+    #[test]
+    fn builds_rust_launch_configuration_on_windows() {
+        let init = initialize_arguments();
+        assert_eq!(init["$__lldb_sourceInitFile"], false);
+
+        let rustc = RustcPaths {
+            sysroot: PathBuf::from(r"C:\r"),
+            commit_hash: None,
+        };
+        let launch = lldb_dap_launch_arguments_windows(
+            Path::new(r"\\?\C:\w\pkg\target\debug\a.exe"),
+            Path::new(r"\\?\C:\w\pkg"),
+            Path::new(r"\\?\C:\w\pkg\test\input.txt"),
+            Some(&rustc),
+        );
+        assert_eq!(launch["type"], "lldb-dap");
+        assert_eq!(launch["request"], "launch");
+        assert_eq!(launch["program"], r"C:\w\pkg\target\debug\a.exe");
+        assert_eq!(launch["cwd"], r"C:\w\pkg");
+        assert_eq!(launch["args"], json!([]));
+        assert_eq!(launch["stopOnEntry"], false);
+        assert_eq!(
+            launch["initCommands"],
+            json!([r#"command script import "C:\\r\\lib\\rustlib\\etc\\lldb_lookup.py""#])
+        );
+        // 標準入力だけ。target.inherit-tcc（macOS の LLDB だけ）は送らない
+        assert_eq!(
+            launch["preRunCommands"],
+            json!([r#"settings set target.input-path "C:\\w\\pkg\\test\\input.txt""#])
+        );
+
+        // 入力のファイルがないとき（choose_input の NUL）も同じ形。表示スクリプトがないとき（rustc の sysroot が取れない）は initCommands が空
+        let launch = lldb_dap_launch_arguments_windows(
+            Path::new(r"C:\w\a.exe"),
+            Path::new(r"C:\w"),
+            Path::new("NUL"),
+            None,
+        );
+        assert_eq!(
+            launch["preRunCommands"],
+            json!([r#"settings set target.input-path "NUL""#])
+        );
+        assert_eq!(launch["initCommands"], json!([]));
     }
 
     // ---- 本物の gdb を使うテスト（Windows 移植の段階 6 の C++ T3）。MinGW-w64 の g++ と gdb が要る ----
