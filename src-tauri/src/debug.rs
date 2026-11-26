@@ -738,9 +738,21 @@ fn lldb_dap_command(launch: &LldbLaunch) -> Command {
     command
 }
 
-// `lldb-dap --version` の最初の行。Python を足した子の環境で、窓を出さず（CREATE_NO_WINDOW）、上限つきで動かす。答えがなければ None
+// `lldb-dap --version` の版の行（lldb_dap_version_line で選ぶ）。Python を足した子の環境で、窓を出さず（CREATE_NO_WINDOW）、上限つきで動かす。答えがなければ None
 #[cfg(windows)]
 const LLDB_DAP_VERSION_WAIT: Duration = Duration::from_secs(5);
+
+// `lldb-dap --version` の出力から、実行ログに出す版の行を選ぶ（段階 6 の Rust W25）。`version <数字>.<数字>.<数字>` を含む最初の行
+// （LLVM 23.1.6 では 2 行目の「LLVM version 23.1.6」。1 行目は「lldb-dap: LLVM (http://llvm.org/):」）。なければ None
+#[cfg(windows)]
+fn lldb_dap_version_line(text: &str) -> Option<String> {
+    static VERSION: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\bversion \d+\.\d+\.\d+").unwrap());
+    text.lines()
+        .map(str::trim)
+        .find(|line| VERSION.is_match(line))
+        .map(str::to_string)
+}
 
 #[cfg(windows)]
 fn lldb_dap_version(launch: &LldbLaunch) -> Option<String> {
@@ -766,10 +778,7 @@ fn lldb_dap_version(launch: &LldbLaunch) -> Option<String> {
     }
     let mut text = String::new();
     child.stdout.take()?.read_to_string(&mut text).ok()?;
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+    lldb_dap_version_line(&text)
 }
 
 // Windows の Rust の initCommands（W17）：lldb_lookup.py の import と source-map だけ（Windows の rustc の etc に lldb_commands がない）。
@@ -813,10 +822,12 @@ fn set_skip_prologue(client: &Client, value: bool, channel: &Channel<RunEvent>) 
     }
 }
 
-// Windows（段階 6 の Rust W22・W23）：lldb-dap の console の知らせを、行ごとに分ける。lldb-server の文は捨て、Process … exited は console、
-// ほかは stdout。続けて同じ扱いの行は 1 つにまとめる。行の途中で知らせが分かれたときは、形が合わないので stdout になる（計画の気がかり）
+// Windows（段階 6 の Rust W22・W23・W24）：lldb-dap の console の知らせを、行ごとに分ける。lldb-server の文は捨て、Process … exited は console、
+// 表示スクリプトの Python の Traceback（`Traceback (most recent call last):` の行から、字下げのない次の行〔例外の行〕まで）は console、ほかは stdout。
+// Traceback の途中かは in_traceback に持ち、知らせをまたいで引き継ぐ（1 行ずつ分かれて届いても同じに扱う）。
+// 続けて同じ扱いの行は 1 つにまとめる。行の途中で知らせが分かれたときは、形が合わないので stdout になる（計画の気がかり）
 #[cfg(windows)]
-fn lldb_dap_console_parts(text: &str) -> Vec<(&'static str, String)> {
+fn lldb_dap_console_parts(text: &str, in_traceback: &mut bool) -> Vec<(&'static str, String)> {
     static LAUNCHED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^Launched '.*' as process \d+\.\.\.$").unwrap()
     });
@@ -834,7 +845,16 @@ fn lldb_dap_console_parts(text: &str) -> Vec<(&'static str, String)> {
         {
             continue;
         }
-        let kind = if EXITED.is_match(body) {
+        let kind = if body == "Traceback (most recent call last):" {
+            *in_traceback = true;
+            "console"
+        } else if *in_traceback {
+            // 字下げのある行（File の行・コードの行・^ の行）は Traceback の続き。字下げのない行は例外の行で、そこで終わる
+            if !body.starts_with([' ', '\t']) {
+                *in_traceback = false;
+            }
+            "console"
+        } else if EXITED.is_match(body) {
             "console"
         } else {
             "stdout"
@@ -1012,6 +1032,9 @@ struct State {
     pause_thread: Option<i64>,
     #[cfg(windows)]
     pick_thread: bool,
+    // Windows（段階 6 の Rust W24）：lldb-dap の console で、表示スクリプトの Python の Traceback の途中か（知らせをまたいで引き継ぐ）
+    #[cfg(windows)]
+    in_traceback: bool,
 }
 
 struct Shared {
@@ -1041,9 +1064,9 @@ impl Shared {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    // 出力を上限まで送る。超えたら一度だけ知らせる
+    // 出力を見分けて（捨てる・lldb-dap の console は分ける）、send_output で送る
     fn output(&self, category: &str, text: &str) {
-        let mut state = self.lock_state();
+        let state = self.lock_state();
         if category == "console" && !state.launched {
             return;
         }
@@ -1053,20 +1076,24 @@ impl Shared {
         if self.adapter == "gdb" && state.debuggee_pid.is_none() {
             return;
         }
-        // Windows（段階 6 の Rust W22・W23）：lldb-dap では、利用者のプログラムの出力も console で届く（P4-C）。行ごとに見て、lldb-server の文は捨て、
-        // 「Process <番号> exited with status = …」は console のまま、ほかは stdout にする（launch の答えの前の console は上で捨てた）。
-        // 分けたものは 1 つずつ output に渡し直す。console のまま 1 つにまとまったもの（Process … exited だけ）は、渡し直さずに下へ進む
+        // Windows（段階 6 の Rust W22・W23・W24）：lldb-dap では、利用者のプログラムの出力も console で届く（P4-C）。行ごとに見て、lldb-server の文は捨て、
+        // 「Process <番号> exited with status = …」と表示スクリプトの Python の Traceback は console のまま、ほかは stdout にする
+        // （launch の答えの前の console は上で捨てた）。分けたものは、もう一度見分けずに send_output で送る（Traceback の途中かの印を、同じ行で 2 回動かさないため）
         #[cfg(windows)]
         if self.adapter == "lldb-dap" && category == "console" {
-            let parts = lldb_dap_console_parts(text);
-            if !(parts.len() == 1 && parts[0].0 == "console") {
-                drop(state);
-                for (kind, part) in parts {
-                    self.output(kind, &part);
-                }
-                return;
+            let mut state = state;
+            let parts = lldb_dap_console_parts(text, &mut state.in_traceback);
+            drop(state);
+            for (kind, part) in parts {
+                self.send_output(self.lock_state(), kind, &part);
             }
+            return;
         }
+        self.send_output(state, category, text);
+    }
+
+    // 出力を上限まで送る。超えたら一度だけ知らせる（段階 6 の Rust W24 で、output の後ろ半分の行をそのまま移した。state は output で取ったものを受け取る）
+    fn send_output(&self, mut state: std::sync::MutexGuard<'_, State>, category: &str, text: &str) {
         let room = OUTPUT_LIMIT.saturating_sub(state.output_sent);
         if text.len() <= room {
             state.output_sent += text.len();
@@ -5274,6 +5301,75 @@ int main() {
                 ),
             ],
         );
+    }
+
+    // A22（段階 6 Rust T4。W24）：Windows の lldb-dap では、表示スクリプトの Python の Traceback（`Traceback (most recent call last):` から、
+    // 字下げのない例外の行まで）を、利用者のプログラムの出力（stdout）にせず、console のまま画面に送る。Traceback が 1 つの知らせで届いても、
+    // 1 行ずつ分かれて届いても同じ。例外の行のあとは stdout に戻る。偽の知らせで試す（CI でも動く）。パスは偽のもの
+    #[cfg(windows)]
+    #[test]
+    fn keeps_python_tracebacks_as_console_on_windows() {
+        let console = |text: &str| lldb_dap_output_event("console", text);
+        let lines = [
+            "Traceback (most recent call last):\n",
+            "  File \"C:\\w\\rustlib\\etc\\lldb_providers.py\", line 916, in MSVCEnumSummaryProvider\n",
+            "    name: str = variant_names.enum_members[name_idx].name\n",
+            "                ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^\n",
+            "IndexError: list index out of range\n",
+        ];
+        let traceback: String = lines.concat();
+        let mut messages = vec![
+            console("Running initCommands:\n"),
+            lldb_dap_launch_answer(),
+            console("あいう\n"),
+            // 1 つの知らせで、前後にプログラムの出力が付いて届く形
+            console(&format!("x\n{traceback}y\n")),
+        ];
+        // 1 行ずつ、いくつもの知らせに分かれて届く形
+        messages.extend(lines.iter().map(|line| console(line)));
+        messages.push(console("6 atcoder\n"));
+        messages.push(console("Process 12 exited with status = 0 (0x00000000) \n"));
+        let outputs = lldb_dap_outputs(messages);
+        let mut expected = vec![
+            ("stdout".to_string(), "あいう\n".to_string()),
+            ("stdout".to_string(), "x\n".to_string()),
+            ("console".to_string(), traceback.clone()),
+            ("stdout".to_string(), "y\n".to_string()),
+        ];
+        expected.extend(
+            lines
+                .iter()
+                .map(|line| ("console".to_string(), line.to_string())),
+        );
+        expected.push(("stdout".to_string(), "6 atcoder\n".to_string()));
+        expected.push((
+            "console".to_string(),
+            "Process 12 exited with status = 0 (0x00000000) \n".to_string(),
+        ));
+        assert_same(outputs, expected);
+    }
+
+    // A23（段階 6 Rust T4。W25）：lldb-dap --version の出力から、版の数字の行（`version <数字>.<数字>.<数字>` を含む最初の行）を選ぶ。
+    // LLVM 23.1.6 の出力は、1 行目が「lldb-dap: LLVM (http://llvm.org/):」で、版は 2 行目（確かめ 3-A）。revision の値は偽のもの
+    #[cfg(windows)]
+    #[test]
+    fn picks_the_version_line_of_lldb_dap_on_windows() {
+        let text = "lldb-dap: LLVM (http://llvm.org/):\n  LLVM version 23.1.6\n  Optimized build.\nliblldb: lldb version 23.1.6 (https://github.com/llvm/llvm-project revision 0123abcd)\n  clang revision 0123abcd\n  llvm revision 0123abcd\n";
+        assert_same(
+            lldb_dap_version_line(text),
+            Some("LLVM version 23.1.6".to_string()),
+        );
+        // 行の終わりが CRLF でも同じ
+        assert_same(
+            lldb_dap_version_line(&text.replace('\n', "\r\n")),
+            Some("LLVM version 23.1.6".to_string()),
+        );
+        // 版の数字の行がなければ None（実行ログには場所だけ出す）
+        assert_same(
+            lldb_dap_version_line("lldb-dap: LLVM (http://llvm.org/):\n  Optimized build.\n"),
+            None,
+        );
+        assert_same(lldb_dap_version_line(""), None);
     }
 
     // ---- 本物の lldb-dap を使うテスト（Windows 移植の段階 6 の Rust T3。A21）。LLVM の lldb-dap と CPython（python3.dll）が要る ----
