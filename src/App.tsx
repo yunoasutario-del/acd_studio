@@ -117,7 +117,7 @@ import {
 import DebugPanel from "./panels/DebugPanel";
 import { useDebug } from "./panels/useDebug";
 import { debugEvaluate } from "./ipc/debug";
-import { appendConsole, consoleKindOf, type ConsoleEntry, type ConsoleKind } from "./panels/debugView";
+import { appendConsole, consoleKindOf, exitText, type ConsoleEntry, type ConsoleKind } from "./panels/debugView";
 import BottomRightPanel from "./panels/BottomRightPanel";
 import SubmissionPanel, { upsertSubmission, type SubmitNotice } from "./panels/SubmissionPanel";
 import { copyText } from "./panels/copyText";
@@ -650,8 +650,7 @@ function App() {
         if (notice.kind === "output") {
           addConsole(consoleKindOf(notice.category), notice.text);
         } else if (notice.kind === "exited") {
-          const code = notice.code === null ? "不明" : String(notice.code);
-          addConsole("info", `\nプログラムが終わりました（終了コード ${code}）\n`);
+          addConsole("info", `\nプログラムが終わりました（${exitText(notice.code, notice.label) ?? "終了コード 不明"}）\n`);
         }
       } else if (event.type === "case") {
         merged = mergeCase(merged, event.result);

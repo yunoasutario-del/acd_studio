@@ -217,7 +217,14 @@ pub enum DebugEvent {
     // プログラムが終わった
     Exited {
         code: Option<i32>,
+        // 終了コードの文（run::exit_code_text。実行・テストと同じ。件 6）。code がなければ None
+        label: Option<String>,
     },
+}
+
+// 終了コードの文（DebugEvent::Exited と Finish::Debugged の label。件 6）
+fn exit_label(code: Option<i32>) -> Option<String> {
+    code.map(run::exit_code_text)
 }
 
 // ---- アダプターを見つける ----
@@ -1213,7 +1220,13 @@ impl Shared {
                     state.exit_code = code;
                     state.stopped_thread = None;
                 }
-                debug_event(&self.channel, DebugEvent::Exited { code });
+                debug_event(
+                    &self.channel,
+                    DebugEvent::Exited {
+                        code,
+                        label: exit_label(code),
+                    },
+                );
             }
             "terminated" => {
                 let _ = notices.send(Notice::Terminated);
@@ -1897,7 +1910,13 @@ impl Client {
                 state.exit_code = status.and_then(|status| status.code());
                 let code = state.exit_code;
                 drop(state);
-                debug_event(&self.shared.channel, DebugEvent::Exited { code });
+                debug_event(
+                    &self.shared.channel,
+                    DebugEvent::Exited {
+                        code,
+                        label: exit_label(code),
+                    },
+                );
             }
         }
         forced
@@ -2004,10 +2023,8 @@ pub fn debug_target(
     // アダプター（Python は debugpy）は、ビルド・構文の確かめの前に見つける（なければ進めない）
     let adapter = match find_session_adapter(target.language, langs, environment) {
         Ok(adapter) => adapter,
-        Err(message) => {
-            info(channel, format!("{message}\n"));
-            return Finish::Failed { message };
-        }
+        // 案内の文は Finish::Failed で返し、画面が「実行できませんでした：」で出す（実行ログに 2 回出さない。件 9）
+        Err(message) => return Finish::Failed { message },
     };
     match &adapter {
         Adapter::Lldb(path) => info(
@@ -2090,10 +2107,7 @@ pub fn debug_target(
             info(channel, shown);
             path
         }
-        Err(message) => {
-            info(channel, format!("{message}\n"));
-            return Finish::Failed { message };
-        }
+        Err(message) => return Finish::Failed { message },
     };
 
     // 表示スクリプトと標準ライブラリのソースの場所（Rust だけ。取れなくても続ける）
@@ -2139,10 +2153,7 @@ pub fn debug_target(
     };
     let (client, mut child, notices) = match spawned {
         Ok(spawned) => spawned,
-        Err(message) => {
-            info(channel, format!("{message}\n"));
-            return Finish::Failed { message };
-        }
+        Err(message) => return Finish::Failed { message },
     };
     control.set(Some(client.clone()));
     let _session = SessionGuard(control);
@@ -2202,7 +2213,6 @@ pub fn debug_target(
             }
         }
         Err(message) if !stopped => {
-            info(channel, format!("{message}\n"));
             let forced = client.shutdown(&mut child);
             if forced {
                 info(
@@ -2219,13 +2229,8 @@ pub fn debug_target(
     }
 
     let forced = client.shutdown(&mut child);
-    if stopped {
-        info(
-            channel,
-            format!("\nデバッグを止めました。{}\n", run::NOT_CHECKED),
-        );
-    } else {
-        info(channel, "\nデバッグが終わりました。\n");
+    if let Some(note) = debug_end_note(stopped) {
+        info(channel, note);
     }
     if forced {
         info(
@@ -2236,9 +2241,21 @@ pub fn debug_target(
             ),
         );
     }
+    let exit_code = client.shared.lock_state().exit_code;
     Finish::Debugged {
-        exit_code: client.shared.lock_state().exit_code,
+        exit_code,
+        label: exit_label(exit_code),
         stopped,
+    }
+}
+
+// デバッグが終わったときに実行ログに出す文（件 10）。止めたときは、実行・テストの止めたときと同じく、止めたことと
+// NOT_CHECKED の知らせ。最後まで動いたときの「デバッグが終わりました」は、画面の describeFinish が終了コードと一緒に出す
+fn debug_end_note(stopped: bool) -> Option<String> {
+    if stopped {
+        Some(format!("\nデバッグを止めました。{}\n", run::NOT_CHECKED))
+    } else {
+        None
     }
 }
 
@@ -3145,7 +3162,8 @@ fn main() {
                 finish,
                 Finish::Debugged {
                     exit_code: Some(0),
-                    stopped: false
+                    stopped: false,
+                    ..
                 }
             ),
             "{finish:?}"
@@ -3261,7 +3279,8 @@ int main() {
             session.finish(),
             Finish::Debugged {
                 exit_code: Some(0),
-                stopped: false
+                stopped: false,
+                ..
             }
         ));
 
@@ -3363,7 +3382,8 @@ int main() {
                 finish,
                 Finish::Debugged {
                     exit_code: Some(101),
-                    stopped: false
+                    stopped: false,
+                    ..
                 }
             ),
             "{finish:?}"
@@ -3400,7 +3420,8 @@ int main() {
                 finish,
                 Finish::Debugged {
                     exit_code: Some(0),
-                    stopped: false
+                    stopped: false,
+                    ..
                 }
             ),
             "{finish:?}"
@@ -3678,7 +3699,8 @@ main()
                 session.finish(),
                 Finish::Debugged {
                     exit_code: Some(0),
-                    stopped: false
+                    stopped: false,
+                    ..
                 }
             ));
 
@@ -3856,7 +3878,8 @@ main()
                 session.finish(),
                 Finish::Debugged {
                     exit_code: Some(0),
-                    stopped: false
+                    stopped: false,
+                    ..
                 }
             ));
 
@@ -4480,7 +4503,8 @@ int main() {
                 finish,
                 Finish::Debugged {
                     exit_code: Some(0),
-                    stopped: false
+                    stopped: false,
+                    ..
                 }
             ),
             "{finish:?}"
@@ -6018,5 +6042,146 @@ fn main() {
             "{}",
             hide_names(&format!("{problems:?}"))
         );
+    }
+
+    // ---- デバッグの画面の小さな直し（windows-debug-ui-fixes T3。件 9・件 10・件 6）。どれも OS に依らない ----
+
+    // 件 9：アダプターが見つからないとき、案内の文は Finish::Failed の message だけで返し、実行ログ（log の知らせ）には出さない
+    // （画面の describeFinish が「実行できませんでした：<文>」で出すので、2 回にしない）。Python の対象で、設定の CPython を
+    // 一時フォルダの中のない場所にする（本物の Python と debugpy は要らない）。失敗の文には message（一時フォルダのパス）を出さない
+    #[test]
+    fn reports_a_missing_adapter_only_in_the_finish() {
+        let ws = workspace("missing-adapter");
+        let pkg = ws.0.join("pkg");
+        write(&pkg.join("main.py"), "print(1)\n");
+        let langs = LangSettings {
+            python: python::PythonSettings {
+                interpreter: Interpreter::Cpython,
+                cpython: ws
+                    .0
+                    .join("no-python")
+                    .join("python.exe")
+                    .to_string_lossy()
+                    .into_owned(),
+                pypy: String::new(),
+            },
+            ..LangSettings::default()
+        };
+        let target = Target {
+            package: "pkg".to_string(),
+            bin: "main".to_string(),
+            language: Language::Python,
+        };
+        let session = Session::start_with(
+            &pkg,
+            &ws.0,
+            None,
+            Vec::new(),
+            target,
+            langs,
+            Environment::real(None),
+        );
+        let events = session.events.clone();
+        let finish = session.finish();
+        let Finish::Failed { message } = finish else {
+            panic!("Finish が Failed でない");
+        };
+        assert!(
+            message.contains("python.cpython"),
+            "message に python.cpython の名前がない"
+        );
+        let log: String = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "log")
+            .map(|event| event["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let count = log.matches(message.as_str()).count();
+        assert_eq!(count, 0, "実行ログに案内の文が {count} 回出た");
+    }
+
+    // 件 10：最後まで動いたとき（止めていないとき）は、終わりの知らせの文を実行ログに出さない（画面の describeFinish が
+    // 「デバッグが終わりました（終了コード N）」を出すので、2 行にしない）。止めたときは今と同じ（実行・テストの止めたときと同じ形）
+    #[test]
+    fn writes_no_extra_line_when_debugging_ends() {
+        assert_eq!(debug_end_note(false), None);
+        let stopped = debug_end_note(true).expect("止めたときの文がない");
+        assert!(
+            stopped.contains("デバッグを止めました。") && stopped.contains(run::NOT_CHECKED),
+            "{stopped}"
+        );
+    }
+
+    // 件 6：プログラムが終わった知らせ（Exited）と、デバッグの終わり方（Finish::Debugged）の終了コードに、実行・テストと同じ
+    // run::exit_code_text の文（label）を付ける（Windows の負の値は 16 進と名前。0 以上は「終了コード N」）。偽の知らせで試す
+    #[test]
+    fn labels_the_exit_code_like_a_run() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let channel = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(text) = body {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            Ok(())
+        });
+        let messages = [
+            json!({ "seq": 0, "type": "event", "event": "exited", "body": { "exitCode": -1073740791 } }),
+            json!({ "seq": 0, "type": "event", "event": "exited", "body": { "exitCode": 0 } }),
+            json!({ "seq": 0, "type": "event", "event": "exited", "body": {} }),
+        ];
+        let bytes: Vec<u8> = messages
+            .iter()
+            .flat_map(|message| encode(&message.to_string()))
+            .collect();
+        let (_client, notices) = Client::connect(
+            "debugpy",
+            std::io::sink(),
+            std::io::Cursor::new(bytes),
+            Path::new("."),
+            &channel,
+        );
+        // 読み終えると、読み取りのスレッドが知らせの送り手を捨てる
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match notices.recv_timeout(Duration::from_millis(20)) {
+                Err(RecvTimeoutError::Disconnected) => break,
+                _ => assert!(Instant::now() < until, "読み終わりません"),
+            }
+        }
+        let exited: Vec<(Value, Value)> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "debug" && event["event"]["kind"] == "exited")
+            .map(|event| {
+                (
+                    event["event"]["code"].clone(),
+                    event["event"]["label"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            exited,
+            vec![
+                (
+                    json!(-1073740791),
+                    json!(
+                        "終了コード 0xC0000409（異常終了：C++ の abort・assert・捕まえない例外、Rust の abort など）"
+                    )
+                ),
+                (json!(0), json!("終了コード 0")),
+                (Value::Null, Value::Null),
+            ]
+        );
+        // Finish::Debugged の label も同じ関数で作る
+        assert_eq!(
+            exit_label(Some(-1073740791)),
+            Some(run::exit_code_text(-1073740791))
+        );
+        assert_eq!(exit_label(Some(0)), Some("終了コード 0".to_string()));
+        assert_eq!(exit_label(None), None);
     }
 }

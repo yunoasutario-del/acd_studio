@@ -1,5 +1,6 @@
 // 実行ログの中身と、終わり方の説明（Phase 2 作業 4）
 import { exitLabel, type Finish, type LogKind } from "../ipc/run";
+import { exitText } from "./debugView";
 
 // lsp は rust-analyzer の状態・失敗の理由・標準エラー（画面で足す行。Phase 3b-2 作業 3。D-130）
 export type LogEntryKind = LogKind | "lsp";
@@ -81,14 +82,16 @@ export function describeFinish(finish: Finish): string {
       return finish.submissionId === null
         ? `${finish.task}：送りました（提出の ID は分かりません）`
         : `${finish.task}：送りました（判定は記録されていません）`;
-    case "debugged":
+    case "debugged": {
       // デバッグ（Phase 5。D-146）
       if (finish.stopped) {
         return "デバッグを止めました";
       }
-      return finish.exitCode === null
+      const text = exitText(finish.exitCode, finish.label);
+      return text === null
         ? "デバッグが終わりました（終了コードは届きませんでした）"
-        : `デバッグが終わりました（終了コード ${finish.exitCode}）`;
+        : `デバッグが終わりました（${text}）`;
+    }
     case "ran": {
       const time = `実行時間 ${finish.elapsedMs} ms（ローカルの計測）`;
       const outcome = finish.outcome;

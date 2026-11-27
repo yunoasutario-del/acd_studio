@@ -195,6 +195,8 @@ pub enum Finish {
     Debugged {
         // プログラムの終了コード（`exited` の知らせ）。届かなかった（止めた・アダプターが落ちた）なら None
         exit_code: Option<i32>,
+        // 終了コードの文（run::exit_code_text。件 6）。終了コードが届かなかったら None
+        label: Option<String>,
         // 停止の操作（またはアプリの終了）で止めた
         stopped: bool,
     },

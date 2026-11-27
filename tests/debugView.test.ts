@@ -2,7 +2,7 @@
 // 動かし方は logLinks.test.ts と同じ（node --test）。パスは偽のもの
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { failureLog, failureStatus, fileName } from "../src/panels/debugView.ts";
+import { exitText, failureLog, failureStatus, fileName } from "../src/panels/debugView.ts";
 
 test("件 1：panic・例外・abort で止まったときの文に「でで」がない（状態の文と、実行ログの文）", () => {
   const cases: [string, string, string][] = [
@@ -47,6 +47,27 @@ test("件 5：コールスタックとブレークポイントの一覧のファ
     const got = fileName(path);
     if (got !== name) {
       wrong.push(`${path} → ${got}`);
+    }
+  }
+  assert.deepEqual(wrong, [], `合わない：\n${wrong.join("\n")}`);
+});
+
+test("件 6：終了コードの文は、Rust が作った名前（label）があればそれ、なければ「終了コード N」（src/ipc/run.ts の exitLabel と同じ決まり）", () => {
+  const cases: [number | null, string | null | undefined, string | null][] = [
+    // Windows の負の値（Rust の run::exit_code_text が 16 進と名前にする）
+    [-1073740791, "終了コード 0xC0000409（異常終了：…）", "終了コード 0xC0000409（異常終了：…）"],
+    [0, "終了コード 0", "終了コード 0"],
+    // label のない知らせ（前の形）と、空の label は、code から作る（exitLabel と同じく || で戻す）
+    [3, undefined, "終了コード 3"],
+    [3, "", "終了コード 3"],
+    // 終了コードが届かなかった
+    [null, null, null],
+  ];
+  const wrong: string[] = [];
+  for (const [code, label, text] of cases) {
+    const got = exitText(code, label);
+    if (got !== text) {
+      wrong.push(`${code} / ${label} → ${got}`);
     }
   }
   assert.deepEqual(wrong, [], `合わない：\n${wrong.join("\n")}`);

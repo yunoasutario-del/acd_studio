@@ -51,7 +51,7 @@ export type DebugEvent =
   | { kind: "output"; category: string; text: string }
   | { kind: "breakpoints"; path: string; breakpoints: BreakpointView[] }
   | { kind: "breakpointChanged"; reason: string; breakpoint: BreakpointView }
-  | { kind: "exited"; code: number | null };
+  | { kind: "exited"; code: number | null; label?: string | null };
 
 export type SourceBreakpoints = { path: string; lines: number[] };
 

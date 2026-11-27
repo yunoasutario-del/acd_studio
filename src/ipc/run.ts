@@ -65,7 +65,7 @@ export type Finish =
       maxElapsedMs: number | null;
     }
   // デバッグをした（Phase 5。D-146）。exitCode はプログラムの終了コード（届かなかったら null）、stopped は停止の操作で止めた
-  | { kind: "debugged"; exitCode: number | null; stopped: boolean }
+  | { kind: "debugged"; exitCode: number | null; stopped: boolean; label?: string | null }
   // AtCoder に提出した（Phase 6。D-148 §2.8。実行履歴だけに出る）。verdict・score は判定が決まったら入る、
   // error は送れなかった・受け付けられなかったときの理由
   | {
