@@ -2008,6 +2008,7 @@ button.breadcrumb:focus-visible {
 }
 
 .debug-variable-value {
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2017,8 +2018,13 @@ button.breadcrumb:focus-visible {
   color: var(--verdict-ng);
 }
 
+/* 型の名前が長いとき、値より先に型の名前を「…」で切る（全体は行の title で出る。件 8） */
 .debug-variable-type {
-  flex: none;
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--fg-muted);
 }
 
