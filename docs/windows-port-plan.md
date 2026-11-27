@@ -2514,6 +2514,7 @@ exe の作り直し
 **今回の移植には含めない（9 章 12。2026-10-29 に決めた）。** 段階 1 では、デバッグのコードは Windows でコンパイルが通るようにするだけで、動かさない。以下は後で行うときのための記録。
 → 2026-11-20 に段階 6 を始めた（9.1 の追加 48。12 は書き換えていない）。Python（debugpy）の計画は、下の「段階 6 の Python（debugpy）の計画」。
 → 2026-11-22 に C++ を始めた（9.1 の追加 50）。アダプターは MinGW-Builds の gdb 16.3 の DAP。計画は下の「段階 6 の C++（gdb）の計画」。
+→ 2026-11-23 に Rust を始めた（9.1 の追加 52）。アダプターは LLVM の公式版の lldb-dap（23.1.6 で確かめた）。計画は下の「段階 6 の Rust（lldb-dap）の計画」。
 
 何を変えるか
 - 6 章で選んだ方式のアダプターの探索と起動、DAP の違いの吸収
@@ -2949,6 +2950,293 @@ A9 で記録したこと（assert していない所を含む）
 | 6 | abort のあとの終了コードが 10 進（-1073740791）のままで、0xC0000409 と名前が付かない | 実行の結果は run.rs の exit_code_text で 16 進と名前にするが、デバッグの文（App.tsx:654 と src/panels/runLog.ts:91）は値をそのまま出す（読んで確かめた） | 件 5 と同じ PR |
 | 7 | 一時停止のあと「停止」すると、デバッグコンソールに「プログラムが終わりました（終了コード 0）」と出る | 未確認（gdb がデバッグ対象を止めたときの exited の知らせの値と見られる。推測） | 件 2・件 4 と同じ PR で調べる |
 
+### 段階 6 の C++ の push と merge（windows-stage6-rust の T1 で書いた）
+
+- windows-stage6-cpp を origin へ push した（-u なし。[new branch]。送ったのは 22c3dd7・96b2f18・17d5de0・7a2093c の 4 つ。origin/main 73d20c8 から作ったブランチ）。
+  push の前に、利用者が自分の窓で秘密の値の照らし合わせをした（範囲 origin/main..windows-stage6-cpp。やり方の確かめの語では -S も --grep も T3 だけが出た。決めた語はどれも 0）
+- push の run #60 は、macOS・Windows とも success（利用者がブラウザで見た）
+
+| OS | lib | 時間 | npm test |
+| --- | --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out | 44.05 秒 | 26 通過 |
+| Windows | 413 通過・0 失敗・8 無視・1 filtered out | 68.06 秒 | 26 通過 |
+
+- PR #13（base は利用者のリポジトリの main）：All checks have passed・No conflicts
+- merge は 0d0e7d4（Create a merge commit。ブランチは消していない）。親は 73d20c8 と 7a2093c、tree は 7a2093c と同じ（bcb01d8a7468671c2aa61efc257bba34c47cc94f）。
+  手元の main は、git fetch origin のあと、親と tree を確かめ、git switch main と git merge --ff-only origin/main で 0d0e7d4 に合わせた
+- merge のあとの main の push の run #62 は、macOS・Windows とも success（利用者がブラウザで見た）
+
+| OS | lib | 時間 | npm test |
+| --- | --- | --- | --- |
+| macOS | 309 通過・0 失敗・0 無視・1 filtered out | 17.74 秒 | 26 通過・0 失敗 |
+| Windows | 413 通過・0 失敗・8 無視・1 filtered out | 68.05 秒 | 26 通過・0 失敗 |
+
+- run #60 と同じ数。macOS の秒数が縮んだのは runner の違いと見られる（推測）
+- run #60・#62 の Annotations は、Node.js 20 の非推奨（actions/checkout@v4・actions/setup-node@v4。macOS と Windows の両方）と、macOS の runner の混雑の notice だけ
+- デスクトップの exe は、17d5de0 から作った release の exe（10,162,176 バイト・685672F5…025B）に入れ替えた（17d5de0..0d0e7d4 は docs だけ）
+
+### 段階 6 の Rust（lldb-dap）の計画（2026-11-23〜25。windows-stage6-rust）
+
+範囲（9.1 の追加 52）
+- Windows で使えるデバッグに Rust を足す（段階 6 の最後の言語）。ブランチは、git fetch origin のあと origin/main（0d0e7d4）から --no-track で作った windows-stage6-rust
+- アダプターは LLVM の公式版の lldb-dap（23.1.6 で確かめた）。IDE には同梱せず、取得もしない（元の版の D-145 と同じ）。ビルドは今の MSVC のまま（PDB）
+- 利用者向けの docs/usage.md の Windows のデバッグの項目に、最後のコミットで Rust を足す
+
+元の版との対応
+| 項目 | 元の版 |
+| --- | --- |
+| 段階・作業 | Phase 5（デバッグ。作業 1〜4） |
+| D-番号 | D-145（利用者の環境の lldb-dap を Rust 側の DAP のクライアントから使う。IDE には同梱せず、取得もしない）・D-146（dev でビルド、利用者の初期化ファイルを読まない、rustc の表示スクリプト、標準入力は input.txt か選んだケース、panic で止める〔rust_panic〕、disconnect から始める止め方） |
+| 画面の確かめの基準 | AC5-01〜13。特に AC5-04（Vec・String・HashMap・構造体・Option が読める形で出る）・AC5-06（panic で止まり、続行すると終了コード 101）・AC5-08（止めたあと、アダプターとプログラムが残らない）・AC5-12（作業領域と利用者のフォルダの .lldbinit を読まない）・AC5-13（アダプターがないとき、始めずに入れ方の案内を出す） |
+| コミット | このリポジトリでは、元の版の全体を最初に取り込んだ 309895d に入っている。機能ごとの元の版のコミットのハッシュは未確認 |
+| 元の版の Windows | デバッグは対象外（P-07-8）。総合開発仕様書 8.2 は、MSVC/PDB と GNU/DWARF の違いを調べ、対応範囲を明示することを求めている → 下の「道具の調べ」と、上の「範囲」 |
+
+道具の調べ（2026-11-23〜24。読むだけの命令と、上限つきの命令で確かめた）
+- この機械の Rust：既定の stable 1.98.1（x86_64-pc-windows-msvc だけ）と 1.99.0（IDE 自身のビルド用）。どちらの rustlib\etc にも lldb_commands はない。
+  lldb_lookup.py は `command script import` で読まれたときに自分で型の扱いを登録し（`__lldb_init_module`）、MSVC（PDB）向けの扱い（`enum2$<…>` など）を持つ。lldb・lldb-dap・codelldb はなかった
+- 候補：A LLVM の lldb-dap（選んだ）／B CodeLLDB／C vsdbg（VS Code の外では使えない見込み）／D デバッグのときだけ x86_64-pc-windows-gnu でビルドして gdb の DAP／E DbgEng で自前の DAP。
+  A を選んだ理由：元の版と同じ lldb-dap で、今の lldb-dap の経路（launch・rust_panic・表示スクリプト）を使え、実行・提出と同じ MSVC の exe を見られる。D は、A が足りなかったときに改めて聞く
+- LLVM 23.1.6 の公式の tar.xz（clang+llvm-23.1.6-x86_64-pc-windows-msvc.tar.xz）には lldb がない。公式のインストーラー（.msi。ALLUSERS=1 で %ProgramFiles%\LLVM に入る）には、
+  bin の lldb-dap.exe・lldb.exe・liblldb.dll・lldb-server.exe・lldb-argdumper.exe と lib\site-packages\lldb がある。試しのために、インストーラーは動かさず、7-Zip でこれらだけを
+  %LOCALAPPDATA%\Programs\llvm-lldb-23.1.6 に取り出した（33 個。PATH には入れていない。利用者の許可のあと）
+- 頼る DLL（dumpbin）：lldb-dap.exe と lldb.exe は liblldb.dll を遅れて読み込み、liblldb.dll は python3.dll を読み込む。Python の DLL は配布に入っていない（LLVM 23.1 から、Python 3.8 以上ならよい）。
+  `lldb-dap --check-python` は、CPython 3.13 のフォルダ（%LOCALAPPDATA%\Programs\Python\Python313）を子の PATH の先頭に足すと終了コード 0、足さないと 1（could not locate the Python runtime library）。
+  lldb-dap は自分では Python を探さないと見られる（推測）。プログラムの起動には lldb-server.exe を使う
+
+確かめ（P3・P4。どれもコミットしていない）
+- P3（lldb.exe の `-b -x -s <命令のファイル>`。30 秒の上限・空の標準入力・子の PATH の先頭に Python313・USERPROFILE と HOME を作業用の場所に差し替え。試しの作業領域は %USERPROFILE%\Documents\debug_test_rust）
+  - IDE と同じビルド（`cargo rustc --bin <名前> -- -C link-arg=/STACK:1073741824`）で pdb ができ、`settings set target.input-path` で標準入力が入った
+  - lldb_lookup.py で、Vec・String・HashMap・Option・構造体・enum が読める形で出た
+  - rust_panic の関数のブレークポイントは、既定では関数の頭から +76 の所に置かれ、止まらずに終了コード 101 で終わった。`--skip-prologue false` で頭に置くと止まった
+  - 作業フォルダの .lldbinit は、-x がなくても読まない（target.load-cwd-lldbinit の既定）。Windows の lldb は家のフォルダを環境変数でなく OS から決める（SBHostOS.GetUserHomeDirectory。
+    環境変数を差し替えても本物の家を見る）ので、家の .lldbinit を読まないことは、23.1.6 のソースで確かめた：lldb-dap の DAP::InitializeDebugger は、
+    `$__lldb_sourceInitFile` が true で、かつ `--no-lldbinit` がないときだけ、家とシステムの .lldbinit を読む（`$__lldb_sourceInitFile: false` は IDE が送る。Windows では両方を付ける）
+  - lldb で run するたびに、コンソールの黒い窓が出てすぐ消えた（K4）。23.1.6 の ProcessLauncherWindows.cpp は、標準入出力の 3 つともつないでいないとき CREATE_NEW_CONSOLE を付け、
+    環境変数 LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE=true（LLDB の自前のテストの道具 dotest.py が Windows で付けているもの）があると窓を隠す。lldb の子に付けると 0 回、付けないと 1 回（利用者が見た）
+- P4（一時的なテスト。C++ の P2 と同じく、debug.rs の控えを取り、足して動かし、控えから戻して、ハッシュが同じことと status 0 行を確かめた。P4-A〜D の 4 回）
+  - IDE の DAP のクライアント（Client・start_session）と IDE と同じビルド（run::prepare）で、本物の lldb-dap を、IDE と同じ起動の形（CREATE_NO_WINDOW・Job・パイプ）で動かした。
+    下の W16〜W18・W20・W21 にあたるものは、テストの中だけで足した
+  - 止まる・変数・式（AC5-04）：Vec（size=3。1・2・3）・String（"atcoder"）・HashMap（size=3）・Option（Some(1)・None）・構造体・enum が読める形。ウォッチ式も動いた。日本語の出力も届いた
+  - panic（AC5-06）：skip-prologue が既定だと止まらずに 101。false にすると、理由 panic で止まり、作業領域のフレーム（範囲外の添字の行）が画面の pickFrame で選ばれる形になり、続行で 101
+  - skip-prologue をずっと false にすると、fn の行に置いたブレークポイントが関数の頭で止まり、引数が「variable not available」になる（既定では次の行に移り、読める）。
+    step in は設定で変わらない（23.1.6 の ThreadPlanStepInRange.cpp は設定を見ない）。値はブレークポイントを作るときに決まる（23.1.6 の Target.cpp）
+  - 一時停止：止まったと知らされるのは、Windows が一時停止のために作ったと見られるスレッド（いちばん上が DbgBreakPoint）で、reason exception・description interrupt。利用者のコードは main のスレッドにある
+  - 出力：利用者のプログラムの出力も、lldb-server の文（lldb-server exiting...・Connection established.・lldb-server-local_build・Launched '<exe のフルパス>' as process <番号>...）も、
+    category console で届いた（stdout は 0。LLDB_LAUNCH_FLAG_USE_PIPES=1 を付けても同じ）。23.1.6 のソースからの見立て（推測）：input-path で標準入力にファイルを指定しているので
+    ConPTY が使われず、デバッグ対象と lldb-server は lldb-dap が console に回すパイプを引き継ぐ。画面の consoleKindOf は stdout・stderr だけをプログラムの出力の見た目にするので、
+    今のままだと Windows ではアダプターの文の見た目になる（コードからの見込み）
+  - launch の答えより前に届いた console は、lldb-dap 自身の文（作業領域や exe のパスを含む）だけで、今のコードが捨てている。プログラムの出力は、すぐに出力するプログラムでも、
+    launch の答えのあとに届いた（1 回ずつの結果。いつもこの順かは未確認）
+  - 止めたあと（AC5-08）：lldb-dap・lldb-server・デバッグ対象は残らず、強制にもならなかった。作業領域の .lldbinit の目印は出なかった（AC5-12）
+  - continued は、続行・ステップのたびに来た。始めたあと最初に止まるまでは来なかった（件 2 と同じ）
+  - IDE と同じ起動の形でも、LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE がないとデバッグ対象の起動ごとに黒い窓が出た（変数あり：起動 6 回で 0 回、なし：1 回で 1 回。利用者が見た）
+  - 同じ行（println!）のブレークポイントで 3 回止まった（K1。lldb では 2 回）。lldb-dap が %LOCALAPPDATA%\lldb に空の symstore を作った
+
+決めたこと（9.1 の追加 52）
+- lldb-dap の探し方：find_gdb_in にならって、PATH → %ProgramFiles%\LLVM\bin（公式のインストーラーの場所）。試しのために作った %LOCALAPPDATA%\Programs\llvm-lldb-* は探さない。
+  ないときは「LLVM の公式版を入れる」案内（D-145 と合わせる）
+- Python の探し方：python::find_interpreter の CPython（settings.json の python.cpython → 決まった場所・PATH。python.interpreter が pypy でも CPython を探す）の exe のフォルダを、
+  lldb-dap の子の PATH の先頭にだけ足す。そのフォルダに python3.dll がなければ案内の文。利用者の PATH や設定は変えない
+- 一時停止（W19）・lldb-server の文（W22）・console の出力（W23）は、Windows で、アダプターが lldb-dap のときだけ扱う。W23 は Rust 側で見分ける（下の表）。
+  launch の答えの前の console を捨てる条件は今のまま（process の知らせから launch の答えの間にも、Attached to process や Executable binary set to '<パス>' が届くため）
+- rust_panic は、setFunctionBreakpoints の前後だけ skip-prologue を false にする（ずっと false にはしない）
+- K1（同じ行で何回か止まる）と symstore は、コードを変えず、usage.md に書く
+
+変えること（どれも Windows だけ。番号は C++ の W8〜W14 の続き）
+| # | 所 | 変えること |
+| --- | --- | --- |
+| W15 | find_session_adapter | Windows の Rust は lldb-dap を探す（上の探し方）。ないときは案内。RUST_DEBUG_UNSUPPORTED はなくす |
+| W16 | lldb-dap の起動 | gdb の W9 と同じく Windows 用の起動の関数に分ける。引数 `--no-lldbinit`、子の PATH の先頭に Python のフォルダ |
+| W17 | init_commands | lldb_lookup.py の import と source-map だけ（lldb_commands を読まない） |
+| W18 | launch | `settings set target.inherit-tcc`（macOS の LLDB だけ）を送らない。program・cwd・input-path の `\\?\` を外す |
+| W19 | 一時停止 | reason exception かつ description interrupt を pause にする（読み取りのスレッドで書き換える。W14 の形）。threadId は pause を送ったスレッドにし、最初にスタックを取るときに、作業領域のフレームがあるスレッド（なければ main）に替える |
+| W20 | lldb-dap の子の環境 | LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE=true（W16 と同じ所） |
+| W21 | panic で止める | setFunctionBreakpoints の直前に `settings set target.skip-prologue false`、直後に true（evaluate の repl で）。行のブレークポイントは setFunctionBreakpoints より前に送るので（start_session）、既定（true）のまま作られる |
+| W22 | lldb-server の文 | launch の答えのあとの console のうち、行全体が上の 4 つの形のものを捨てる（Launched は `'…' as process <数字>...` の形で見分ける） |
+| W23 | console の出力 | launch の答えのあとの console のうち、W22 の形でも「Process <数字> exited with status = …」の形でもないものを、stdout として画面に送る |
+
+- W21 で、evaluate（repl）が configurationDone の前に通るかは未確認。通らなければ、ほかの形（preRunCommands で `breakpoint set --name rust_panic --skip-prologue false` を作り、
+  止まった関数の名前で panic と見分けるなど）を考える。initCommands で false・preRunCommands で true の形は、P4-D で preRunCommands が initialized より前に動いたので使えない見込み
+- 変えないこと：止める関数（rust_panic）、stack・scopes・variables・evaluate の要求の形、shutdown（W4 の release_job を含む）、ブレークポイントのパス（W6 の without_verbatim）
+
+macOS への影響
+- W15〜W23 は cfg(windows)。W19・W22・W23 は、それに加えてアダプターが lldb-dap のときだけ。Unix の行は cfg を付ける以外は変えない
+- 画面の TypeScript（consoleKindOf など）は変えない。確かめは CI の macos-latest（ビルド・clippy・テスト）。macOS の画面は未確認
+
+先に書くテスト（どれも cfg(windows)。直す前に落ちることを確かめ、直したあと W ごとに一時的に外して落ちることを確かめる）
+| # | テスト（名前は案） | 中身 |
+| --- | --- | --- |
+| A13 | finds_lldb_dap_on_windows | 偽の lldb-dap.exe を置いた PATH・%ProgramFiles%\LLVM\bin の形で見つかる。ないときは案内の文 |
+| A14 | builds_lldb_dap_command_on_windows | 起動の引数（--no-lldbinit）と、子の環境（PATH の先頭の Python のフォルダ・LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE） |
+| A15 | builds_rust_init_commands_on_windows | command source がない |
+| A16 | builds_rust_launch_configuration_on_windows | inherit-tcc と `\\?\` がない |
+| A17 | treats_lldb_dap_interrupt_as_pause_on_windows | 偽の知らせで、exception・interrupt が pause になり threadId が替わる。本当の例外は変わらない |
+| A18 | sets_rust_panic_at_the_function_start_on_windows | 偽のアダプターで、evaluate(false) → setFunctionBreakpoints → evaluate(true) の順に送る |
+| A19 | hides_lldb_server_lines_on_windows | 偽の output の知らせで、lldb-server の 4 つの形が出ない。前後の行は残る |
+| A20 | shows_lldb_dap_console_output_as_program_output_on_windows | 利用者の出力（console）が stdout になる。Process … exited は console のまま。launch の答えの前の console は捨てる |
+| A21 | debugs_rust_with_real_lldb_dap_on_windows | 本物の lldb-dap（A9 の形）。CI では飛ぶ。lldb-dap か Python がない機械でも飛ぶ。止まる・変数・式・入力・panic・fn の行の変数・一時停止・すぐに出力した行が残る・lldb-server の文が出ない・止めたあとに残らない |
+
+順番（コミット）
+- T1：この節、9.1 の追加 52、10 章、段階 6 の C++ の push と merge の記録
+- T2：テスト A13〜A16 と W15〜W18・W20
+- T3：テスト A17〜A21 と W19・W21〜W23
+- T3 のあと：release の exe を作り、画面で確かめる（元の版の AC5-01〜13 を Windows 向けに読み替える。手順は別に作り、コードと照らしてから見せる）
+- T4：画面の確かめで見つけた件の直し（W24・W25。2026-11-26 に利用者が決めた。9.1 の追加 53）
+- T5：画面の確かめの結果と、usage.md の Windows のデバッグの項目に Rust を足す（前の「T4 は記録」を T5 に読み替えた）
+
+未決
+- この機械での画面の確かめで lldb-dap をどう見つけさせるか（利用者の PATH に足す・公式のインストーラーで %ProgramFiles%\LLVM に入れる、など）。リポジトリの外を変えることなので、画面の確かめの前に利用者が決める
+  （→ 画面の確かめは、作業する側の PowerShell から、起動のときだけ PATH の先頭に試しの bin を足して exe を起動する形〔C〕で行った。利用者の PATH や設定は変えていない。
+  普段使いでの見つけさせ方〔A：公式のインストーラーで %ProgramFiles%\LLVM に入れる／B：利用者の PATH に足す〕は、PR のあとに利用者が決める）
+
+気がかり（直すかは決めていない）
+- 毎回出る「warning: this version of LLDB has no plugin for the language "rust". Inspection of frame variables will be limited」（category important）。macOS でも出るかは未確認
+- 変数の欄：型の名前が C の形（i64 は long long、i32 は int、usize は unsigned long long。PDB のためと見られる。推測）、同じ名前の変数が 2 つずつ並ぶ（ブロックの中と外）、
+  まだ使えない所の変数が「variable not available」で出る、String の値に改行がそのまま入る
+- W23 で stdout にしない決まった文は、見たものは「Process <数字> exited with status = …」だけ。ほかに出るもの（Process <数字> detached・lldb-server の error など）は未確認で、A21 で見る
+  （→ 画面の確かめで、表示スクリプトの Python の Traceback も console で届き、stdout になっていたので、T4 の W24 で console のままにした）
+- W22・W23・W24 は行ごとに見分けるので、1 行が 2 つの知らせに分かれて届くと形が合わず、stdout になる。Launched '<exe>' as process … の行が分かれると、exe のフルパスが画面に出るおそれがある
+- W24 は、`Traceback (most recent call last):` の行から、字下げのない次の行（例外の行）までを console にする。例外がつながったとき
+  （`During handling of the above exception, another exception occurred:` などの行）は、例外の行と次の Traceback の行の間の行が stdout に戻る。
+  利用者のプログラムが同じ形の行を出したときも、次の字下げのない行までが console（薄い色）になる。印が立っている間に空行が来ると、字下げのない行として、そこで終わる
+  （ふつうの Traceback に空行は入らない見込み）
+- 変数の欄で、同じ名前の変数が 2 つずつ並ぶ（ブロックの中と外。まだ使えない側は `<error: variable not available>`）。同じ名前を見分けるため、lldb-dap が名前のあとに場所を付けることがある（「q @ 0x…」。推測）
+- 標準ライブラリのフレームで止まっているとき、そのフレームにない変数のウォッチ式は「lldb-dap が evaluate を断りました：warnin…」と出た（文の全体と、頭が warning なのかは未確認）
+
+試しのあとに残しているもの
+- 試しのために取り出した %LOCALAPPDATA%\Programs\llvm-lldb-23.1.6、落とした tar.xz と .msi、試しの作業領域 debug_test_rust、作業用の場所の一時的なファイル（控え・一時的なテスト・出力）、
+  置いた目印の .lldbinit 2 つ、%LOCALAPPDATA%\lldb（空の symstore）は、今は消さずに、PR の終わりにまとめて相談する
+
+### 段階 6 の Rust（lldb-dap）の結果（T2〜T5。2026-11-23〜27。windows-stage6-rust）
+
+| T | コミット | 中身 |
+| --- | --- | --- |
+| T1 | 2f956e0 | 上の計画の節、9.1 の追加 52、10 章、段階 6 の C++ の push と merge の記録 |
+| T2 | d306c87 | W15〜W18・W20 とテスト A13〜A16 |
+| T3 | 78b2fde | W19・W21〜W23 と、偽のアダプター・偽の知らせのテスト A17〜A20、本物の lldb-dap のテスト A21 |
+| T4 | 21c1acf | 画面の確かめで見つけた件の直し W24・W25 と、テスト A22・A23 |
+| T5 | （この変更） | 結果の記録、9.1 の追加 53、10 章、docs/usage.md の Rust の項目 |
+
+T2
+- W15〜W18・W20 の形は計画の表のとおり。spawn_lldb_dap は spawn_gdb と同じ流れで別に書いた（Unix の spawn と spawn_gdb の行は変えない）。macOS と共通の行で変えたのは、Adapter::Lldb のコメントだけ
+- 実行ログの「デバッグアダプター：」に、lldb-dap の場所と --version の最初の行を出す形にした（Python を足した子の環境・CREATE_NO_WINDOW・5 秒の上限）。最初の行が版の数字でなかったので、T4 の W25 で直した
+- 今のテスト A7c（reports_rust_debug_unsupported_on_windows）と、文の定数 RUST_DEBUG_UNSUPPORTED（使っていた 3 か所）を消した。Windows の Rust は「まだ使えません」の文で止まらなくなるため。
+  案内の文は A13 で確かめる（C++ の T2 で A7c を足したのと同じ形の記録。2026-11-25 に利用者が決めた）
+- 直す前の失敗（テストと、空の答えを返す形だけの関数を先に書いた。4 つとも中身の違いで落ちた）：A13 は場面 1 で Err("")、A14 は引数が []、A15 は []、A16 は type が Null
+- 外す確かめ（2 回に分けた。どちらも控えから戻し、ハッシュが控えと同じことを確かめた）：1 回目は R8 PATH の項目を見ない → A13 の場面 1、R10 --no-lldbinit を消す → A14 の引数、
+  R13a inherit-tcc を足す → A16 の preRunCommands。2 回目は R9 python3.dll の確かめを消す → A13 の場面 4、R11 窓を隠す変数を消す → A14 の変数、R12 command source を足す → A15、
+  R13b program の `\\?\` を外さない → A16 の program。7 つとも、見込みのテストの見込みの所で落ちた
+- 確かめ：cargo test lib 416 通過・0 失敗・9 無視（T1 の 413 から、A7c を消して A13〜A16 を足した）
+
+T3
+- W19・W21〜W23 の形は計画の表のとおり。どれも cfg(windows) で、アダプターが lldb-dap のときだけ働く。Windows だけの行で書き換えたのは、event() の C++ の W14 の 2 行
+  （上のコメントと、gdb_pause_stop の行に lldb_dap_pause_stop を足した）
+- W21 の evaluate（repl）は、configurationDone の前でも通った（A18・A21）。断られたときは、パスを入れない 1 行を実行ログに出して続ける
+- 直す前の失敗（テストを先に書いた。5 つとも中身の違いで落ちた）：A17 は画面の stopped が ("exception", 9)、A18 は evaluate の 2 つがない、A19 は lldb-server の文が残る、
+  A20 は利用者の出力が console のまま、A21 は a・c・e・g で lldb-server の文が出る、a・g で出力が stdout でない、c で panic で止まらない、f で理由が pause でなく作業領域のフレームがない
+- 直したあと、A17 だけが落ちた。テストの期待の値の書き間違い（選び直したスレッドの stack() のいちばん上を solution::main にしていた。本当は core::hint::black_box）で、期待の値を 1 か所直した
+- 直したあとは 5 つとも通った。A21 は NG 0（c は panic で止まり、作業領域のフレームは 60 行目、続行で 101）。A21 のあいだ（デバッグ対象を 5 回起動）、コンソールの黒い窓は 0 回だった（利用者が画面で見た）
+- 外す確かめ（A17〜A20 で 2 回に分けた）：1 回目は R14 W19 の理由の書き換え → A17、R16 W21 → A18、R17 W22 → A19、R18 W23 → A20。2 回目は R15 W19 のスレッドの選び直し → A17。
+  5 つとも、見込みのテストの見込みの所で落ちた
+- fmt と clippy で直したこと（どれもテストの中）：cargo fmt --check の 16 か所の行の折り方を、fmt の出力のとおりに手で直した。clippy の type_complexity は型に名前を付けて直した（allow は使わない）
+- 確かめ：cargo test lib 421 通過・0 失敗・9 無視（A21 は LLDB_DAP_FOR_TEST がなく、PATH と %ProgramFiles%\LLVM\bin にも lldb-dap がないので飛ぶ）
+
+画面の確かめ（2026-11-26。78b2fde から作った release の exe 54E49AAF…2CE1〔10,186,240 バイト〕。利用者が操作した。ログインも提出もしていない）
+- 作業領域は、作業する側が用意した %USERPROFILE%\Documents\debug_test_rust\t1（t1_a は 56 行の試しのプログラムと、test\input.txt〔「3」「1 2 3」「1」〕・sample-1〜3〔範囲外の添字・あふれる足し算・回り続ける〕・
+  目印の .lldbinit。t1_b はコンパイルエラーの 2 行。t1_c は t1_a と同じ main.rs で test のフォルダがない）
+- 起動：場面 A は PATH を足さずに起動した。ほかの場面は、作業する側の PowerShell から、起動のときだけ PATH の先頭に試しの bin（%LOCALAPPDATA%\Programs\llvm-lldb-23.1.6\bin）を足して起動した
+  （Python は W16 の探し方に任せた）。場面の順は A → B → C → D → E → G → F
+- 場面 A（lldb-dap がない）：信頼していないフォルダでは、ボタンに信頼の案内が出た。信頼してから「デバッグ」を押すと、実行ログに LLDB_DAP_MISSING の文が出て、
+  続けて同じ文に「実行できませんでした：」が付いた行も出た（同じ文が 2 回。件 9）。デバッグは始まらなかった
+- 場面 B（input.txt。45 行目のブレークポイント）
+  - 実行ログにデバッグ用のビルドの文・「標準入力：test/input.txt」・「デバッグアダプター：<場所>（lldb-dap: LLVM (http://llvm.org/):）」・「デバッグを始めました。」。45 行目で止まって強調された
+  - F9 で印が付いて消えた。空行（16 行目）に置いた印は、動かずにそのまま付いた。止まっている間に 54 行目に足せた。デバッグしていないときに上に空行を足すと、印は 46 行目に動いた（Ctrl+Z で戻した）
+  - ウォッチ式 total + 1 は 7。コールスタックで t1_a::main が目立ち、名前の末尾にハッシュは付かない
+  - 変数の欄で、name "atcoder"・point {x:1, y:2}・total 6・area 47・n 3 は値が出たが、a（Vec）・count（HashMap）・shapes・words・q の値の欄が空だった（件 8）。
+    型の名前は C の形（long long・int・unsigned long long・enum2$<…>・tuple$<…>）。iter・v・args・q が 2 つずつ並んだ（気がかり）
+  - デバッグコンソールで total・total + 1・`` `bt `` の答えと、注意の文が出た。「あいう」は白、rust の warning はオレンジ。lldb-server の文と作業領域の .lldbinit の目印は出なかった
+  - デバッグ中は、ほかのボタンに「別の処理を実行中です」
+  - F10・Shift+F11 では 45 行目のまま、F11 で標準ライブラリの mod.rs に入った。続行 2 回のあと 54 行目で止まった（45 行目で 3 回止まった。K1）
+  - 最後まで動かすと、「6 atcoder Some(1) Point { x: 1, y: 2 } 3 47」「2 3」（白）、「Process … exited with status = 0 …」（薄い色）、終了コード 0。
+    その前に、表示スクリプトの Python の Traceback（lldb_providers.py の 916 行目、MSVCEnumSummaryProvider の IndexError: list index out of range）が 2 回、白い色で出た（T4 の W24 で直した）
+- 場面 C（サンプルテストのあと「このケースをデバッグ」）：sample-1 は「標準入力：test/sample-1.in」、「panic でで止まっています」（件 1）、54 行目が強調された。
+  止まっている間に a を開くと 1・2・3（a の値の欄は空のまま）、first は値の欄に Some(1)、開くと 0 = 1。続行で panic の文（白）・「panic でで止まりました。」・Process … exited with status = 101・終了コード 101。
+  sample-2 は 42 行目（attempt to add with overflow）が強調され、停止を押すとすぐ止まり、「Process … exited with status = 0 (0x00000000) killed」と「プログラムが終わりました（終了コード 0）」（件 7 と同じ形）
+- 場面 D（sample-3。回り続ける）：動いている間、デバッグコンソールに打てない。ボタンは最初に止まるまで「一時停止」にならなかった（件 2）。47 行目で止めて印を消し、続行してから一時停止すると、
+  「止まっています」だけ（「例外で」と出ない。W19）。コールスタックのいちばん上は hint.rs:490、その下が t1_a::main（main.rs:49）で、押すと 49 行目が強調された。
+  続行してから停止で、すぐに止まった。コールスタックの場所はフルパス（件 5）
+- 場面 E（t1_c。入力のファイルなし）：「入力ファイルなし（空の標準入力で実行）…」、入力を待たずに終わり、「あいう」「0 atcoder None Point { x: 1, y: 2 } 3 47」・終了コード 0
+- 場面 G（t1_b。コンパイルエラー）：error[E0308] mismatched types、エラー一覧に src/main.rs:2、「CE：コンパイルエラー（実行していません）」。デバッグは始まらなかった。
+  「デバッグアダプター：」の行はビルドの前に出た
+- 場面 F：45 行目で止まったまま × で閉じた。確かめの文は出なかった
+- コンソールの黒い窓は一度も出なかった（W20）。実行ログの版の部分は、どの場面でも「（lldb-dap: LLVM (http://llvm.org/):）」だった（T4 の W25 で直した）
+- 前と後（読むだけの命令。後は、場面 F でアプリを閉じてから）
+  - atcoder-studio・lldb・lldb-dap・lldb-server・t1_a・t1_b・t1_c は 0 → 0
+  - settings.json と acd_studio の git status（windows-stage6-rust・78b2fde・0 行）は変わらなかった
+  - trusted.json は debug_test_rust を信頼した分だけ変わった（625 → 684 バイト。debug_test_rust の項目が 1 つ）
+  - debug_test_rust（target の中を除く）は 16 → 18 個（t1_b・t1_c の Cargo.lock が増えた）。t1_a の main.rs は、場面 B で空行を足して戻したあと（自動保存）も、前と同じハッシュ
+  - %LOCALAPPDATA%\lldb は、空の symstore の 1 つのまま
+
+画面で見込みと違った件の確かめ（2026-11-26〜27。アプリを閉じてから）
+- 1-A（読むだけ）：settings.json の python.cpython は空、python.interpreter は cpython。アプリも A21 と同じ既定の探し方で CPython を選ぶ
+- 3-A：試しの bin の lldb-dap --version（子の PATH の先頭に CPython のフォルダを足した。P3 では、足さないと 0xC06D007E で落ちた）の出力は 6 行で、1 行目が「lldb-dap: LLVM (http://llvm.org/):」、
+  2 行目が「LLVM version 23.1.6」、4 行目が liblldb の版と revision
+- 1-B（一時的なテスト。debug.rs の控えを取って足し、--ignored --exact で 1 回動かし、控えから戻した）：t1_a の写し（edition 2024）・同じ入力で 45 行目に止めると、
+  lldb-dap の variables の答えは a・count・shapes が size=3、first・q が Some(1)、words にも値があった。画面の要求（debug_variables → Client::variables）も同じ形なので、
+  値は画面に届いていると見られる。値が見えなかったのは、src/App.css の .debug-variable-type が flex: none、.debug-variable-value が min-width: 0・overflow: hidden で、
+  型の名前が長いと値の幅が 0 になるため（件 8。読んで確かめた）。frame variable・bt・Locals では Traceback は出なかった
+- 1-C（同じ一時的なテストに足した）：45 行目のあと F11 で core\src\fmt\rt.rs の new_display に入り、その Locals（x の 1 つ）を取っても、Traceback は出なかった
+- 一時的なテスト（diag_rust_values_t1a）はコミットしていない。debug.rs は控えから戻し、ハッシュが控えと同じことを確かめた
+
+T4
+- W24（Traceback）：表示スクリプトの Python の Traceback（`Traceback (most recent call last):` の行から、字下げのない次の行〔例外の行〕まで）を、stdout にせず console のまま（薄い色）にする。
+  Traceback の途中かを State の in_traceback に持ち、知らせをまたいで引き継ぐので、1 つの知らせで届いても、1 行ずつ分かれて届いても同じに扱う。
+  分けた部分は、output に渡し直さず、新しい send_output で送る（印を同じ行で 2 回動かさないため）
+- 共通のコードの変更（9.1 の追加 53 の例外）：send_output は Shared::output の後ろ半分（上限まで送る・超えたら一度だけ知らせる）の行をそのまま移したもので、ロックも output で取ったものを受け取る。
+  これに伴い、output の `let mut state` の mut を外し、Windows の lldb-dap の段の頭で `let mut state = state;` と受け取り直した（macOS では output の中で state を書き換えなくなり、unused_mut になるため）。
+  output の上の説明の 1 行も、今の動きに合わせて直した。macOS の動きは変わらない見込み（CI の macos-latest で確かめる）
+- W25（版の行）：版を選ぶ所を lldb_dap_version_line に分け、`version <数字>.<数字>.<数字>` を含む最初の行（LLVM 23.1.6 では「LLVM version 23.1.6」）を選ぶ。なければ今までどおり場所だけ出す
+- テスト（偽の知らせ・偽の出力。CI でも動く）：A22 keeps_python_tracebacks_as_console_on_windows・A23 picks_the_version_line_of_lldb_dap_on_windows
+- 直す前の失敗（lldb_dap_version_line は、先に今と同じ動きで切り出してから動かした）：A23 は最初の assert_same で left: Some("lldb-dap: LLVM (http://llvm.org/):")、
+  A22 は最後の assert_same で、Traceback の行がすべて stdout になった
+- 外す確かめ（W24 の印を動かす所と、W25 の行の選び方を、まとめて外した）：A22・A23 が同じ所で落ち、A19・A20 は通った。控えから戻し、ハッシュが同じことを確かめた
+- 確かめ：cargo test lib 423 通過・0 失敗・9 無視（T3 の 421 に A22・A23 を足した）
+
+画面の確かめ 2（場面 H。2026-11-27。21c1acf から作った release の exe F457F971…E513〔10,186,752 バイト〕。起動は上と同じ形〔C〕。利用者が操作した。ログインも提出もしていない）
+- 実行ログに「デバッグアダプター：%LOCALAPPDATA%\Programs\llvm-lldb-23.1.6\bin\lldb-dap.exe（LLVM version 23.1.6）」（W25）。ほかの行は前と同じ
+- 45 行目で止まり、ウォッチ式 total + 1 は 7。F10 では 45 行目のまま、F11 で mod.rs に入り、そこではウォッチ式が「lldb-dap が evaluate を断りました：warnin…」、
+  変数は template（unsigned char ()[19]）と args（core::fmt::rt::Argument ()[6]）。Shift+F11 のあと、続行で最後まで動かした
+- デバッグコンソールの並びは、あいう → rust の warning → Traceback が 2 回（どちらも lldb_providers.py の 916 行目、MSVCEnumSummaryProvider、IndexError: list index out of range）→
+  6 atcoder Some(1) Point { x: 1, y: 2 } 3 47 → 2 3 → Process … exited with status = 0 (0x00000000) → 「プログラムが終わりました（終了コード 0）」。
+  **Traceback は薄い色で出て、そのあとのプログラムの出力は白に戻った（W24）**。どの操作のあとに出たかは見ていない
+- コンソールの黒い窓は出なかった（利用者が見た）
+- 前と後（読むだけ）：atcoder-studio・lldb・lldb-dap・lldb-server・t1_a・t1_b・t1_c は 0 → 0。settings.json・trusted.json・t1_a と t1_c の main.rs・debug_test_rust のファイルの数（18）・
+  %LOCALAPPDATA%\lldb（symstore の 1 つ）は変わらなかった。acd_studio は windows-stage6-rust・21c1acf・0 行
+
+受け入れ条件の結果（元の版の AC5-01〜13 を Windows 向けに読み替えたもの）
+| AC | 結果 |
+| --- | --- |
+| AC5-01（始める） | 満たした（場面 B。ビルド・実行ログの行・ブレークポイントで止まる） |
+| AC5-02（ブレークポイント） | 満たした（F9 の付け外し、デバッグ中に足す、編集で印が動く）。空行の印は動かずにそのまま付いた |
+| AC5-03（ステップ・一時停止） | 満たした。一時停止は「止まっています」で、作業領域のフレームが選べる（W19）。ただし「一時停止」は最初に止まるまで出ない（件 2）。同じ行で何回か止まる（K1） |
+| AC5-04（変数・ウォッチ式・コールスタック） | 一部。lldb-dap は Vec・HashMap・Option などの値を返している（1-B）が、型の名前が長い変数は画面で値が見えない（件 8）。開けば中は見える。ウォッチ式・コールスタックは満たした |
+| AC5-05（入力） | 満たした（input.txt・選んだケース・入力のファイルなし） |
+| AC5-06（panic） | 満たした（範囲外の添字・あふれる足し算で止まり、続行で 101）。「でで」（件 1） |
+| AC5-07（デバッグコンソール） | 満たした（式・LLDB のコマンド・注意の文。動いている間は打てない） |
+| AC5-08（止める） | 満たした（止まっているとき・動いているとき・アプリを閉じる。後の確かめで残りは 0）。止めたあとの終了コードは 0 と出る（件 7） |
+| AC5-09（最後まで動かす） | 満たした（出力と終了コード 0） |
+| AC5-10（ビルドの失敗） | 満たした（CE で、デバッグは始まらない） |
+| AC5-11（信頼・ほかの処理の間） | 画面で見た所は満たした（信頼していないときのボタンの案内と、デバッグ中のほかのボタン）。信頼していない作業領域で、開発者ツールからデバッグのコマンドを試す所は、画面では見ていない。コマンドの側の信頼の確かめ（D-128）は共通のコードで、この PR では変えていない（未確認のまま） |
+| AC5-12（.lldbinit を読まない） | 作業領域の目印は出なかった（場面 B・H、A21）。利用者のフォルダの .lldbinit は画面では見ておらず、ソース（DAP::InitializeDebugger）と A14（--no-lldbinit）で確かめた |
+| AC5-13（アダプターがない） | 満たした（場面 A。始めずに入れ方の案内）。同じ文が 2 回出る（件 9） |
+
+画面の確かめで見つかった件（番号は「段階 6 の C++ の結果」の件 5〜7 の続き。扱いは 9.1 の追加 53）
+| # | 見たこと | 原因 | 扱い |
+| --- | --- | --- | --- |
+| 8 | 変数の欄で、型の名前が長い変数（Vec・HashMap・enum2$<…> など）の値の欄が空に見える | src/App.css の .debug-variable-type が flex: none、.debug-variable-value が min-width: 0・overflow: hidden で、型の名前が長いと値の幅が 0 になる（読んで確かめた）。lldb-dap は値を返している（1-B）。共通の CSS | この PR では直さない。件 1・5・6 と一緒に、共通の画面の小さな PR で直す。usage.md に、サイドバーを広げると値が見えること、型の名前は行にマウスを乗せると出ることを書いた |
+| 9 | lldb-dap がないとき、実行ログに同じ案内の文が 2 回出る（2 回目は頭に「実行できませんでした：」） | debug.rs の debug_target が、アダプターが見つからないとき info で文を出してから Finish::Failed で同じ文を返し、画面の describeFinish（src/panels/runLog.ts:31）がもう一度出す（読んで確かめた）。gdb・debugpy がないときも同じ道を通る見込み（推測。画面では見ていない） | 記録だけ。あとの画面の小さな PR の候補 |
+- 件 1（「でで」）・件 2（最初に止まるまで「一時停止」が出ない）・件 5（コールスタックの場所がフルパス）・件 7（止めたあとの終了コード 0）は、Rust でも同じ形で見えた。直すのは前に決めたとおり別の PR
+
 ---
 
 ## 8. 新しい依存の候補
@@ -3058,6 +3346,8 @@ A9 で記録したこと（assert していない所を含む）
 | 追加 49（2026-11-21） | 段階 6 の Python の画面の確かめ（AC20-04・05）で見つかった 4 つの件の扱い。標準出力が届かない件は、この PR で W7 として直す（cfg(windows) で `-u`。Unix の経路は変えない。macOS でも同じことが起きる見込みは、10 章に未確認として書く）。「例外でで」（failureStop と、それを呼ぶ 2 か所）と「一時停止にならない」は、Python の PR のあとの別の小さな PR で直す（共通の TS などを変えるので、macOS も変わる。後者は C++ の段階で lldb-dap の動きを見てから決める）。「強制的に止めた」は記録だけにして一時的なテストはせず、調べは後者の PR で行う。W6 は source.path にだけ without_verbatim を通す（cwd は変えない）。find_debugpy は OS ごとの 2 つの関数に分ける | 段階 6 |
 | 追加 50（2026-11-22） | 段階 6 の C++ を、origin/main（73d20c8）から作った windows-stage6-cpp で行う。アダプターは利用者の手元の MinGW-Builds の gdb 16.3 の DAP（A）。LLVM の lldb-dap（B）と attach の形は、今は使わない。gdb.exe の隣に gdborig.exe と ..\opt があるときだけ gdborig.exe を直接起動し、gdb の子にだけ PYTHONHOME=<mingw64>\opt と PATH（コンパイラの bin → opt\bin → もとの PATH）を付ける。ないときは gdb.exe をそのまま使う。どちらも PYTHONUTF8=1 を gdb の子にだけ付ける。引数は -nh -q --interpreter=dap -iex "set auto-load off"。標準入力は launch の args に引用符つきの 1 つの文字列（"< \"パス\""）。P2 で見つけた 3 つの件（gdb 自身の文が stdout で届く・abort のあと signal で止まる・一時停止が送れない）は、先にテストを書いてから直す。Windows の Rust のデバッグの文は、Xcode の案内から「まだ使えません」の文に変わる（cfg(windows) の中だけ）。件 1・件 2（追加 49）は、この PR でも記録だけ。計画は「段階 6 の C++（gdb）の計画」の節 | 段階 6 |
 | 追加 51（2026-11-22） | 段階 6 の C++ の T2・T3 と画面の確かめで決めたこと。spawn_gdb は Client::spawn と別に書く（Unix の spawn の行を変えないため。利用者が決めた）。A9（本物の gdb）は CI では飛ばす（環境変数 CI があるとき。利用者が決めた）。W11 の境は、launch の答えでなく process の知らせ（利用者が決めた）。W12（abort のあと signal で止まり、0xC0000409 で終わる）はコードを変えない（利用者が決めた）。W13 は threads を送らずに pause を送り、W14 は gdb の reason "stopped" の停止を main のスレッド（1）の pause として扱う。デバッグコンソールで interrupt を打ったときも pause になる（利用者が決めた）。全体の cargo test で A9 が 1 回落ちた件は、見立てを確かめないまま、3 秒まで見直して alive のものだけを数える形にした（利用者が決めた）。画面の確かめで見つかった件 5〜7 は、この PR では記録だけ：件 5（コールスタックのフルパス）と件 6（終了コードが 10 進）は、件 1 と一緒に、デバッグの画面の文を直すあとの小さな PR で直し、件 7（一時停止のあと止めると終了コード 0）は件 2・件 4 と同じ PR で調べる（利用者が決めた）。結果は「段階 6 の C++（gdb）の結果」の節 | 段階 6 |
+| 追加 52（2026-11-25） | 段階 6 の Rust を、origin/main（0d0e7d4）から作った windows-stage6-rust で行う。アダプターは LLVM の公式版の lldb-dap（A。23.1.6 で確かめた）。A が足りなければ D（GNU のターゲット＋gdb）を改めて聞く。試しのための lldb は、公式のインストーラー（.msi）を動かさずに 7-Zip で %LOCALAPPDATA%\Programs\llvm-lldb-23.1.6 に取り出した（PATH には入れない）。lldb-dap の探し方は PATH → %ProgramFiles%\LLVM\bin（試しの場所は探さない。ないときは LLVM の公式版を入れる案内）。Python は python::find_interpreter の CPython のフォルダを lldb-dap の子の PATH の先頭にだけ足し、python3.dll がなければ案内。家の .lldbinit は `$__lldb_sourceInitFile: false` と `--no-lldbinit` の両方で読まない。黒い窓は lldb-dap の子の LLDB_LAUNCH_INFERIORS_WITHOUT_CONSOLE=true で隠す。rust_panic は setFunctionBreakpoints の前後だけ skip-prologue false。一時停止（exception・interrupt）は pause にし、作業領域のフレームがあるスレッド（なければ main）を選ぶ。lldb-server の決まった 4 つの文は捨て、launch の答えのあとの console のうち決まった文でないものは stdout として画面に送る（Windows の lldb-dap のときだけ。launch の答えの前の console を捨てる条件は今のまま）。K1 と symstore は usage.md に書くだけ。この機械で画面の確かめのときに lldb-dap をどう見つけさせるかは未決。試しのファイルと置いた目印は PR の終わりにまとめて相談する（どれも helper の勧めで利用者が決めた）。計画は「段階 6 の Rust（lldb-dap）の計画」の節 | 段階 6 |
+| 追加 53（2026-11-26〜27） | 段階 6 の Rust の画面の確かめと T4 で決めたこと。画面の確かめは、作業する側の PowerShell から、起動のときだけ PATH の先頭に試しの bin を足して exe を起動する形（C）で行う（場面 A〔lldb-dap がない〕だけ PATH を足さない）。普段使いでの lldb-dap の見つけさせ方（A 公式のインストーラー／B 利用者の PATH）は PR のあとに利用者が決める。見込みと違った件は、アプリを閉じてから、読むだけの確かめ（1-A）・上限つきの --version（3-A）・一時的なテスト（1-B・1-C。控えから戻し、コミットしない）で調べた。T4 で直すのは W24（表示スクリプトの Traceback を console のまま。1 つの知らせでも分かれて届いても扱える、状態を持つ形）と W25（--version の版の行）の 2 つで、T5 で記録する（前の「T4 は記録」を T5 に読み替えた）。「macOS / Unix の経路は cfg を付ける・場所を移す以外は変えない」の例外として、共通の Shared に send_output を足した（output の後ろ半分の行をそのまま移した。ロックも output で取ったものを渡す）。これに伴い output の `let mut state` の mut を外し（macOS で unused_mut になるため）、Windows の lldb-dap の段で受け取り直した。output の上の説明の 1 行も直した。macOS の動きは変わらない見込みで、CI の macos-latest で確かめる（macOS の画面は未確認）。変数の値が見えない件（件 8。App.css）は、この PR では直さず、件 1・5・6 と一緒に共通の画面の小さな PR で直す（この PR は Windows だけの直しのまま）。案内の文が 2 回出る件（件 9）は記録だけで、あとの画面の小さな PR の候補。同じ名前の変数・「q @ 0x…」は気がかりに書くだけ（どれも helper の勧めで利用者が決めた）。結果は「段階 6 の Rust（lldb-dap）の結果」の節 | 段階 6 |
 
 ---
 
@@ -3123,8 +3413,25 @@ A9 で記録したこと（assert していない所を含む）
     （続行すると 0xC0000409 で終わることは、A9 と画面の場面 D で確認済み）
   - 全体の cargo test で A9 が 1 回落ちた理由（止めた直後に一覧に残っていたという見立ては未確認）
   - 画面の確かめで見つかった件 5〜7（直すのは別の PR）：件 5 の fileName がブレークポイントの一覧と Python でも同じに出るか（推測）、件 7 の終了コード 0 の理由
+- 段階 6 の Rust（「段階 6 の Rust（lldb-dap）の計画」）
+  - 上の C++ の項目のうち、LLVM の lldb-dap の有無（→ 23.1.6 の公式のインストーラーにあり、tar.xz にはないことを確認済み）と、一時停止の件の lldb-dap の動き
+    （→ 始めたあと最初に止まるまで continued は来ないことを P4 で確認済み）。gdb が PDB を読めないことは、Rust を lldb-dap にしたので確かめていない（推測のまま）
+  - CRT の dup2 が Windows の標準ハンドルまで替えるか（出力が console で届く見立ての前提）、LLDB_LAUNCH_FLAG_USE_PIPES と eLaunchFlagUsePipes を読む所
+  - launch の答えがいつもプログラムの最初の出力より前に届くか（A21 で、すぐに出力した行が残ることを見る）
+  - W21 の evaluate（repl）が configurationDone の前に通るか（→ A18・A21 と画面の確かめで通ることを確認済み）
+  - lldb-dap が出す決まった文のうち、見ていないもの（Process <数字> detached・lldb-server の error など）（→ 表示スクリプトの Python の Traceback は見て、T4 の W24 で扱った。ほかは未確認のまま）
+  - 「no plugin for the language "rust"」の warning と、Process … exited の文が macOS でも出るか
+  - 表示スクリプトの Traceback が、どの操作で出るか（場面 B・H では、45 行目で F10・F11・Shift+F11 をしたあと、続行の前後に 2 回出た。一時的なテスト 1-B・1-C では出なかった）
+  - 標準ライブラリのフレームでのウォッチ式の文「lldb-dap が evaluate を断りました：warnin…」の全体
+  - 件 9（案内の文が 2 回）が、gdb・debugpy がないときも同じ形で出るか（推測）
+  - T4 の共通のコードの変更（send_output・output の mut を外したこと）で、macOS の clippy・テストが通るか（CI の macos-latest で見るまで未確認）。macOS の画面
+  - 普段使いでの lldb-dap の見つけさせ方（PR のあとに利用者が決める）
+  - AC5-11 の後半（信頼していない作業領域で、開発者ツールからデバッグのコマンドを試すと拒否される）を、Windows の画面で見ていない（コマンドの側の信頼の確かめは共通のコードで、この PR では変えていない）
+  - 同じ行で何回か止まる理由（K1。PDB の行の情報で 1 行が何か所かに分かれていると見られる。推測）と、macOS でも同じか
+  - Microsoft Store の Python を lldb-dap の Python にできるか
+  - macOS の rustc の etc にも lldb_commands がなくなっているか（macOS の init_commands は変えない）
 - 計画書の前の段階の記録の中に、ユーザーのフォルダの名前が入ったパス（6 行）と、アプリの識別子（10 行）がそのまま残っている。利用者が「最後にまとめて直す」と決めた（2026-11-22）
-- docs/usage.md で Windows に触れているのは、末尾の「Windows：対応を確認していません。」と、段階 6 で足した Python と C++ のデバッグの項目だけ。
+- docs/usage.md で Windows に触れているのは、末尾の「Windows：対応を確認していません。」と、段階 6 で足した Python・C++・Rust のデバッグの項目だけ。
   usage.md の Windows の書き方（brew・macOS のキーなど）をまとめて直すのは、あとの PR の候補
 - 段階 3 で確かめること：残りなし（ShellExecuteW を COM の初期化なしで呼んで URL とフォルダを開けることは T8 で確認済み。提出の処理を始めずに提出のページを開ける経路がないことは T8 でコードで確認済み。InPrivate と on_navigation の制限のもとでログインが通ること〔Turnstile が出たかは記録していない〕と、cookies() が WebView2 で REVEL_SESSION を返すこと〔HttpOnly かは見ていない〕は T9 で、CI の Windows で資格情報を書けることは run 42378818906 で確認済み。アプリが記録をファイルに書かないことは T9 の前にコードで確認済み）。あとの段階へ残したものは「段階 3 の結果」の「残る未確認」にある
 - curl の .curlrc：Windows の curl.exe は --disable で読まない（段階 3 T10。テストで確認済み）。macOS の curl には付けていない（.curlrc が Cookie の入った要求に効くかは推測のまま）。
