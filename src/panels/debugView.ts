@@ -19,6 +19,34 @@ export function failureStop(reason: string | null): string | null {
   }
 }
 
+// 止まっているときの状態の文（DebugPanel）。panic・例外・abort 以外の理由なら null
+// （failureStop の値が「で」まで含むので、ここでは付けない。件 1）
+export function failureStatus(reason: string | null): string | null {
+  const failure = failureStop(reason);
+  return failure === null ? null : `${failure}止まっています`;
+}
+
+// 止まったときに実行ログに出す文（useDebug）。panic・例外・abort 以外の理由なら null
+export function failureLog(reason: string | null): string | null {
+  const failure = failureStop(reason);
+  return failure === null ? null : `${failure}止まりました。`;
+}
+
+// 終了コードの文（デバッグコンソールと実行ログ。件 6）。Rust が作った label（run::exit_code_text。Windows の例外の名前など）があればそれ、
+// なければ「終了コード N」、code もなければ null。src/ipc/run.ts の exitLabel と同じ決まり（exitLabel を読むと ipc/run.ts が
+// @tauri-apps/api/core を読むので、node のテストのためにここに置く）
+export function exitText(code: number | null, label?: string | null): string | null {
+  if (label) {
+    return label;
+  }
+  return code === null ? null : `終了コード ${code}`;
+}
+
+// コールスタックとブレークポイントの一覧に出す、ファイルの名前（DebugPanel.tsx から移した）。Windows の「\」でも区切る（件 5）
+export function fileName(path: string): string {
+  return path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+}
+
 // 止まったときに選ぶフレーム。panic・例外・abort のときは、作業領域のソースのいちばん上（D-146 2.7。
 // 一番上は rust_panic・__cxa_throw・abort などの作業領域の外の関数）。ほかは一番上（作業領域の外でも）
 export function pickFrame(frames: FrameView[], reason: string | null): FrameView | null {

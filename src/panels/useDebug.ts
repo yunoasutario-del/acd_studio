@@ -22,7 +22,7 @@ import {
   subscribeBreakpoints,
 } from "../editor/breakpoints";
 import type { DebugPhase } from "./runState";
-import { entriesFromViews, failureStop, pickFrame } from "./debugView";
+import { entriesFromViews, failureLog, pickFrame } from "./debugView";
 
 // ウォッチ式の値（評価できなければ error）
 export type WatchValue = { result: string; typeName: string | null } | { error: string };
@@ -165,9 +165,9 @@ export function useDebug({ onOpenFrame, onLog }: Options) {
       stopSeq: seq,
       error: null,
     }));
-    const failure = failureStop(reason);
-    if (failure !== null) {
-      optionsRef.current.onLog(`\n${failure}で止まりました。\n`);
+    const log = failureLog(reason);
+    if (log !== null) {
+      optionsRef.current.onLog(`\n${log}\n`);
     }
     try {
       const frames = await debugStack();

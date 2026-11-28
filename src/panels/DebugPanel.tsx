@@ -5,7 +5,7 @@ import { useState } from "react";
 import type { FrameView, VariableView } from "../ipc/debug";
 import type { BreakpointEntry } from "../editor/breakpoints";
 import type { DebugView, WatchValue } from "./useDebug";
-import { failureStop } from "./debugView";
+import { failureStatus, failureStop, fileName } from "./debugView";
 
 type Props = {
   view: DebugView;
@@ -80,10 +80,6 @@ function VariableRow({
   );
 }
 
-function fileName(path: string): string {
-  return path.slice(path.lastIndexOf("/") + 1);
-}
-
 function DebugPanel({
   view,
   watches,
@@ -106,9 +102,7 @@ function DebugPanel({
         ? "デバッグを始めています…"
         : view.phase === "running"
           ? "プログラムが動いています（下は、前に止まったときの内容です）"
-          : failure !== null
-            ? `${failure}で止まっています`
-            : "止まっています";
+          : (failureStatus(view.stopReason) ?? "止まっています");
 
   return (
     // タブの列は BottomRightPanel が描く（Phase 6 で「提出結果」を加えた）
